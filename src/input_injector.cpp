@@ -82,41 +82,31 @@ void InputInjector::cleanup() {
 }
 
 bool InputInjector::ensure_uitest_agent() {
-    std::string output;
+    for (int i = 0; i < 10; i++) {
+        std::string output;
 
-    hdc_.shell_command("cat /proc/net/unix | grep uitest_socket", &output, 3);
-    if (output.find("uitest_socket") != std::string::npos) {
-        LOGI("uitest agent already listening on abstract socket uitest_socket");
-        use_abstract_control_ = true;
-        return true;
+        hdc_.shell_command("cat /proc/net/unix | grep uitest_socket", &output, 3);
+        if (output.find("uitest_socket") != std::string::npos) {
+            LOGI("uitest agent listening on abstract socket uitest_socket (check %d)", i + 1);
+            use_abstract_control_ = true;
+            return true;
+        }
+
+        hdc_.shell_command("netstat -an | grep 8012 | grep LISTEN", &output, 3);
+        if (output.find("8012") != std::string::npos && output.find("LISTEN") != std::string::npos) {
+            LOGI("uitest agent listening on TCP port 8012 (check %d)", i + 1);
+            use_abstract_control_ = false;
+            return true;
+        }
+
+        if (i == 0) {
+            LOGI("uitest agent not found yet, starting uitest daemon...");
+            hdc_.shell_command("uitest start-daemon singleness", nullptr, 5);
+        }
+        Sleep(300);
     }
 
-    hdc_.shell_command("netstat -an | grep 8012 | grep LISTEN", &output, 3);
-    if (output.find("8012") != std::string::npos && output.find("LISTEN") != std::string::npos) {
-        LOGI("uitest agent already listening on TCP port 8012");
-        use_abstract_control_ = false;
-        return true;
-    }
-
-    LOGI("No uitest agent found, starting uitest daemon...");
-    hdc_.shell_command("uitest start-daemon singleness", nullptr, 5);
-    Sleep(1500);
-
-    hdc_.shell_command("cat /proc/net/unix | grep uitest_socket", &output, 3);
-    if (output.find("uitest_socket") != std::string::npos) {
-        LOGI("uitest agent now listening on abstract socket uitest_socket");
-        use_abstract_control_ = true;
-        return true;
-    }
-
-    hdc_.shell_command("netstat -an | grep 8012 | grep LISTEN", &output, 3);
-    if (output.find("8012") != std::string::npos && output.find("LISTEN") != std::string::npos) {
-        LOGI("uitest agent now listening on TCP port 8012");
-        use_abstract_control_ = false;
-        return true;
-    }
-
-    LOGW("uitest agent still not available after start attempt");
+    LOGW("uitest agent still not available after checks");
     return false;
 }
 
@@ -224,18 +214,16 @@ bool InputInjector::send_to_socket(const std::string &json) {
         LOGW("send to socket failed (n=%d), reconnecting...", n);
         CLOSE_SOCKET(static_cast<socket_t>(control_sock_));
         control_sock_ = -1;
-        Sleep(100);
+        Sleep(50);
         if (setup_control_port()) {
             n = ::send(static_cast<socket_t>(control_sock_),
                        json.c_str(), static_cast<int>(json.size()), 0);
             if (n <= 0) {
-                LOGW("send still failed after reconnect, falling back to shell mode");
-                use_socket_mode_ = false;
+                LOGW("send still failed after reconnect");
                 return false;
             }
         } else {
-            LOGW("reconnect failed, falling back to shell mode");
-            use_socket_mode_ = false;
+            LOGW("reconnect failed");
             return false;
         }
     }
@@ -291,7 +279,9 @@ bool InputInjector::inject_touch_down(uint32_t x, uint32_t y) {
                  x, y);
         return send_to_socket(json);
     }
-    return true;
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "uitest uiInput click %u %u", x, y);
+    return hdc_.shell_command(cmd, nullptr, 5);
 }
 
 bool InputInjector::inject_touch_move(uint32_t x, uint32_t y) {

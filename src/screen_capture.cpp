@@ -160,22 +160,18 @@ std::string ScreenCapture::find_matching_so_with_md5(const std::string &device_m
         };
     }
 
-    if (!device_md5.empty()) {
-        for (auto &name : candidates) {
-            std::string path = server_dir_ + "\\" + name;
-            if (GetFileAttributesA(path.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
-            std::string local_md5 = get_local_so_md5(path);
-            if (!local_md5.empty() && local_md5 == device_md5) {
-                LOGI("MD5 matched: %s", name.c_str());
-                return path;
-            }
-        }
-    }
-
     for (auto &name : candidates) {
         std::string path = server_dir_ + "\\" + name;
         if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            return path;
+            if (!device_md5.empty()) {
+                std::string local_md5 = get_local_so_md5(path);
+                if (!local_md5.empty() && local_md5 == device_md5) {
+                    LOGI("MD5 matched: %s", name.c_str());
+                    return path;
+                }
+            } else {
+                return path;
+            }
         }
     }
 
@@ -343,22 +339,25 @@ bool ScreenCapture::start_uitest_with_extension() {
     }
     LOGI("Using server SO: %s", local_so.c_str());
 
-    std::string local_md5 = get_local_so_md5(local_so);
-    bool so_up_to_date = !device_md5.empty() && device_md5 == local_md5;
-    LOGI("Device SO md5: %s, Local SO md5: %s, up_to_date: %s",
-         device_md5.c_str(), local_md5.c_str(), so_up_to_date ? "true" : "false");
+    bool so_up_to_date = !device_md5.empty();
+    if (so_up_to_date) {
+        std::string local_md5 = get_local_so_md5(local_so);
+        so_up_to_date = (local_md5 == device_md5);
+        LOGI("Device SO md5: %s, Local SO md5: %s, up_to_date: %s",
+             device_md5.c_str(), local_md5.c_str(), so_up_to_date ? "true" : "false");
+    } else {
+        LOGI("Device SO md5 empty, will push");
+    }
 
-    if (extension_running && so_up_to_date && !pids.empty()) {
-        LOGI("uitest extension already running, killing for fresh gRPC connection");
-        std::string kill_cmd = "kill -9";
-        for (auto &p : pids) kill_cmd += " " + p;
-        hdc_.shell_command(kill_cmd, nullptr, 3);
-        Sleep(300);
-    } else if (!pids.empty()) {
+    if (!pids.empty()) {
         LOGI("Killing %zu existing uitest extension process(es)", pids.size());
         std::string kill_cmd = "kill -9";
         for (auto &p : pids) kill_cmd += " " + p;
         hdc_.shell_command(kill_cmd, nullptr, 3);
+        Sleep(300);
+    } else if (extension_running) {
+        LOGI("Extension running but PID not found, killing all uitest processes");
+        hdc_.shell_command("\"kill -9 $(ps -ef | grep uitest | grep -v grep | awk '{print $2}')\"", nullptr, 3);
         Sleep(300);
     }
 
@@ -574,6 +573,31 @@ void ScreenCapture::stop() {
     if (local_video_port_ > 0) {
         hdc_.forward_remove(local_video_port_, use_abstract_socket_,
                             use_abstract_socket_ ? kGrpcSocketName : "");
+    }
+
+    if (mode_ == CaptureMode::kGrpcStream) {
+        LOGI("Killing uitest extension on stop");
+        std::string ps_out;
+        hdc_.shell_command("ps -ef | grep libscreen_casting | grep -v grep", &ps_out, 3);
+        std::vector<std::string> pids;
+        std::istringstream iss(ps_out);
+        std::string line;
+        while (std::getline(iss, line)) {
+            if (line.find("libscreen_casting") == std::string::npos) continue;
+            if (line.find("grep") != std::string::npos) continue;
+            std::istringstream ls(line);
+            std::string user, pid_str;
+            if (ls >> user >> pid_str) {
+                bool all_digit = true;
+                for (char c : pid_str) { if (c < '0' || c > '9') { all_digit = false; break; } }
+                if (all_digit && !pid_str.empty()) pids.push_back(pid_str);
+            }
+        }
+        if (!pids.empty()) {
+            std::string kill_cmd = "kill -9";
+            for (auto &p : pids) kill_cmd += " " + p;
+            hdc_.shell_command(kill_cmd, nullptr, 3);
+        }
     }
 }
 

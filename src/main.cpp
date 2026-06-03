@@ -72,18 +72,34 @@ static void set_status(const char *msg) {
 }
 
 static void refresh_devices() {
+    std::string current_serial;
+    if (g_mirroring && g_hdc) {
+        current_serial = g_hdc->serial();
+    } else {
+        int sel = (int)SendMessageA(g_combo_hwnd, CB_GETCURSEL, 0, 0);
+        if (sel != CB_ERR && sel < (int)g_devices.size()) {
+            current_serial = g_devices[sel].serial;
+        }
+    }
+
     SetWindowTextA(g_status_hwnd, "Scanning...");
     SendMessageA(g_combo_hwnd, CB_RESETCONTENT, 0, 0);
 
     HdcWrapper hdc_local;
     g_devices = hdc_local.list_devices();
 
+    int select_idx = 0;
+    int cur = 0;
     for (auto &d : g_devices) {
         std::string entry = d.serial;
         SendMessageA(g_combo_hwnd, CB_ADDSTRING, 0, (LPARAM)entry.c_str());
+        if (!current_serial.empty() && d.serial == current_serial) {
+            select_idx = cur;
+        }
+        cur++;
     }
     if (!g_devices.empty()) {
-        SendMessageA(g_combo_hwnd, CB_SETCURSEL, 0, 0);
+        SendMessageA(g_combo_hwnd, CB_SETCURSEL, select_idx, 0);
         EnableWindow(g_btn_start_hwnd, TRUE);
     }
 
