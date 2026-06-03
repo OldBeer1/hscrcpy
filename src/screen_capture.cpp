@@ -10,6 +10,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #endif
 
 namespace hscrcpy {
@@ -305,9 +307,7 @@ bool ScreenCapture::start_uitest_with_extension() {
         }
     }
 
-    if (pids.empty()) {
-        LOGI("No existing uitest extension process, starting new one");
-    } else {
+    if (!pids.empty()) {
         LOGI("Found %zu existing uitest extension process(es), killing with SIGKILL", pids.size());
         std::string kill_cmd = "kill -9";
         for (auto &p : pids) kill_cmd += " " + p;
@@ -324,51 +324,57 @@ bool ScreenCapture::start_uitest_with_extension() {
     }
     LOGI("Starting uitest: %s", cmd.c_str());
     hdc_.shell_command(cmd, nullptr, 5);
-    Sleep(5000);
+    Sleep(3000);
 
-    std::string check;
-    hdc_.shell_command("\"ps -ef | grep extension-name | grep -v grep\"", &check, 5);
-    if (check.find("extension-name") != std::string::npos) {
-        LOGI("uitest extension process confirmed running");
-        uitest_port_ = kDefaultVideoPort;
-        return true;
-    }
+    uitest_port_ = kDefaultVideoPort;
+    return true;
+}
 
-    LOGE("uitest extension process not found after start");
-    return false;
+static bool is_local_port_free(uint16_t port) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == INVALID_SOCKET) return false;
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bool free = (bind(s, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    closesocket(s);
+    return free;
 }
 
 bool ScreenCapture::setup_port_forward() {
-    hdc_.forward_remove_all();
     Sleep(200);
 
-    for (uint16_t port = kDefaultLocalBasePort; port < kDefaultLocalBasePort + 100; port += 2) {
-        local_video_port_ = port;
-        local_control_port_ = port + 1;
+    for (uint16_t base = kDefaultLocalBasePort; base < kDefaultLocalBasePort + 500; base += 2) {
+        if (!is_local_port_free(base) || !is_local_port_free(base + 1)) continue;
+
+        local_video_port_ = base;
+        local_control_port_ = base + 1;
 
         bool ok;
         if (use_abstract_socket_) {
             ok = hdc_.forward_localabstract(local_video_port_, kGrpcSocketName);
         } else {
-            char remote[32];
-            snprintf(remote, sizeof(remote), "tcp:%u", uitest_port_);
             ok = hdc_.forward_tcp(local_video_port_, uitest_port_);
         }
         if (ok) {
+            local_base_port_ = base;
             char remote_info[64];
             if (use_abstract_socket_) {
                 snprintf(remote_info, sizeof(remote_info), "%s", kGrpcSocketName);
             } else {
                 snprintf(remote_info, sizeof(remote_info), "tcp:%u", uitest_port_);
             }
-            LOGI("Port forward: local %u -> %s", local_video_port_, remote_info);
+            LOGI("Port forward: local %u -> %s (control will use %u)",
+                 local_video_port_, remote_info, local_control_port_);
             break;
         }
         local_video_port_ = 0;
+        local_control_port_ = 0;
     }
 
     if (local_video_port_ == 0) {
-        LOGE("Failed to set up port forward");
+        LOGE("Failed to set up port forward (no free local port)");
         return false;
     }
     return true;

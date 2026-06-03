@@ -496,7 +496,7 @@ void GrpcClient::streaming_loop() {
                 LOGI("No data for 300s, stream dead");
                 break;
             }
-            if (idle_count == 3 && got_first_data) {
+            if (idle_count == 10 && got_first_data) {
                 request_idr_frame();
                 LOGI("Requested IDR frame for keepalive");
             }

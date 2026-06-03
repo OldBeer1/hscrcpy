@@ -11,7 +11,7 @@ namespace hscrcpy {
 
 class InputInjector {
 public:
-    explicit InputInjector(HdcWrapper &hdc);
+    explicit InputInjector(HdcWrapper &hdc, uint16_t base_port = 0);
     ~InputInjector();
 
     bool init(const std::string &uitest_version = "");
@@ -38,11 +38,12 @@ private:
     bool send_to_socket(const std::string &json);
     bool setup_control_port();
     bool push_agent_so();
-    bool start_uitest_daemon();
+    bool ensure_uitest_agent();
 
     HdcWrapper &hdc_;
+    uint16_t base_port_ = 0;
     uint16_t local_control_port_ = 0;
-    bool use_abstract_socket_ = false;
+    bool use_abstract_control_ = false;
     bool use_socket_mode_ = false;
     int control_sock_ = -1;
     std::string uitest_version_;

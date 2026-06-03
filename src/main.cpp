@@ -98,6 +98,12 @@ static std::string get_selected_serial() {
     return g_devices[sel].serial;
 }
 
+static HdcDevice get_selected_device() {
+    int sel = (int)SendMessageA(g_combo_hwnd, CB_GETCURSEL, 0, 0);
+    if (sel == CB_ERR || sel >= (int)g_devices.size()) return {};
+    return g_devices[sel];
+}
+
 static std::pair<uint32_t, uint32_t> canvas_to_screen(int wx, int wy) {
     if (g_screen_w == 0 || g_screen_h == 0) return {0, 0};
     RECT rc;
@@ -278,24 +284,21 @@ static void stop_mirroring() {
     }
 
     SetWindowTextA(g_btn_start_hwnd, "Start Mirroring");
-    EnableWindow(g_combo_hwnd, TRUE);
-    EnableWindow(g_btn_refresh_hwnd, TRUE);
     set_status("Stopped");
     g_snapshot_warned = false;
 
     InvalidateRect(g_canvas_hwnd, NULL, TRUE);
 }
 
-static void start_mirroring(const std::string &serial) {
+static void start_mirroring(const std::string &serial, const std::string &ip = "127.0.0.1", const std::string &port = "8710") {
     if (g_mirroring) {
         stop_mirroring();
-        return;
     }
 
     set_status("Connecting...");
     EnableWindow(g_btn_start_hwnd, FALSE);
 
-    g_hdc = new HdcWrapper(serial);
+    g_hdc = new HdcWrapper(serial, ip, port);
     g_capture = new ScreenCapture(*g_hdc, 30);
 
     if (!g_capture->start()) {
@@ -330,7 +333,7 @@ static void start_mirroring(const std::string &serial) {
     g_screen_w = g_capture->width();
     g_screen_h = g_capture->height();
 
-    g_input = new InputInjector(*g_hdc);
+    g_input = new InputInjector(*g_hdc, g_capture->local_base_port());
     std::thread input_init_thread([]() {
         g_input->init(g_capture->uitest_version());
     });
@@ -339,8 +342,6 @@ static void start_mirroring(const std::string &serial) {
     g_mirroring = true;
     SetWindowTextA(g_btn_start_hwnd, "Stop Mirroring");
     EnableWindow(g_btn_start_hwnd, TRUE);
-    EnableWindow(g_combo_hwnd, FALSE);
-    EnableWindow(g_btn_refresh_hwnd, FALSE);
 
     double aspect = (double)g_screen_w / g_screen_h;
     int min_w = 440;
@@ -435,15 +436,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_COMBO:
             if (HIWORD(wp) == CBN_SELCHANGE) {
                 int sel = (int)SendMessageA(g_combo_hwnd, CB_GETCURSEL, 0, 0);
-                EnableWindow(g_btn_start_hwnd, sel != CB_ERR && !g_mirroring);
+                if (sel != CB_ERR) {
+                    if (g_mirroring) {
+                        auto dev = get_selected_device();
+                        if (!dev.serial.empty() && dev.serial != g_hdc->serial()) {
+                            start_mirroring(dev.serial, dev.ip, dev.port);
+                        }
+                    } else {
+                        EnableWindow(g_btn_start_hwnd, TRUE);
+                    }
+                }
             }
             break;
         case ID_BTN_START: {
             if (g_mirroring) {
                 stop_mirroring();
             } else {
-                std::string serial = get_selected_serial();
-                if (!serial.empty()) start_mirroring(serial);
+                auto dev = get_selected_device();
+                if (!dev.serial.empty()) start_mirroring(dev.serial, dev.ip, dev.port);
             }
             break;
         }
@@ -504,7 +514,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     SendMessageA(g_combo_hwnd, CB_SETCURSEL, idx, 0);
                     EnableWindow(g_btn_start_hwnd, TRUE);
                 }
-                start_mirroring(auto_serial);
+                std::string ip = "127.0.0.1", port = "8710";
+                if (idx != CB_ERR && idx < (int)g_devices.size()) {
+                    ip = g_devices[idx].ip;
+                    port = g_devices[idx].port;
+                } else {
+                    auto colon_pos = auto_serial.find(':');
+                    if (colon_pos != std::string::npos) {
+                        ip = auto_serial.substr(0, colon_pos);
+                        port = auto_serial.substr(colon_pos + 1);
+                    }
+                }
+                start_mirroring(auto_serial, ip, port);
             } else {
                 LOGW("No -s serial specified for auto-start");
             }

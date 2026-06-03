@@ -23,7 +23,7 @@ using socket_t = int;
 
 namespace hscrcpy {
 
-InputInjector::InputInjector(HdcWrapper &hdc) : hdc_(hdc) {}
+InputInjector::InputInjector(HdcWrapper &hdc, uint16_t base_port) : hdc_(hdc), base_port_(base_port) {}
 
 InputInjector::~InputInjector() { cleanup(); }
 
@@ -43,16 +43,14 @@ bool InputInjector::init(const std::string &uitest_version) {
 
     std::istringstream s1("6.0.2.1"), s2(uitest_version_);
     std::string p1, p2;
-    use_abstract_socket_ = false;
     while (std::getline(s1, p1, '.') && std::getline(s2, p2, '.')) {
         int n1 = std::atoi(p1.c_str());
         int n2 = std::atoi(p2.c_str());
-        if (n2 < n1) { use_abstract_socket_ = false; break; }
-        if (n2 > n1) { use_abstract_socket_ = true; break; }
+        if (n2 != n1) break;
     }
 
-    if (!start_uitest_daemon()) {
-        LOGW("Failed to start uitest daemon");
+    if (!ensure_uitest_agent()) {
+        LOGW("uitest agent may not be available");
     }
 
     if (!push_agent_so()) {
@@ -68,7 +66,7 @@ bool InputInjector::init(const std::string &uitest_version) {
     }
 
     use_socket_mode_ = true;
-    LOGI("Input injector initialized (socket mode, abstract=%s)", use_abstract_socket_ ? "true" : "false");
+    LOGI("Input injector initialized (socket mode, abstract_control=%s)", use_abstract_control_ ? "true" : "false");
     return true;
 }
 
@@ -78,30 +76,48 @@ void InputInjector::cleanup() {
         control_sock_ = -1;
     }
     if (local_control_port_ > 0) {
-        hdc_.forward_remove(local_control_port_, use_abstract_socket_,
-                            use_abstract_socket_ ? kUitestSocketName : "");
+        hdc_.forward_remove(local_control_port_, use_abstract_control_,
+                            use_abstract_control_ ? kUitestSocketName : "");
     }
 }
 
-bool InputInjector::start_uitest_daemon() {
+bool InputInjector::ensure_uitest_agent() {
     std::string output;
-    hdc_.shell_command("\"ps -ef | grep singleness\"", &output, 5);
-    bool has_singleness = false;
-    for (auto &line : output) {
-        if (output.find("singleness") != std::string::npos &&
-            output.find("extension-name") == std::string::npos &&
-            output.find("grep") == std::string::npos) {
-            has_singleness = true;
-            break;
-        }
-    }
-    if (has_singleness) {
-        LOGI("uitest daemon already running (without extension)");
+
+    hdc_.shell_command("cat /proc/net/unix | grep uitest_socket", &output, 3);
+    if (output.find("uitest_socket") != std::string::npos) {
+        LOGI("uitest agent already listening on abstract socket uitest_socket");
+        use_abstract_control_ = true;
         return true;
     }
+
+    hdc_.shell_command("netstat -an | grep 8012 | grep LISTEN", &output, 3);
+    if (output.find("8012") != std::string::npos && output.find("LISTEN") != std::string::npos) {
+        LOGI("uitest agent already listening on TCP port 8012");
+        use_abstract_control_ = false;
+        return true;
+    }
+
+    LOGI("No uitest agent found, starting uitest daemon...");
     hdc_.shell_command("uitest start-daemon singleness", nullptr, 5);
-    Sleep(1000);
-    return true;
+    Sleep(1500);
+
+    hdc_.shell_command("cat /proc/net/unix | grep uitest_socket", &output, 3);
+    if (output.find("uitest_socket") != std::string::npos) {
+        LOGI("uitest agent now listening on abstract socket uitest_socket");
+        use_abstract_control_ = true;
+        return true;
+    }
+
+    hdc_.shell_command("netstat -an | grep 8012 | grep LISTEN", &output, 3);
+    if (output.find("8012") != std::string::npos && output.find("LISTEN") != std::string::npos) {
+        LOGI("uitest agent now listening on TCP port 8012");
+        use_abstract_control_ = false;
+        return true;
+    }
+
+    LOGW("uitest agent still not available after start attempt");
+    return false;
 }
 
 bool InputInjector::push_agent_so() {
@@ -112,48 +128,45 @@ bool InputInjector::push_agent_so() {
     if (last_sep != std::string::npos) exe_dir = exe_dir.substr(0, last_sep + 1);
     std::string server_dir = exe_dir + "server";
 
-    std::string file_output;
-    hdc_.shell_command("file /system/bin/uitest", &file_output, 5);
-    bool is_x86 = file_output.find("x86_64") != std::string::npos;
-
     std::string agent_path;
-    if (is_x86) {
-        agent_path = server_dir + "\\uitest_agent_x86_1.1.9.so";
-    } else {
-        const char *agents[] = {
-            "uitest_agent_1.2.2.so",
-            "uitest_agent_1.1.10.so",
-            "uitest_agent_1.1.5.so",
-            "uitest_agent_1.1.3.so",
-        };
-        for (auto &name : agents) {
-            std::string path = server_dir + "\\" + name;
-            if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                agent_path = path;
-                break;
-            }
+    const char *agents[] = {
+        "uitest_agent_1.2.2.so",
+        "uitest_agent_1.1.10.so",
+        "uitest_agent_1.1.5.so",
+        "uitest_agent_1.1.3.so",
+        "uitest_agent_x86_1.1.9.so",
+    };
+    for (auto &name : agents) {
+        std::string path = server_dir + "\\" + name;
+        if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            agent_path = path;
+            break;
         }
     }
 
-    if (agent_path.empty() || GetFileAttributesA(agent_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    if (agent_path.empty()) {
         LOGW("No agent SO found");
         return false;
     }
 
     std::string check_output;
-    hdc_.shell_command("cat /data/local/tmp/agent.so | grep -a UITEST_AGENT_LIBRARY", &check_output, 5);
-    if (check_output.find("UITEST_AGENT_LIBRARY") != std::string::npos) {
+    hdc_.shell_command("ls -l /data/local/tmp/agent.so", &check_output, 3);
+    if (check_output.find("No such file") == std::string::npos && !check_output.empty()) {
         LOGI("Agent already exists on device");
         return true;
     }
 
+    LOGI("Pushing agent %s", agent_path.c_str());
     return hdc_.push_file(agent_path, kDeviceAgentPath);
 }
 
 bool InputInjector::setup_control_port() {
-    for (uint16_t port = 9950; port < 10050; port++) {
+    uint16_t start_port = base_port_ > 0 ? base_port_ + 1 : 9950;
+    uint16_t end_port = 10050;
+
+    for (uint16_t port = start_port; port < end_port; port++) {
         bool ok;
-        if (use_abstract_socket_) {
+        if (use_abstract_control_) {
             ok = hdc_.forward_localabstract(port, kUitestSocketName);
         } else {
             ok = hdc_.forward_tcp(port, kDefaultControlPort);
@@ -182,13 +195,15 @@ bool InputInjector::setup_control_port() {
 
     if (::connect(static_cast<socket_t>(control_sock_),
                   reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0) {
-        LOGW("Failed to connect to control port %u", local_control_port_);
+        LOGW("Failed to connect to control port %u (abstract=%s)", local_control_port_,
+             use_abstract_control_ ? "true" : "false");
         CLOSE_SOCKET(static_cast<socket_t>(control_sock_));
         control_sock_ = -1;
         return false;
     }
 
-    LOGI("Control socket connected on port %u", local_control_port_);
+    LOGI("Control socket connected on port %u (abstract=%s)", local_control_port_,
+         use_abstract_control_ ? "true" : "false");
     return true;
 }
 
@@ -196,10 +211,13 @@ bool InputInjector::send_to_socket(const std::string &json) {
     std::lock_guard<std::mutex> lock(socket_mutex_);
 
     if (control_sock_ < 0) {
-        if (!setup_control_port()) return false;
+        if (!setup_control_port()) {
+            LOGW("setup_control_port failed, falling back to shell mode");
+            use_socket_mode_ = false;
+            return false;
+        }
     }
 
-    LOGI("Sending to socket: %s", json.c_str());
     int n = ::send(static_cast<socket_t>(control_sock_),
                    json.c_str(), static_cast<int>(json.size()), 0);
     if (n <= 0) {
@@ -210,9 +228,18 @@ bool InputInjector::send_to_socket(const std::string &json) {
         if (setup_control_port()) {
             n = ::send(static_cast<socket_t>(control_sock_),
                        json.c_str(), static_cast<int>(json.size()), 0);
+            if (n <= 0) {
+                LOGW("send still failed after reconnect, falling back to shell mode");
+                use_socket_mode_ = false;
+                return false;
+            }
+        } else {
+            LOGW("reconnect failed, falling back to shell mode");
+            use_socket_mode_ = false;
+            return false;
         }
     }
-    return n > 0;
+    return true;
 }
 
 bool InputInjector::inject_click(uint32_t x, uint32_t y) {

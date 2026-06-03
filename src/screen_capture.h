@@ -37,6 +37,7 @@ public:
     CaptureMode mode() const { return mode_; }
     uint64_t frame_count() const { return frame_count_; }
     const std::string &uitest_version() const { return uitest_version_; }
+    uint16_t local_base_port() const { return local_base_port_; }
     HANDLE frame_event() const { return frame_event_; }
 
 private:
@@ -73,6 +74,7 @@ private:
     JpegDecoder jpeg_decoder_;
     uint16_t local_video_port_ = 0;
     uint16_t local_control_port_ = 0;
+    uint16_t local_base_port_ = 0;
     bool use_abstract_socket_ = false;
     uint16_t uitest_port_ = 5000;
     std::string uitest_version_;

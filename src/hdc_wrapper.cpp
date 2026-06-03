@@ -23,6 +23,10 @@ std::string HdcWrapper::build_hdc_cmd(const std::string &subcmd) {
     return cmd;
 }
 
+bool HdcWrapper::is_tcp_device() const {
+    return serial_.find(':') != std::string::npos;
+}
+
 int HdcWrapper::run_process(const std::string &cmd, std::string *output, int timeout_ms) {
     LOGI("CMD: %s (timeout=%d ms)", cmd.c_str(), timeout_ms);
 #ifdef _WIN32
@@ -135,10 +139,16 @@ std::vector<HdcDevice> HdcWrapper::list_devices() {
         if (line.find("failed") != std::string::npos) continue;
 
         auto tab_pos = line.find('\t');
-        if (tab_pos != std::string::npos) {
-            devices.push_back({line.substr(0, tab_pos), line.substr(tab_pos + 1), "127.0.0.1", "8710"});
-        } else if (!line.empty()) {
-            devices.push_back({line, "unknown", "127.0.0.1", "8710"});
+        std::string serial = (tab_pos != std::string::npos) ? line.substr(0, tab_pos) : line;
+        std::string state = (tab_pos != std::string::npos) ? line.substr(tab_pos + 1) : "unknown";
+
+        auto colon_pos = serial.find(':');
+        if (colon_pos != std::string::npos) {
+            std::string ip = serial.substr(0, colon_pos);
+            std::string port = serial.substr(colon_pos + 1);
+            devices.push_back({serial, state, ip, port});
+        } else {
+            devices.push_back({serial, state, "127.0.0.1", "8710"});
         }
     }
     return devices;
@@ -163,17 +173,44 @@ bool HdcWrapper::forward_localabstract(uint16_t local_port, const std::string &s
 }
 
 bool HdcWrapper::forward_remove(uint16_t local_port, bool is_abstract, const std::string &socket_name) {
-    char subcmd[256];
-    if (is_abstract) {
-        snprintf(subcmd, sizeof(subcmd), "fport rm tcp:%u localabstract:%s", local_port, socket_name.c_str());
-    } else {
-        snprintf(subcmd, sizeof(subcmd), "fport rm tcp:%u tcp:%u", local_port, 5000);
+    std::string output;
+    run_process(build_hdc_cmd("fport ls"), &output, 10000);
+    std::istringstream iss(output);
+    std::string line;
+    char local_str[32];
+    snprintf(local_str, sizeof(local_str), "tcp:%u", local_port);
+    while (std::getline(iss, line)) {
+        if (line.find(local_str) == std::string::npos) continue;
+        auto pos = line.find("tcp:");
+        if (pos == std::string::npos) pos = line.find("localabstract:");
+        if (pos == std::string::npos) continue;
+        std::string entry = line.substr(pos);
+        while (!entry.empty() && (entry.back() == '\r' || entry.back() == '\n' || entry.back() == ' '))
+            entry.pop_back();
+        std::string rm_cmd = "fport rm " + entry;
+        return run_process(build_hdc_cmd(rm_cmd), nullptr, 5000) == 0;
     }
-    return run_process(build_hdc_cmd(subcmd), nullptr, 10000) == 0;
+    return true;
 }
 
 bool HdcWrapper::forward_remove_all() {
-    return run_process(build_hdc_cmd("fport rm-all")) == 0;
+    std::string output;
+    run_process(build_hdc_cmd("fport ls"), &output, 10000);
+    std::istringstream iss(output);
+    std::string line;
+    bool any_removed = false;
+    while (std::getline(iss, line)) {
+        auto pos = line.find("tcp:");
+        if (pos == std::string::npos) continue;
+        std::string entry = line.substr(pos);
+        while (!entry.empty() && (entry.back() == '\r' || entry.back() == '\n' || entry.back() == ' '))
+            entry.pop_back();
+        std::string rm_cmd = "fport rm " + entry;
+        if (run_process(build_hdc_cmd(rm_cmd), nullptr, 5000) == 0) {
+            any_removed = true;
+        }
+    }
+    return any_removed;
 }
 
 bool HdcWrapper::shell_command(const std::string &cmd, std::string *output, int timeout_sec) {

@@ -37,6 +37,8 @@ private:
     int run_process(const std::string &cmd, std::string *output = nullptr, int timeout_ms = 30000);
     std::string build_hdc_cmd(const std::string &subcmd);
 
+    bool is_tcp_device() const;
+
     std::string serial_;
     std::string ip_;
     std::string port_;
