@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <memory>
 #include <chrono>
+#include <algorithm>
 
 #include <windows.h>
 #include <windowsx.h>
@@ -38,6 +39,7 @@ static HWND g_status_hwnd = nullptr;
 static HWND g_canvas_hwnd = nullptr;
 
 static std::vector<HdcDevice> g_devices;
+static hscrcpy::CliArgs g_cli_args;
 
 static std::shared_ptr<DecodedImage> g_cur_frame;
 static std::mutex g_frame_mutex;
@@ -494,14 +496,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (wp == 2) {
             KillTimer(hwnd, 2);
-            const char *auto_serial = "FMR0224B14009124";
-            LOGI("Auto-start with serial=%s", auto_serial);
-            int idx = (int)SendMessageA(g_combo_hwnd, CB_FINDSTRINGEXACT, -1, (LPARAM)auto_serial);
-            if (idx != CB_ERR) {
-                SendMessageA(g_combo_hwnd, CB_SETCURSEL, idx, 0);
-                EnableWindow(g_btn_start_hwnd, TRUE);
+            std::string auto_serial = g_cli_args.serial;
+            if (!auto_serial.empty()) {
+                LOGI("Auto-start with serial: %s", auto_serial.c_str());
+                int idx = (int)SendMessageA(g_combo_hwnd, CB_FINDSTRINGEXACT, -1, (LPARAM)auto_serial.c_str());
+                if (idx != CB_ERR) {
+                    SendMessageA(g_combo_hwnd, CB_SETCURSEL, idx, 0);
+                    EnableWindow(g_btn_start_hwnd, TRUE);
+                }
+                start_mirroring(auto_serial);
+            } else {
+                LOGW("No -s serial specified for auto-start");
             }
-            start_mirroring(auto_serial);
         }
         break;
     case WM_DESTROY:
@@ -517,6 +523,31 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     g_hInst = hInst;
+
+    {
+        std::string cmd_line(GetCommandLineA());
+        std::vector<std::string> argv_strs;
+        std::vector<char *> argv_vec;
+        std::string token;
+        bool in_quote = false;
+        for (char c : cmd_line) {
+            if (c == '"') { in_quote = !in_quote; }
+            else if (c == ' ' && !in_quote) {
+                if (!token.empty()) { argv_strs.push_back(token); token.clear(); }
+            } else { token += c; }
+        }
+        if (!token.empty()) argv_strs.push_back(token);
+        for (auto &s : argv_strs) argv_vec.push_back(s.data());
+        int argc = static_cast<int>(argv_vec.size());
+        if (!hscrcpy::CliParser::parse(g_cli_args, argc, argv_vec.data())) {
+            hscrcpy::CliParser::print_usage("hscrcpy");
+            return 1;
+        }
+        if (g_cli_args.show_help) {
+            hscrcpy::CliParser::print_usage("hscrcpy");
+            return 0;
+        }
+    }
 
     WNDCLASSEXA canvas_wc = {};
     canvas_wc.cbSize        = sizeof(canvas_wc);
@@ -549,7 +580,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     ShowWindow(g_hwnd, SW_SHOW);
     UpdateWindow(g_hwnd);
 
-    SetTimer(g_hwnd, 2, 2000, NULL);
+    if (g_cli_args.auto_start) {
+        SetTimer(g_hwnd, 2, 2000, NULL);
+    }
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {

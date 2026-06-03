@@ -324,7 +324,7 @@ bool ScreenCapture::start_uitest_with_extension() {
     }
     LOGI("Starting uitest: %s", cmd.c_str());
     hdc_.shell_command(cmd, nullptr, 5);
-    Sleep(3000);
+    Sleep(5000);
 
     std::string check;
     hdc_.shell_command("\"ps -ef | grep extension-name | grep -v grep\"", &check, 5);

@@ -13,6 +13,7 @@ struct CliArgs {
     bool no_control  = false;
     bool show_help   = false;
     bool verbose     = false;
+    bool auto_start  = false;
     int display_id   = 0;
 };
 

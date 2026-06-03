@@ -19,6 +19,8 @@ bool CliParser::parse(CliArgs &args, int argc, char *argv[]) {
             args.display_id = std::atoi(argv[++i]);
         } else if (arg == "-n" || arg == "--no-control") {
             args.no_control = true;
+        } else if (arg == "-a" || arg == "--auto-start") {
+            args.auto_start = true;
         } else if (arg == "-v" || arg == "--verbose") {
             args.verbose = true;
         } else if (arg == "--help") {
@@ -40,6 +42,7 @@ void CliParser::print_usage(const char *prog) {
     printf("  -f, --fps=FPS          Capture frame rate 1-60 (default %u)\n", kDefaultFps);
     printf("  -d, --display=ID       Display ID (default 0)\n");
     printf("  -n, --no-control       Disable device control\n");
+    printf("  -a, --auto-start       Auto connect and start mirroring on launch\n");
     printf("  -v, --verbose          Verbose output\n");
     printf("      --help             Show this help\n");
     printf("\nVideo stream: gRPC H264 (primary), snapshot_display (fallback)\n");
