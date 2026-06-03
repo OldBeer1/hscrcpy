@@ -330,22 +330,13 @@ bool InputInjector::inject_reboot() {
 }
 
 bool InputInjector::inject_wheel(uint32_t x, uint32_t y, int32_t delta) {
-    if (use_socket_mode_) {
-        char json[512];
-        const char *api = delta > 0 ? "AxisUp" : "AxisDown";
-        snprintf(json, sizeof(json),
-                 "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
-                 "\"params\":{\"api\":\"%s\",\"args\":{\"x\":%u,\"y\":%u}}}",
-                 api, x, y);
-        return send_to_socket(json);
-    }
-    char cmd[256];
+    uint32_t distance = 200;
+    uint32_t velocity = 600;
     if (delta > 0) {
-        snprintf(cmd, sizeof(cmd), "uitest uiInput swipe %u %u %u %u 600", x, y + 200, x, y - 200);
+        return inject_swipe(x, y + distance, x, y - distance, velocity);
     } else {
-        snprintf(cmd, sizeof(cmd), "uitest uiInput swipe %u %u %u %u 600", x, y - 200, x, y + 200);
+        return inject_swipe(x, y - distance, x, y + distance, velocity);
     }
-    return hdc_.shell_command(cmd, nullptr, 5);
 }
 
 } // namespace hscrcpy
