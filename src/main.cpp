@@ -311,13 +311,17 @@ static void start_mirroring(const std::string &serial, const std::string &ip = "
     }
 
     set_status("Waiting for frame...");
-    for (int i = 0; i < 300 && g_capture->width() == 0; i++) {
+    for (int i = 0; i < 100 && g_capture->width() == 0; i++) {
         MSG msg;
         while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
-        Sleep(100);
+        if (g_capture->frame_event()) {
+            WaitForSingleObject(g_capture->frame_event(), 200);
+        } else {
+            Sleep(50);
+        }
     }
 
     if (g_capture->width() == 0) {

@@ -287,32 +287,89 @@ bool ScreenCapture::push_agent_so() {
 }
 
 bool ScreenCapture::start_uitest_with_extension() {
-    std::string ps_output;
-    hdc_.shell_command("\"ps -ef | grep extension-name | grep -v grep\"", &ps_output, 5);
+    std::string combined;
+    hdc_.shell_command("\"/system/bin/uitest --version; echo '---'; md5sum /data/local/tmp/libscreen_casting.z.so; echo '---'; ps -ef | grep extension-name | grep -v grep\"", &combined, 10);
 
-    std::vector<std::string> pids;
-    std::istringstream iss(ps_output);
+    std::string ver_raw;
+    std::string device_md5;
+    std::string ps_output;
+    std::istringstream iss(combined);
     std::string line;
+    int section = 0;
     while (std::getline(iss, line)) {
+        if (line.find("---") != std::string::npos) { section++; continue; }
+        if (section == 0 && ver_raw.empty()) {
+            for (auto &c : line) {
+                if ((c >= '0' && c <= '9') || c == '.') ver_raw += c;
+                else if (!ver_raw.empty()) break;
+            }
+        } else if (section == 1 && device_md5.empty()) {
+            auto pos = line.find(' ');
+            if (pos == std::string::npos) pos = line.find('\t');
+            if (pos != std::string::npos) device_md5 = line.substr(0, pos);
+        } else if (section == 2) {
+            ps_output += line + "\n";
+        }
+    }
+
+    if (!ver_raw.empty()) {
+        uitest_version_ = ver_raw;
+    }
+    LOGI("uitest version: '%s', device_md5: '%s'", uitest_version_.c_str(), device_md5.c_str());
+
+    use_abstract_socket_ = version_compare_result(uitest_version_, "6.0.2.1") != "less";
+    LOGI("use_abstract_socket: %s", use_abstract_socket_ ? "true" : "false");
+
+    bool extension_running = false;
+    std::vector<std::string> pids;
+    std::istringstream piss(ps_output);
+    while (std::getline(piss, line)) {
         if (line.find("extension-name") == std::string::npos) continue;
         if (line.find("grep") != std::string::npos) continue;
+        extension_running = true;
         std::istringstream ls(line);
         std::string user, pid_str;
         if (ls >> user >> pid_str) {
             bool all_digit = true;
             for (char c : pid_str) { if (c < '0' || c > '9') { all_digit = false; break; } }
-            if (all_digit && !pid_str.empty()) {
-                pids.push_back(pid_str);
-            }
+            if (all_digit && !pid_str.empty()) pids.push_back(pid_str);
         }
     }
 
-    if (!pids.empty()) {
-        LOGI("Found %zu existing uitest extension process(es), killing with SIGKILL", pids.size());
+    std::string local_so = find_matching_so_with_md5(device_md5);
+    if (local_so.empty()) {
+        LOGE("No matching server .z.so found in %s", server_dir_.c_str());
+        return false;
+    }
+    LOGI("Using server SO: %s", local_so.c_str());
+
+    std::string local_md5 = get_local_so_md5(local_so);
+    bool so_up_to_date = !device_md5.empty() && device_md5 == local_md5;
+    LOGI("Device SO md5: %s, Local SO md5: %s, up_to_date: %s",
+         device_md5.c_str(), local_md5.c_str(), so_up_to_date ? "true" : "false");
+
+    if (extension_running && so_up_to_date && !pids.empty()) {
+        LOGI("uitest extension already running, killing for fresh gRPC connection");
         std::string kill_cmd = "kill -9";
         for (auto &p : pids) kill_cmd += " " + p;
         hdc_.shell_command(kill_cmd, nullptr, 3);
-        Sleep(1000);
+        Sleep(300);
+    } else if (!pids.empty()) {
+        LOGI("Killing %zu existing uitest extension process(es)", pids.size());
+        std::string kill_cmd = "kill -9";
+        for (auto &p : pids) kill_cmd += " " + p;
+        hdc_.shell_command(kill_cmd, nullptr, 3);
+        Sleep(300);
+    }
+
+    if (!so_up_to_date) {
+        LOGI("Pushing %s to %s", local_so.c_str(), kDeviceSoPath);
+        if (!hdc_.push_file(local_so, kDeviceSoPath)) {
+            LOGE("Failed to push server SO");
+            return false;
+        }
+    } else {
+        LOGI("Server SO already up to date on device");
     }
 
     std::string cmd;
@@ -324,7 +381,16 @@ bool ScreenCapture::start_uitest_with_extension() {
     }
     LOGI("Starting uitest: %s", cmd.c_str());
     hdc_.shell_command(cmd, nullptr, 5);
-    Sleep(3000);
+
+    for (int i = 0; i < 30; i++) {
+        Sleep(100);
+        std::string check;
+        hdc_.shell_command("netstat -an | grep 5000 | grep LISTEN", &check, 3);
+        if (check.find("5000") != std::string::npos && check.find("LISTEN") != std::string::npos) {
+            LOGI("uitest extension ready after %d ms", (i + 1) * 100);
+            break;
+        }
+    }
 
     uitest_port_ = kDefaultVideoPort;
     return true;
@@ -343,8 +409,6 @@ static bool is_local_port_free(uint16_t port) {
 }
 
 bool ScreenCapture::setup_port_forward() {
-    Sleep(200);
-
     for (uint16_t base = kDefaultLocalBasePort; base < kDefaultLocalBasePort + 500; base += 2) {
         if (!is_local_port_free(base) || !is_local_port_free(base + 1)) continue;
 
@@ -382,26 +446,12 @@ bool ScreenCapture::setup_port_forward() {
 
 bool ScreenCapture::setup_grpc_stream() {
     LOGI("setup_grpc_stream: serial='%s'", hdc_.serial().c_str());
-    uitest_version_ = get_uitest_version();
-    if (uitest_version_.empty()) {
-        LOGW("Could not get uitest version, assuming old version");
-        uitest_version_ = "4.0.0.0";
-    }
-
-    use_abstract_socket_ = version_compare_result(uitest_version_, "6.0.2.1") != "less";
-    LOGI("uitest version: %s, use_abstract_socket: %s",
-         uitest_version_.c_str(), use_abstract_socket_ ? "true" : "false");
 
     if (!decoder_.init()) {
         LOGW("H264 decoder not available (FFmpeg DLLs not found), skipping gRPC stream");
         LOGW("To enable gRPC virtual screen streaming, download FFmpeg shared DLLs from:");
         LOGW("https://github.com/BtbN/FFmpeg-Builds/releases");
         LOGW("Copy avcodec-62.dll, avutil-60.dll, swscale-9.dll, swresample-6.dll to the exe directory");
-        return false;
-    }
-
-    if (!push_server_so()) {
-        LOGE("Failed to push server SO");
         return false;
     }
 
@@ -414,8 +464,6 @@ bool ScreenCapture::setup_grpc_stream() {
         LOGE("Failed to setup port forward");
         return false;
     }
-
-    Sleep(500);
 
     bool connected = false;
     for (int retry = 0; retry < 5; retry++) {
@@ -435,9 +483,9 @@ bool ScreenCapture::setup_grpc_stream() {
                 cmd = "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so -scale 1 -frameRate 30 -bitRate 4000000 -p 5000 -iFrameInterval 2000 &";
             }
             hdc_.shell_command(cmd, nullptr, 5);
-            Sleep(3000);
-        } else {
             Sleep(1000);
+        } else {
+            Sleep(500);
         }
     }
 
@@ -449,8 +497,10 @@ bool ScreenCapture::setup_grpc_stream() {
     mode_ = CaptureMode::kGrpcStream;
     LOGI("gRPC stream setup complete, starting streaming");
 
-    hdc_.shell_command("power-shell wakeup", nullptr, 5);
-    LOGI("Sent power-shell wakeup (before streaming)");
+    std::thread([this]() {
+        hdc_.shell_command("power-shell wakeup", nullptr, 5);
+        LOGI("Sent power-shell wakeup (async)");
+    }).detach();
 
     return true;
 }
