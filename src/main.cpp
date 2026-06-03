@@ -39,9 +39,10 @@ static HWND g_canvas_hwnd = nullptr;
 
 static std::vector<HdcDevice> g_devices;
 
-static DecodedImage g_cur_frame;
+static std::shared_ptr<DecodedImage> g_cur_frame;
 static std::mutex g_frame_mutex;
 static uint64_t g_last_rendered_seq = 0;
+static HANDLE g_frame_event = nullptr;
 
 static int TOOLBAR_H = 62;
 static bool g_snapshot_warned = false;
@@ -145,8 +146,8 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         {
             std::lock_guard<std::mutex> lock(g_frame_mutex);
-            if (!g_cur_frame.data.empty() && g_cur_frame.width > 0) {
-                double aspect = (double)g_cur_frame.width / g_cur_frame.height;
+            if (g_cur_frame && !g_cur_frame->data.empty() && g_cur_frame->width > 0) {
+                double aspect = (double)g_cur_frame->width / g_cur_frame->height;
                 int draw_w, draw_h, off_x, off_y;
                 if ((double)cw / ch > aspect) {
                     draw_h = ch;
@@ -160,16 +161,16 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
                 BITMAPINFOHEADER bih = {};
                 bih.biSize     = sizeof(bih);
-                bih.biWidth    = static_cast<LONG>(g_cur_frame.width);
-                bih.biHeight   = -static_cast<LONG>(g_cur_frame.height);
+                bih.biWidth    = static_cast<LONG>(g_cur_frame->width);
+                bih.biHeight   = -static_cast<LONG>(g_cur_frame->height);
                 bih.biPlanes   = 1;
                 bih.biBitCount = 24;
                 bih.biCompression = BI_RGB;
 
                 SetStretchBltMode(memdc, HALFTONE);
                 StretchDIBits(memdc, off_x, off_y, draw_w, draw_h,
-                              0, 0, g_cur_frame.width, g_cur_frame.height,
-                              g_cur_frame.data.data(),
+                              0, 0, g_cur_frame->width, g_cur_frame->height,
+                              g_cur_frame->data.data(),
                               reinterpret_cast<BITMAPINFO *>(&bih),
                               DIB_RGB_COLORS, SRCCOPY);
             }
@@ -248,12 +249,12 @@ static uint64_t g_last_drawn_frame = 0;
 static void try_update_frame() {
     if (!g_capture) return;
     auto fc = g_capture->frame_count();
-    if (fc != g_last_drawn_frame) {
-        DecodedImage img;
-        if (g_capture->get_latest_frame(img) && !img.data.empty()) {
+    if (fc != g_last_rendered_seq) {
+        std::shared_ptr<DecodedImage> img;
+        if (g_capture->get_latest_frame(img) && img && !img->data.empty()) {
             std::lock_guard<std::mutex> lock(g_frame_mutex);
             g_cur_frame = std::move(img);
-            g_last_drawn_frame = fc;
+            g_last_rendered_seq = fc;
             InvalidateRect(g_canvas_hwnd, NULL, FALSE);
         }
     }
@@ -271,7 +272,7 @@ static void stop_mirroring() {
     g_screen_h = 0;
     {
         std::lock_guard<std::mutex> lock(g_frame_mutex);
-        g_cur_frame = DecodedImage();
+        g_cur_frame.reset();
     }
 
     SetWindowTextA(g_btn_start_hwnd, "Start Mirroring");
@@ -487,6 +488,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         if (wp == 1 && g_mirroring) {
             try_update_frame();
+            if (g_capture && g_capture->frame_event()) {
+                WaitForSingleObject(g_capture->frame_event(), 33);
+            }
         }
         if (wp == 2) {
             KillTimer(hwnd, 2);

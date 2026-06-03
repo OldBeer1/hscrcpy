@@ -498,6 +498,7 @@ bool ScreenCapture::start() {
     }
 
     running_ = true;
+    if (!frame_event_) frame_event_ = CreateEventA(NULL, FALSE, FALSE, NULL);
     if (mode_ == CaptureMode::kGrpcStream) {
         thread_ = std::thread(&ScreenCapture::grpc_stream_loop, this);
     } else {
@@ -513,6 +514,7 @@ void ScreenCapture::stop() {
     grpc_client_.disconnect();
     decoder_.cleanup();
 
+    if (frame_event_) { CloseHandle(frame_event_); frame_event_ = nullptr; }
     if (local_video_port_ > 0) {
         hdc_.forward_remove(local_video_port_, use_abstract_socket_,
                             use_abstract_socket_ ? kGrpcSocketName : "");
@@ -527,14 +529,20 @@ void ScreenCapture::grpc_stream_loop() {
         if (ok) {
             auto &img = decoder_.image();
             if (img.width > 0 && img.height > 0) {
-                std::lock_guard<std::mutex> lock(mutex_);
-                latest_frame_ = img;
+                uint32_t w = img.width, h = img.height;
+                auto frame = std::make_shared<DecodedImage>();
+                std::swap(*frame, decoder_.image_ref());
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    latest_frame_ = frame;
+                }
                 if (width_ == 0) {
-                    width_ = img.width;
-                    height_ = img.height;
+                    width_ = w;
+                    height_ = h;
                     LOGI("Screen resolution from stream: %ux%u", width_, height_);
                 }
                 frame_count_++;
+                if (frame_event_) SetEvent(frame_event_);
             } else {
                 LOGW("Decoded frame but width=0 height=0");
             }
@@ -601,9 +609,13 @@ bool ScreenCapture::capture_one_snapshot() {
     DeleteFileA(local_file.c_str());
 
     if (jpeg_decoder_.decode(buf.data(), buf.size())) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        latest_frame_ = jpeg_decoder_.image();
+        auto frame = std::make_shared<DecodedImage>(jpeg_decoder_.image());
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            latest_frame_ = frame;
+        }
         frame_count_++;
+        if (frame_event_) SetEvent(frame_event_);
         return true;
     }
 
@@ -635,9 +647,9 @@ void ScreenCapture::snapshot_loop() {
     LOGI("Snapshot loop stopped, frames: %llu", (unsigned long long)frame_count_.load());
 }
 
-bool ScreenCapture::get_latest_frame(DecodedImage &img) {
+bool ScreenCapture::get_latest_frame(std::shared_ptr<DecodedImage> &img) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (latest_frame_.data.empty()) return false;
+    if (!latest_frame_ || latest_frame_->data.empty()) return false;
     img = latest_frame_;
     return true;
 }

@@ -167,10 +167,15 @@ bool H264Decoder::decode(const uint8_t *h264_data, size_t h264_size) {
                     image_.data.resize(static_cast<size_t>(stride) * img_h);
                 }
 
-                for (uint32_t y = 0; y < img_h; y++) {
-                    memcpy(image_.data.data() + y * stride,
-                           frame_rgb_->data[0] + y * frame_rgb_->linesize[0],
-                           static_cast<size_t>(img_w) * 3);
+                if (stride == static_cast<int>(img_w) * 3) {
+                    memcpy(image_.data.data(), frame_rgb_->data[0],
+                           static_cast<size_t>(stride) * img_h);
+                } else {
+                    for (uint32_t y = 0; y < img_h; y++) {
+                        memcpy(image_.data.data() + y * stride,
+                               frame_rgb_->data[0] + y * frame_rgb_->linesize[0],
+                               static_cast<size_t>(img_w) * 3);
+                    }
                 }
                 got_frame = true;
             } else {

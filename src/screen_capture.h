@@ -12,6 +12,7 @@
 #include <atomic>
 #include <thread>
 #include <functional>
+#include <memory>
 
 namespace hscrcpy {
 
@@ -28,7 +29,7 @@ public:
     bool start();
     void stop();
 
-    bool get_latest_frame(DecodedImage &img);
+    bool get_latest_frame(std::shared_ptr<DecodedImage> &img);
 
     uint32_t width()  const { return width_; }
     uint32_t height() const { return height_; }
@@ -36,6 +37,7 @@ public:
     CaptureMode mode() const { return mode_; }
     uint64_t frame_count() const { return frame_count_; }
     const std::string &uitest_version() const { return uitest_version_; }
+    HANDLE frame_event() const { return frame_event_; }
 
 private:
     bool setup_grpc_stream();
@@ -62,8 +64,9 @@ private:
     std::atomic<bool> running_{false};
     std::thread thread_;
     std::mutex mutex_;
-    DecodedImage latest_frame_;
+    std::shared_ptr<DecodedImage> latest_frame_;
     std::atomic<uint64_t> frame_count_{0};
+    HANDLE frame_event_ = nullptr;
 
     GrpcClient grpc_client_;
     H264Decoder decoder_;
