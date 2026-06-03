@@ -436,11 +436,14 @@ void GrpcClient::stop_streaming() {
 bool GrpcClient::request_idr_frame() {
     if (!connected_) return false;
 
+    uint32_t sid = next_stream_id_;
+    next_stream_id_ += 2;
+
     std::vector<uint8_t> hpack_block;
     build_grpc_headers(hpack_block, "/ScrcpyService/onRequestIDRFrame");
 
     std::vector<uint8_t> headers_frame;
-    write_frame(headers_frame, 0x01, 0x04, 3,
+    write_frame(headers_frame, 0x01, 0x04, sid,
                 hpack_block.data(), hpack_block.size());
 
     if (!send_all(sock_, headers_frame.data(), headers_frame.size())) {
@@ -449,7 +452,7 @@ bool GrpcClient::request_idr_frame() {
 
     uint8_t grpc_empty[5] = {0, 0, 0, 0, 0};
     std::vector<uint8_t> data_frame;
-    write_frame(data_frame, 0x00, 0x01, 3, grpc_empty, 5);
+    write_frame(data_frame, 0x00, 0x01, sid, grpc_empty, 5);
 
     return send_all(sock_, data_frame.data(), data_frame.size());
 }
@@ -489,9 +492,13 @@ void GrpcClient::streaming_loop() {
         }
         if (sel == 0) {
             idle_count++;
-            if (idle_count >= 10) {
-                LOGI("No data for 30s, stream dead");
+            if (idle_count >= 100) {
+                LOGI("No data for 300s, stream dead");
                 break;
+            }
+            if (idle_count == 3 && got_first_data) {
+                request_idr_frame();
+                LOGI("Requested IDR frame for keepalive");
             }
             continue;
         }
@@ -586,16 +593,8 @@ void GrpcClient::streaming_loop() {
                 LOGI("HEADERS frame: stream=%u len=%u flags=0x%02x", stream_id, frame_len, flags);
                 if (stream_id == 1 && !idr_requested_) {
                     idr_requested_ = true;
-                    std::vector<uint8_t> hpack_idr;
-                    build_grpc_headers(hpack_idr, "/ScrcpyService/onRequestIDRFrame");
-                    std::vector<uint8_t> idr_hdr;
-                    write_frame(idr_hdr, 0x01, 0x04, 3, hpack_idr.data(), hpack_idr.size());
-                    send_all(sock_, idr_hdr.data(), idr_hdr.size());
-                    uint8_t grpc_empty[5] = {0, 0, 0, 0, 0};
-                    std::vector<uint8_t> idr_dat;
-                    write_frame(idr_dat, 0x00, 0x01, 3, grpc_empty, 5);
-                    send_all(sock_, idr_dat.data(), idr_dat.size());
-                    LOGI("Sent IDR request on stream 3 after stream 1 HEADERS");
+                    request_idr_frame();
+                    LOGI("Sent IDR request after stream 1 HEADERS");
                 }
             } else if (frame_type == 0x04) {
                 if (!(flags & 0x01)) {

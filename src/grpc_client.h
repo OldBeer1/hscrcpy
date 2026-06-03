@@ -46,6 +46,7 @@ private:
     std::vector<uint8_t> leftover_buf_;
     uint32_t server_window_size_ = 65535;
     bool idr_requested_ = false;
+    uint32_t next_stream_id_ = 3;
 };
 
 } // namespace hscrcpy

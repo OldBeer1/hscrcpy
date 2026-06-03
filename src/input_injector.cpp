@@ -27,16 +27,19 @@ InputInjector::InputInjector(HdcWrapper &hdc) : hdc_(hdc) {}
 
 InputInjector::~InputInjector() { cleanup(); }
 
-bool InputInjector::init() {
-    std::string output;
-    hdc_.shell_command("/system/bin/uitest --version", &output, 8);
-    std::string ver;
-    for (auto &c : output) {
-        if ((c >= '0' && c <= '9') || c == '.') ver += c;
-        else if (!ver.empty()) break;
+bool InputInjector::init(const std::string &uitest_version) {
+    if (!uitest_version.empty()) {
+        uitest_version_ = uitest_version;
+        LOGI("Input: uitest version (shared): %s", uitest_version_.c_str());
+    } else {
+        std::string output;
+        hdc_.shell_command("/system/bin/uitest --version", &output, 8);
+        for (auto &c : output) {
+            if ((c >= '0' && c <= '9') || c == '.') uitest_version_ += c;
+            else if (!uitest_version_.empty()) break;
+        }
+        LOGI("Input: uitest version: %s", uitest_version_.c_str());
     }
-    uitest_version_ = ver;
-    LOGI("Input: uitest version: %s", uitest_version_.c_str());
 
     std::istringstream s1("6.0.2.1"), s2(uitest_version_);
     std::string p1, p2;
@@ -135,6 +138,13 @@ bool InputInjector::push_agent_so() {
     if (agent_path.empty() || GetFileAttributesA(agent_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
         LOGW("No agent SO found");
         return false;
+    }
+
+    std::string check_output;
+    hdc_.shell_command("cat /data/local/tmp/agent.so | grep -a UITEST_AGENT_LIBRARY", &check_output, 5);
+    if (check_output.find("UITEST_AGENT_LIBRARY") != std::string::npos) {
+        LOGI("Agent already exists on device");
+        return true;
     }
 
     return hdc_.push_file(agent_path, kDeviceAgentPath);

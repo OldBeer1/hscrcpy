@@ -328,7 +328,10 @@ static void start_mirroring(const std::string &serial) {
     g_screen_h = g_capture->height();
 
     g_input = new InputInjector(*g_hdc);
-    g_input->init();
+    std::thread input_init_thread([]() {
+        g_input->init(g_capture->uitest_version());
+    });
+    input_init_thread.detach();
 
     g_mirroring = true;
     SetWindowTextA(g_btn_start_hwnd, "Stop Mirroring");
@@ -337,8 +340,13 @@ static void start_mirroring(const std::string &serial) {
     EnableWindow(g_btn_refresh_hwnd, FALSE);
 
     double aspect = (double)g_screen_w / g_screen_h;
-    int init_h = 640;
+    int min_w = 440;
+    int init_h = 480;
     int init_w = (int)(init_h * aspect);
+    if (init_w < min_w) {
+        init_w = min_w;
+        init_h = (int)(init_w / aspect);
+    }
 
     RECT wr = {0, 0, init_w, init_h + TOOLBAR_H};
     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);

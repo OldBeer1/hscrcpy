@@ -14,7 +14,7 @@ public:
     explicit InputInjector(HdcWrapper &hdc);
     ~InputInjector();
 
-    bool init();
+    bool init(const std::string &uitest_version = "");
     void cleanup();
 
     bool inject_click(uint32_t x, uint32_t y);
