@@ -284,7 +284,7 @@ bool ScreenCapture::push_agent_so() {
 
 bool ScreenCapture::start_uitest_with_extension() {
     std::string combined;
-    hdc_.shell_command("\"/system/bin/uitest --version; echo '---'; md5sum /data/local/tmp/libscreen_casting.z.so; echo '---'; ps -ef | grep extension-name | grep -v grep\"", &combined, 10);
+    hdc_.shell_command("/system/bin/uitest --version; echo '---'; md5sum /data/local/tmp/libscreen_casting.z.so; echo '---'; ps -ef | grep extension-name | grep -v grep", &combined, 10);
 
     std::string ver_raw;
     std::string device_md5;
@@ -356,8 +356,23 @@ bool ScreenCapture::start_uitest_with_extension() {
         hdc_.shell_command(kill_cmd, nullptr, 3);
         Sleep(300);
     } else if (extension_running) {
-        LOGI("Extension running but PID not found, killing all uitest processes");
-        hdc_.shell_command("\"kill -9 $(ps -ef | grep uitest | grep -v grep | awk '{print $2}')\"", nullptr, 3);
+        LOGI("Extension running but PID not found, re-querying");
+        std::string ps2;
+        hdc_.shell_command("ps -ef | grep libscreen_casting | grep -v grep", &ps2, 3);
+        std::istringstream iss2(ps2);
+        std::string line2;
+        while (std::getline(iss2, line2)) {
+            if (line2.find("grep") != std::string::npos) continue;
+            std::istringstream ls2(line2);
+            std::string user2, pid2;
+            if (ls2 >> user2 >> pid2) {
+                bool all_digit = true;
+                for (char c : pid2) { if (c < '0' || c > '9') { all_digit = false; break; } }
+                if (all_digit && !pid2.empty()) {
+                    hdc_.shell_command("kill -9 " + pid2, nullptr, 3);
+                }
+            }
+        }
         Sleep(300);
     }
 
@@ -381,14 +396,30 @@ bool ScreenCapture::start_uitest_with_extension() {
     LOGI("Starting uitest: %s", cmd.c_str());
     hdc_.shell_command(cmd, nullptr, 5);
 
+    bool extension_ready = false;
     for (int i = 0; i < 30; i++) {
         Sleep(100);
         std::string check;
-        hdc_.shell_command("netstat -an | grep 5000 | grep LISTEN", &check, 3);
-        if (check.find("5000") != std::string::npos && check.find("LISTEN") != std::string::npos) {
-            LOGI("uitest extension ready after %d ms", (i + 1) * 100);
-            break;
+        if (use_abstract_socket_) {
+            hdc_.shell_command("cat /proc/net/unix | grep " + std::string(kGrpcSocketName), &check, 3);
+            if (check.find(kGrpcSocketName) != std::string::npos) {
+                LOGI("uitest extension ready (abstract socket) after %d ms", (i + 1) * 100);
+                extension_ready = true;
+                break;
+            }
+        } else {
+            hdc_.shell_command("netstat -an | grep 5000 | grep LISTEN", &check, 3);
+            if (check.find("5000") != std::string::npos && check.find("LISTEN") != std::string::npos) {
+                LOGI("uitest extension ready (port 5000) after %d ms", (i + 1) * 100);
+                extension_ready = true;
+                break;
+            }
         }
+    }
+
+    if (!extension_ready) {
+        LOGE("uitest extension failed to start (port 5000 not listening after 3s)");
+        return false;
     }
 
     uitest_port_ = kDefaultVideoPort;
@@ -408,6 +439,17 @@ static bool is_local_port_free(uint16_t port) {
 }
 
 bool ScreenCapture::setup_port_forward() {
+    std::string remote_pattern;
+    if (use_abstract_socket_) {
+        remote_pattern = kGrpcSocketName;
+    } else {
+        char rp[32];
+        snprintf(rp, sizeof(rp), "tcp:%u", uitest_port_);
+        remote_pattern = rp;
+    }
+    LOGI("Cleaning up stale video forwards for remote: %s", remote_pattern.c_str());
+    hdc_.forward_remove_by_remote(remote_pattern);
+
     for (uint16_t base = kDefaultLocalBasePort; base < kDefaultLocalBasePort + 500; base += 2) {
         if (!is_local_port_free(base) || !is_local_port_free(base + 1)) continue;
 
@@ -574,6 +616,10 @@ void ScreenCapture::stop() {
         hdc_.forward_remove(local_video_port_, use_abstract_socket_,
                             use_abstract_socket_ ? kGrpcSocketName : "");
     }
+
+    hdc_.forward_remove_by_remote(use_abstract_socket_ ? kGrpcSocketName : "tcp:5000");
+    hdc_.forward_remove_by_remote(kUitestSocketName);
+    hdc_.forward_remove_by_remote("tcp:8012");
 
     if (mode_ == CaptureMode::kGrpcStream) {
         LOGI("Killing uitest extension on stop");

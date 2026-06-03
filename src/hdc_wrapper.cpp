@@ -193,6 +193,29 @@ bool HdcWrapper::forward_remove(uint16_t local_port, bool is_abstract, const std
     return true;
 }
 
+bool HdcWrapper::forward_remove_by_remote(const std::string &remote_pattern) {
+    std::string output;
+    run_process(build_hdc_cmd("fport ls"), &output, 10000);
+    std::istringstream iss(output);
+    std::string line;
+    bool any_removed = false;
+    while (std::getline(iss, line)) {
+        if (line.find(remote_pattern) == std::string::npos) continue;
+        auto pos = line.find("tcp:");
+        if (pos == std::string::npos) pos = line.find("localabstract:");
+        if (pos == std::string::npos) continue;
+        std::string entry = line.substr(pos);
+        while (!entry.empty() && (entry.back() == '\r' || entry.back() == '\n' || entry.back() == ' '))
+            entry.pop_back();
+        std::string rm_cmd = "fport rm " + entry;
+        if (run_process(build_hdc_cmd(rm_cmd), nullptr, 5000) == 0) {
+            LOGI("Removed stale forward: %s", entry.c_str());
+            any_removed = true;
+        }
+    }
+    return any_removed;
+}
+
 bool HdcWrapper::forward_remove_all() {
     std::string output;
     run_process(build_hdc_cmd("fport ls"), &output, 10000);

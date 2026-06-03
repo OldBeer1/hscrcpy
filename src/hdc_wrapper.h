@@ -25,6 +25,7 @@ public:
     bool forward_localabstract(uint16_t local_port, const std::string &socket_name);
     bool forward_remove(uint16_t local_port, bool is_abstract, const std::string &socket_name = "");
     bool forward_remove_all();
+    bool forward_remove_by_remote(const std::string &remote_pattern);
     bool shell_command(const std::string &cmd, std::string *output = nullptr, int timeout_sec = 30);
     bool push_file(const std::string &local_path, const std::string &remote_path);
     bool pull_file(const std::string &remote_path, const std::string &local_path);
