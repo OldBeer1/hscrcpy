@@ -1,6 +1,8 @@
 build/
 ffmpeg/
+decompiled/
 decompiled_gui/
+client/
 *.exe
 *.obj
 *.o
@@ -15,3 +17,4 @@ CMakeCache.txt
 Makefile
 *.cmake
 !CMakeLists.txt
+NUL
