@@ -3,6 +3,7 @@ ffmpeg/
 decompiled/
 decompiled_gui/
 client/
+server/
 *.exe
 *.obj
 *.o
