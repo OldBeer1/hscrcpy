@@ -1,14 +1,12 @@
+# Build output
 build/
-decompiled/
-decompiled_gui/
-client/
 *.exe
 *.obj
 *.o
 *.log
-*.dll
-*.a
-*.lib
+*.sh
+
+# VS
 .vs/
 CMakeFiles/
 cmake_install.cmake
@@ -16,4 +14,11 @@ CMakeCache.txt
 Makefile
 *.cmake
 !CMakeLists.txt
+
+# Decompiled
+decompiled/
+decompiled_gui/
+client/
+
+# Temp
 NUL

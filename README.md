@@ -57,37 +57,32 @@ Windows 端鸿蒙设备投屏控制工具，Base On [HOScrcpy](https://gitcode.c
 
 - Windows 10/11
 - [HDC](https://developer.huawei.com/consumer/cn/download/) (HarmonyOS Device Connector)，已加入 PATH
-- FFmpeg 共享库（用于 H264 视频解码）：
-  1. 从 https://github.com/BtbN/FFmpeg-Builds/releases 下载 `ffmpeg-master-latest-win64-gpl-shared.zip`
-  2. 将以下 DLL 复制到 `hscrcpy.exe` 同目录：
-     - `avcodec-62.dll`
-     - `avutil-60.dll`
-     - `swscale-9.dll`
-     - `swresample-6.dll`
-
-> 无 FFmpeg DLL 时，自动降级为 `snapshot_display` JPEG 抓屏模式（~2 FPS）。
 
 ## 构建
 
 ### 环境要求
 
-- CMake 3.16+
-- Cygwin + MinGW-w64 交叉编译工具链（x86_64-w64-mingw32-gcc/g++）
-- FFmpeg 7.x 开发头文件和导入库（.dll.a）
+- Windows 10/11
+- [MSYS2](https://www.msys2.org/) + MinGW-w64 工具链
+- **FFmpeg 7.x**（可选，用于 H264 硬解，无 FFmpeg 时自动降级 JPEG 快照模式）
 
 ### 编译
 
-```bat
-build.bat
+```powershell
+.\build.ps1
 ```
+
+首次运行会自动检测 MSYS2 并安装 GCC/CMake/Make，后续编译直接跳过安装步骤。
 
 输出：`build\hscrcpy.exe`
 
 ### 清理
 
-```bat
-build.bat clean
+```powershell
+.\build.ps1 -Clean
 ```
+
+输出：`build\hscrcpy.exe`
 
 ## 使用
 
@@ -115,7 +110,7 @@ Options:
 
 ### 示例
 
-```bat
+```cmd
 :: USB 设备自动投屏
 hscrcpy.exe -a -s FMR0224B14009124
 
@@ -159,7 +154,7 @@ hscrcpy/
 │   ├── main.cpp            # Win32 GUI 主程序
 │   ├── screen_capture.cpp  # 投屏核心（gRPC 流 / 快照回退）
 │   ├── grpc_client.cpp     # HTTP/2 + gRPC 客户端（无第三方依赖）
-│   ├── h264_decoder.cpp    # FFmpeg H264 解码
+│   ├── h264_decoder.cpp    # FFmpeg H264 解码（条件编译）
 │   ├── jpeg_decoder.cpp    # GDI+ JPEG 解码（回退模式）
 │   ├── input_injector.cpp  # 输入注入（uitest socket / shell）
 │   ├── hdc_wrapper.cpp     # HDC 命令封装
@@ -172,9 +167,10 @@ hscrcpy/
 ├── server/                 # 设备端二进制
 │   ├── libscrcpy_server*.z.so  # uitest 扩展（虚拟屏 H264 编码）
 │   └── uitest_agent*.so        # uitest agent（输入注入）
-├── docs/                   # 文档
+├── ffmpeg/                 # FFmpeg 开发文件（可选，需自行下载）
 ├── CMakeLists.txt          # CMake 构建配置
-├── build.bat               # Windows 构建脚本
+├── build.ps1               # Windows 构建脚本
+├── download_ffmpeg.ps1     # FFmpeg 自动下载脚本
 └── .gitignore
 ```
 
@@ -208,9 +204,9 @@ hscrcpy/
 
 ## 致谢
 
-- [HOScrcpy](https://gitcode.com/OpenHarmonyToolkitsPlaza/HOScrcpy/) — 鸿蒙投屏工具SDK
-- [scrcpy](https://github.com/Genymobile/scrcpy) — Android 投屏工具，架构设计参考
-- [FFmpeg](https://ffmpeg.org/) — H264 视频解码
+- [HOScrcpy](https://gitcode.com/OpenHarmonyToolkitsPlaza/HOScrcpy) — 鸿蒙投屏工具SDK
+- [scrcpy](https://github.com/Genymobile/scrcpy/) — Android 投屏工具，架构设计参考
+- [FFmpeg](https://ffmpeg.org) — H264 视频解码
 
 ## License
 
