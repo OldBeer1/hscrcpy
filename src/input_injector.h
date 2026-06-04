@@ -7,6 +7,9 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <condition_variable>
+#include <functional>
+#include <queue>
 
 namespace hscrcpy {
 
@@ -41,6 +44,7 @@ private:
     bool push_agent_so();
     bool ensure_uitest_agent();
     void reconnect_loop();
+    void task_loop();
 
     HdcWrapper &hdc_;
     uint16_t base_port_ = 0;
@@ -52,6 +56,12 @@ private:
     std::mutex socket_mutex_;
     std::atomic<bool> reconnect_running_{false};
     std::thread reconnect_thread_;
+
+    std::queue<std::function<void()>> task_queue_;
+    std::mutex task_mutex_;
+    std::condition_variable task_cv_;
+    std::atomic<bool> task_running_{false};
+    std::thread task_thread_;
 };
 
 } // namespace hscrcpy

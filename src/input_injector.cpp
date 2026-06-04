@@ -27,6 +27,9 @@ InputInjector::InputInjector(HdcWrapper &hdc, uint16_t base_port) : hdc_(hdc), b
 
 InputInjector::~InputInjector() {
     reconnect_running_ = false;
+    task_running_ = false;
+    task_cv_.notify_all();
+    if (task_thread_.joinable()) task_thread_.join();
     if (reconnect_thread_.joinable()) reconnect_thread_.join();
     cleanup();
 }
@@ -72,6 +75,8 @@ bool InputInjector::init(const std::string &uitest_version) {
     use_socket_mode_ = true;
     reconnect_running_ = true;
     reconnect_thread_ = std::thread(&InputInjector::reconnect_loop, this);
+    task_running_ = true;
+    task_thread_ = std::thread(&InputInjector::task_loop, this);
     LOGI("Input injector initialized (socket mode, abstract_control=%s)", use_abstract_control_ ? "true" : "false");
     return true;
 }
@@ -353,6 +358,30 @@ bool InputInjector::inject_reboot() {
 }
 
 bool InputInjector::inject_wheel(uint32_t x, uint32_t y, int32_t delta) {
+    if (use_socket_mode_) {
+        std::lock_guard<std::mutex> lock(task_mutex_);
+        task_queue_.push([this, x, y, delta]() {
+            int distance = 150;
+            uint32_t from_y, to_y;
+            if (delta > 0) {
+                from_y = y + distance;
+                to_y = y - distance;
+            } else {
+                from_y = y - distance;
+                to_y = y + distance;
+            }
+            inject_touch_down(x, from_y);
+            int steps = 5;
+            for (int i = 1; i <= steps; i++) {
+                uint32_t cy = from_y + (to_y - from_y) * i / steps;
+                inject_touch_move(x, cy);
+                Sleep(8);
+            }
+            inject_touch_up(x, to_y);
+        });
+        task_cv_.notify_one();
+        return true;
+    }
     uint32_t distance = 200;
     uint32_t velocity = 600;
     if (delta > 0) {
@@ -395,6 +424,22 @@ void InputInjector::reconnect_loop() {
         }
     }
     LOGI("Reconnect loop ended");
+}
+
+void InputInjector::task_loop() {
+    while (task_running_) {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lock(task_mutex_);
+            task_cv_.wait_for(lock, std::chrono::milliseconds(100), [this] {
+                return !task_queue_.empty() || !task_running_;
+            });
+            if (task_queue_.empty()) continue;
+            task = std::move(task_queue_.front());
+            task_queue_.pop();
+        }
+        task();
+    }
 }
 
 } // namespace hscrcpy
