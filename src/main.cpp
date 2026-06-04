@@ -153,6 +153,144 @@ static std::pair<uint32_t, uint32_t> canvas_to_screen(int wx, int wy) {
             static_cast<uint32_t>(rel_y * g_screen_h / draw_h)};
 }
 
+static WNDPROC g_canvas_orig_wndproc = nullptr;
+
+static int windows_key_to_harmonyos(int vk) {
+    switch (vk) {
+    case VK_BACK:   return 2055;
+    case VK_TAB:    return 2049;
+    case VK_RETURN: return 2119;
+    case VK_ESCAPE: return 2070;
+    case VK_SPACE:  return 2050;
+    case VK_LEFT:   return 2014;
+    case VK_UP:     return 2012;
+    case VK_RIGHT:  return 2015;
+    case VK_DOWN:   return 2013;
+    case VK_INSERT: return 2057;
+    case VK_DELETE: return 2056;
+    default:        return -1;
+    }
+}
+
+static uint32_t g_last_touch_x = 0, g_last_touch_y = 0;
+
+static std::string g_cjk_buf;
+static uint64_t g_cjk_buf_time = 0;
+static uint32_t g_cjk_x = 0, g_cjk_y = 0;
+
+static void flush_cjk_buffer() {
+    std::string text;
+    uint32_t x, y;
+    {
+        text = std::move(g_cjk_buf);
+        g_cjk_buf.clear();
+        g_cjk_buf_time = 0;
+        x = g_cjk_x;
+        y = g_cjk_y;
+    }
+    if (!text.empty() && g_input) {
+        LOGI("CJK flush: '%s' at (%u, %u)", text.c_str(), x, y);
+        g_input->inject_text(text, x, y);
+    }
+}
+
+static LRESULT CALLBACK CanvasKeyProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (g_mirroring && g_input) {
+        if (msg == WM_KEYDOWN) {
+            bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+
+            if (ctrl && wp == 'V') {
+                if (OpenClipboard(hwnd)) {
+                    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+                    if (h) {
+                        wchar_t *wtext = static_cast<wchar_t *>(GlobalLock(h));
+                        if (wtext) {
+                            int glen = WideCharToMultiByte(CP_ACP, 0, wtext, -1, NULL, 0, NULL, NULL);
+                            if (glen > 0) {
+                                std::vector<char> buf(glen);
+                                WideCharToMultiByte(CP_ACP, 0, wtext, -1, buf.data(), glen, NULL, NULL);
+                                std::string s(buf.data());
+                                if (!s.empty()) {
+                                    LOGI("Ctrl+V paste: '%s' at (%u, %u)", s.c_str(), g_last_touch_x, g_last_touch_y);
+                                    g_input->inject_text(s, g_last_touch_x, g_last_touch_y);
+                                }
+                            }
+                            GlobalUnlock(h);
+                        }
+                    } else {
+                        HANDLE h2 = GetClipboardData(CF_TEXT);
+                        if (h2) {
+                            char *text = static_cast<char *>(GlobalLock(h2));
+                            if (text) {
+                                std::string s(text);
+                                GlobalUnlock(h2);
+                                if (!s.empty()) {
+                                    LOGI("Ctrl+V paste (ANSI): '%s' at (%u, %u)", s.c_str(), g_last_touch_x, g_last_touch_y);
+                                    g_input->inject_text(s, g_last_touch_x, g_last_touch_y);
+                                }
+                            }
+                        }
+                    }
+                    CloseClipboard();
+                }
+                return 0;
+            }
+            if (ctrl) return CallWindowProcA(g_canvas_orig_wndproc, hwnd, msg, wp, lp);
+
+            if (wp >= 'A' && wp <= 'Z') {
+                int code = (wp - 'A') + 2017;
+                LOGI("Key '%c' -> HarmonyOS %d shift=%d", (char)wp, code, shift);
+                g_input->inject_key_code(code, shift);
+                return 0;
+            }
+            if (wp >= '0' && wp <= '9') {
+                int code = (wp - '0') + 2000;
+                LOGI("Key '%c' -> HarmonyOS %d", (char)wp, code);
+                g_input->inject_key_code(code);
+                return 0;
+            }
+            int hk = windows_key_to_harmonyos(static_cast<int>(wp));
+            if (hk > 0) {
+                LOGI("Key vk=%d -> HarmonyOS %d", (int)wp, hk);
+                g_input->inject_key_code(hk);
+                return 0;
+            }
+        }
+        if (msg == WM_CHAR) {
+            if (GetKeyState(VK_CONTROL) & 0x8000) {
+                return CallWindowProcA(g_canvas_orig_wndproc, hwnd, msg, wp, lp);
+            }
+            char ch = static_cast<char>(wp & 0xFF);
+            if (ch >= 32 && ch < 127) {
+                return 0;
+            }
+            if (static_cast<unsigned char>(ch) >= 0x80) {
+                static std::string pending_mb;
+                pending_mb += ch;
+                if (pending_mb.size() >= 2) {
+                    int wlen = MultiByteToWideChar(CP_ACP, 0, pending_mb.c_str(), (int)pending_mb.size(), NULL, 0);
+                    if (wlen > 0) {
+                        std::vector<wchar_t> wbuf(wlen);
+                        MultiByteToWideChar(CP_ACP, 0, pending_mb.c_str(), (int)pending_mb.size(), wbuf.data(), wlen);
+                        char gbk[64];
+                        int glen = WideCharToMultiByte(CP_ACP, 0, wbuf.data(), wlen, gbk, sizeof(gbk), NULL, NULL);
+                        if (glen > 0) {
+                            g_cjk_buf.append(gbk, glen);
+                            g_cjk_buf_time = GetTickCount64();
+                            g_cjk_x = g_last_touch_x;
+                            g_cjk_y = g_last_touch_y;
+                        }
+                    }
+                    pending_mb.clear();
+                }
+                return 0;
+            }
+        }
+    }
+    return CallWindowProcA(g_canvas_orig_wndproc, hwnd, msg, wp, lp);
+}
+
 static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_PAINT: {
@@ -216,10 +354,13 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_LBUTTONDOWN: {
         LOGI("Canvas WM_LBUTTONDOWN");
         if (g_mirroring && g_input) {
+            HWND prev = SetFocus(hwnd);
+            LOGI("SetFocus to canvas: hwnd=%p, prev=%p, err=%d", hwnd, prev, GetLastError());
             POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             auto [x, y] = canvas_to_screen(pt.x, pt.y);
             g_mouse_down = true;
             g_drag_start_x = x; g_drag_start_y = y;
+            g_last_touch_x = x; g_last_touch_y = y;
             g_last_click_time = std::chrono::steady_clock::now();
             g_input->inject_touch_down(x, y);
             SetCapture(hwnd);
@@ -244,11 +385,13 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
             int dx = static_cast<int>(x) - static_cast<int>(g_drag_start_x);
             int dy = static_cast<int>(y) - static_cast<int>(g_drag_start_y);
-            g_input->inject_touch_up(x, y);
             if (dx * dx + dy * dy >= 100) {
-                g_input->inject_swipe(g_drag_start_x, g_drag_start_y, x, y);
+                g_input->inject_touch_up(x, y);
             } else if (ms > 500) {
+                g_input->inject_touch_up(x, y);
                 g_input->inject_long_click(x, y);
+            } else {
+                g_input->inject_touch_up(x, y);
             }
         }
         return 0;
@@ -432,8 +575,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                        370, 38, 400, 18, hwnd, NULL, g_hInst, NULL);
 
         g_canvas_hwnd = CreateWindowA(CANVAS_CLASS, "",
-                                       WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+                                       WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_TABSTOP,
                                        0, TOOLBAR_H, 400, 400, hwnd, NULL, g_hInst, NULL);
+
+        g_canvas_orig_wndproc = (WNDPROC)SetWindowLongPtrA(g_canvas_hwnd, GWLP_WNDPROC, (LONG_PTR)CanvasKeyProc);
+        LOGI("Canvas subclassed, orig_wndproc=%p, err=%d", g_canvas_orig_wndproc, GetLastError());
 
         refresh_devices();
         break;
@@ -501,15 +647,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(g_canvas_hwnd, NULL, FALSE);
         break;
     }
-    case WM_KEYDOWN:
-        if (g_mirroring && g_input) {
-            if (wp == VK_BACK) g_input->inject_back();
-            if (wp == VK_HOME) g_input->inject_home();
-        }
-        break;
     case WM_TIMER:
         if (wp == 1 && g_mirroring) {
             try_update_frame();
+            if (!g_cjk_buf.empty() && g_cjk_buf_time > 0 && GetTickCount64() - g_cjk_buf_time >= 100) {
+                flush_cjk_buffer();
+            }
             if (g_capture && g_capture->frame_event()) {
                 WaitForSingleObject(g_capture->frame_event(), 33);
             }
@@ -664,6 +807,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     }
     case WM_DESTROY:
+        if (g_canvas_orig_wndproc && g_canvas_hwnd) {
+            SetWindowLongPtrA(g_canvas_hwnd, GWLP_WNDPROC, (LONG_PTR)g_canvas_orig_wndproc);
+            g_canvas_orig_wndproc = nullptr;
+        }
         if (g_mirroring || g_starting) {
             g_mirroring = false;
             g_starting = false;

@@ -36,6 +36,8 @@ public:
     bool inject_recent();
     bool inject_power();
     bool inject_key_event(const std::string &key);
+    bool inject_key_code(int key_code, bool shift = false);
+    bool inject_text(const std::string &text, uint32_t x = 0, uint32_t y = 0);
     bool inject_reboot();
 
 private:

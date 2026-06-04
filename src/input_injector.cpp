@@ -348,6 +348,43 @@ bool InputInjector::inject_key_event(const std::string &key) {
     return hdc_.shell_command("uinput -K -d " + key + " -u " + key, nullptr, 3);
 }
 
+bool InputInjector::inject_key_code(int key_code, bool shift) {
+    char cmd[256];
+    if (shift) {
+        snprintf(cmd, sizeof(cmd), "uinput -K -d 2047 -d %d -u %d -u 2047", key_code, key_code);
+    } else {
+        snprintf(cmd, sizeof(cmd), "uinput -K -d %d -u %d", key_code, key_code);
+    }
+    LOGI("inject_key_code: %s", cmd);
+    std::lock_guard<std::mutex> lock(task_mutex_);
+    task_queue_.push([this, c = std::string(cmd)]() {
+        hdc_.shell_command(c, nullptr, 3);
+    });
+    task_cv_.notify_one();
+    return true;
+}
+
+bool InputInjector::inject_text(const std::string &text, uint32_t x, uint32_t y) {
+    LOGI("inject_text: '%s' at (%u, %u)", text.c_str(), x, y);
+    std::string escaped;
+    for (char c : text) {
+        if (c == '\'') escaped += "'\\''";
+        else escaped += c;
+    }
+    char cmd[512];
+    if (x > 0 || y > 0) {
+        snprintf(cmd, sizeof(cmd), "uitest uiInput inputText %u %u '%s'", x, y, escaped.c_str());
+    } else {
+        snprintf(cmd, sizeof(cmd), "uitest uiInput inputText 0 0 '%s'", escaped.c_str());
+    }
+    std::lock_guard<std::mutex> lock(task_mutex_);
+    task_queue_.push([this, cmd]() {
+        hdc_.shell_command(cmd, nullptr, 5);
+    });
+    task_cv_.notify_one();
+    return true;
+}
+
 bool InputInjector::inject_reboot() {
     return hdc_.shell_command("reboot", nullptr, 5);
 }
