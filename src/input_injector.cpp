@@ -163,15 +163,6 @@ bool InputInjector::push_agent_so() {
 }
 
 bool InputInjector::setup_control_port() {
-    std::string remote_pattern;
-    if (use_abstract_control_) {
-        remote_pattern = kUitestSocketName;
-    } else {
-        remote_pattern = "tcp:8012";
-    }
-    LOGI("Cleaning up stale control forwards for remote: %s", remote_pattern.c_str());
-    hdc_.forward_remove_by_remote(remote_pattern);
-
     uint16_t start_port = base_port_ > 0 ? base_port_ + 1 : 9950;
     uint16_t end_port = 10050;
 
@@ -343,6 +334,10 @@ bool InputInjector::inject_back() {
 
 bool InputInjector::inject_home() {
     return hdc_.shell_command("uinput -K -d 1 -u 1", nullptr, 3);
+}
+
+bool InputInjector::inject_recent() {
+    return hdc_.shell_command("uitest uiInput keyEvent 10011", nullptr, 3);
 }
 
 bool InputInjector::inject_power() {

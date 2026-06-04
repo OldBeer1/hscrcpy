@@ -33,6 +33,7 @@ public:
     bool inject_swipe(uint32_t from_x, uint32_t from_y, uint32_t to_x, uint32_t to_y, uint32_t velocity = 600);
     bool inject_back();
     bool inject_home();
+    bool inject_recent();
     bool inject_power();
     bool inject_key_event(const std::string &key);
     bool inject_reboot();

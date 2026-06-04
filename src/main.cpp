@@ -30,11 +30,12 @@ static HWND g_hwnd = nullptr;
 static HWND g_combo_hwnd = nullptr;
 static HWND g_btn_start_hwnd = nullptr;
 static HWND g_btn_refresh_hwnd = nullptr;
-static HWND g_btn_power_hwnd = nullptr;
 static HWND g_btn_back_hwnd = nullptr;
+static HWND g_btn_home_hwnd = nullptr;
+static HWND g_btn_recent_hwnd = nullptr;
 static HWND g_btn_volup_hwnd = nullptr;
 static HWND g_btn_voldown_hwnd = nullptr;
-static HWND g_btn_home_hwnd = nullptr;
+static HWND g_btn_power_hwnd = nullptr;
 static HWND g_btn_reboot_hwnd = nullptr;
 static HWND g_status_hwnd = nullptr;
 static HWND g_canvas_hwnd = nullptr;
@@ -63,6 +64,7 @@ static auto g_last_click_time = std::chrono::steady_clock::now();
 #define ID_BTN_VOLDOWN 1007
 #define ID_BTN_HOME    1008
 #define ID_BTN_REBOOT  1009
+#define ID_BTN_RECENT  1010
 
 static void show_error(const char *msg) {
     MessageBoxA(g_hwnd, msg, "HScrcpy Error", MB_OK | MB_ICONERROR);
@@ -293,6 +295,9 @@ static void try_update_frame() {
 }
 
 static bool g_stopping = false;
+static std::string g_pending_start_serial;
+static std::string g_pending_start_ip;
+static std::string g_pending_start_port;
 
 static void stop_mirroring() {
     if (!g_mirroring && !g_starting) return;
@@ -332,7 +337,13 @@ static void stop_mirroring() {
 }
 
 static void start_mirroring(const std::string &serial, const std::string &ip = "127.0.0.1", const std::string &port = "8710") {
-    if (g_mirroring || g_starting || g_stopping) {
+    if (g_mirroring || g_starting) {
+        return;
+    }
+    if (g_stopping) {
+        g_pending_start_serial = serial;
+        g_pending_start_ip = ip;
+        g_pending_start_port = port;
         return;
     }
 
@@ -397,30 +408,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_btn_back_hwnd = CreateWindowA("BUTTON", "Back",
                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                          12, 34, 48, 22, hwnd, (HMENU)ID_BTN_BACK, g_hInst, NULL);
-
-        g_btn_power_hwnd = CreateWindowA("BUTTON", "Power",
-                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                          64, 34, 48, 22, hwnd, (HMENU)ID_BTN_POWER, g_hInst, NULL);
-
-        g_btn_volup_hwnd = CreateWindowA("BUTTON", "Vol+",
-                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                          116, 34, 42, 22, hwnd, (HMENU)ID_BTN_VOLUP, g_hInst, NULL);
-
-        g_btn_voldown_hwnd = CreateWindowA("BUTTON", "Vol-",
-                                            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                            162, 34, 42, 22, hwnd, (HMENU)ID_BTN_VOLDOWN, g_hInst, NULL);
-
         g_btn_home_hwnd = CreateWindowA("BUTTON", "Home",
                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                         208, 34, 46, 22, hwnd, (HMENU)ID_BTN_HOME, g_hInst, NULL);
-
+                                         64, 34, 48, 22, hwnd, (HMENU)ID_BTN_HOME, g_hInst, NULL);
+        g_btn_recent_hwnd = CreateWindowA("BUTTON", "Recent",
+                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                           116, 34, 50, 22, hwnd, (HMENU)ID_BTN_RECENT, g_hInst, NULL);
+        g_btn_volup_hwnd = CreateWindowA("BUTTON", "Vol+",
+                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                          170, 34, 42, 22, hwnd, (HMENU)ID_BTN_VOLUP, g_hInst, NULL);
+        g_btn_voldown_hwnd = CreateWindowA("BUTTON", "Vol-",
+                                            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                            216, 34, 42, 22, hwnd, (HMENU)ID_BTN_VOLDOWN, g_hInst, NULL);
+        g_btn_power_hwnd = CreateWindowA("BUTTON", "Power",
+                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                          262, 34, 48, 22, hwnd, (HMENU)ID_BTN_POWER, g_hInst, NULL);
         g_btn_reboot_hwnd = CreateWindowA("BUTTON", "Reboot",
                                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                            258, 34, 50, 22, hwnd, (HMENU)ID_BTN_REBOOT, g_hInst, NULL);
+                                            314, 34, 50, 22, hwnd, (HMENU)ID_BTN_REBOOT, g_hInst, NULL);
 
         g_status_hwnd = CreateWindowA("STATIC", "",
                                        WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                       320, 38, 200, 18, hwnd, NULL, g_hInst, NULL);
+                                       370, 38, 400, 18, hwnd, NULL, g_hInst, NULL);
 
         g_canvas_hwnd = CreateWindowA(CANVAS_CLASS, "",
                                        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
@@ -458,11 +467,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_BTN_REFRESH:
             refresh_devices();
             break;
-        case ID_BTN_POWER:
-            if (g_input) g_input->inject_power();
-            break;
         case ID_BTN_BACK:
             if (g_input) g_input->inject_back();
+            break;
+        case ID_BTN_HOME:
+            if (g_input) g_input->inject_home();
+            break;
+        case ID_BTN_RECENT:
+            if (g_input) g_input->inject_recent();
             break;
         case ID_BTN_VOLUP:
             if (g_input) g_input->inject_key_event("16");
@@ -470,8 +482,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_BTN_VOLDOWN:
             if (g_input) g_input->inject_key_event("17");
             break;
-        case ID_BTN_HOME:
-            if (g_input) g_input->inject_home();
+        case ID_BTN_POWER:
+            if (g_input) g_input->inject_power();
             break;
         case ID_BTN_REBOOT:
             if (g_mirroring) {
@@ -613,6 +625,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_stopping = false;
         EnableWindow(g_btn_start_hwnd, TRUE);
         set_status("Stopped");
+        if (!g_pending_start_serial.empty()) {
+            std::string s = std::move(g_pending_start_serial);
+            std::string i = std::move(g_pending_start_ip);
+            std::string p = std::move(g_pending_start_port);
+            g_pending_start_serial.clear();
+            g_pending_start_ip.clear();
+            g_pending_start_port.clear();
+            start_mirroring(s, i, p);
+        }
         break;
     }
     case WM_USER + 5: {

@@ -351,52 +351,57 @@ bool ScreenCapture::start_uitest_with_extension() {
         LOGI("Device SO md5 empty, will push");
     }
 
-    if (!pids.empty()) {
-        LOGI("Killing %zu existing uitest extension process(es)", pids.size());
-        std::string kill_cmd = "kill -9";
-        for (auto &p : pids) kill_cmd += " " + p;
-        hdc_.shell_command(kill_cmd, nullptr, 3);
-        Sleep(300);
-    } else if (extension_running) {
-        LOGI("Extension running but PID not found, re-querying");
-        std::string ps2;
-        hdc_.shell_command("ps -ef | grep libscreen_casting | grep -v grep", &ps2, 3);
-        std::istringstream iss2(ps2);
-        std::string line2;
-        while (std::getline(iss2, line2)) {
-            if (line2.find("grep") != std::string::npos) continue;
-            std::istringstream ls2(line2);
-            std::string user2, pid2;
-            if (ls2 >> user2 >> pid2) {
-                bool all_digit = true;
-                for (char c : pid2) { if (c < '0' || c > '9') { all_digit = false; break; } }
-                if (all_digit && !pid2.empty()) {
-                    hdc_.shell_command("kill -9 " + pid2, nullptr, 3);
+    bool can_reuse = extension_running && so_up_to_date;
+    if (can_reuse) {
+        LOGI("Extension already running with up-to-date SO, reusing");
+    } else {
+        if (!pids.empty()) {
+            LOGI("Killing %zu existing uitest extension process(es) for restart", pids.size());
+            std::string kill_cmd = "kill -9";
+            for (auto &p : pids) kill_cmd += " " + p;
+            hdc_.shell_command(kill_cmd, nullptr, 3);
+            Sleep(300);
+        } else if (extension_running) {
+            LOGI("Extension running but PID not found, re-querying");
+            std::string ps2;
+            hdc_.shell_command("ps -ef | grep libscreen_casting | grep -v grep", &ps2, 3);
+            std::istringstream iss2(ps2);
+            std::string line2;
+            while (std::getline(iss2, line2)) {
+                if (line2.find("grep") != std::string::npos) continue;
+                std::istringstream ls2(line2);
+                std::string user2, pid2;
+                if (ls2 >> user2 >> pid2) {
+                    bool all_digit = true;
+                    for (char c : pid2) { if (c < '0' || c > '9') { all_digit = false; break; } }
+                    if (all_digit && !pid2.empty()) {
+                        hdc_.shell_command("kill -9 " + pid2, nullptr, 3);
+                    }
                 }
             }
+            Sleep(300);
         }
-        Sleep(300);
-    }
 
-    if (!so_up_to_date) {
-        LOGI("Pushing %s to %s", local_so.c_str(), kDeviceSoPath);
-        if (!hdc_.push_file(local_so, kDeviceSoPath)) {
-            LOGE("Failed to push server SO");
-            return false;
+        if (!so_up_to_date) {
+            LOGI("Pushing %s to %s", local_so.c_str(), kDeviceSoPath);
+            if (!hdc_.push_file(local_so, kDeviceSoPath)) {
+                LOGE("Failed to push server SO");
+                return false;
+            }
+        } else {
+            LOGI("Server SO already up to date on device");
         }
-    } else {
-        LOGI("Server SO already up to date on device");
-    }
 
-    std::string cmd;
-    if (use_abstract_socket_) {
-        cmd = "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so -scale 1 -frameRate 30 -bitRate 4000000 " +
-              std::string(kGrpcSocketName) + " -iFrameInterval 2000 &";
-    } else {
-        cmd = "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so -scale 1 -frameRate 30 -bitRate 4000000 -p 5000 -iFrameInterval 2000 &";
+        std::string cmd;
+        if (use_abstract_socket_) {
+            cmd = "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so -scale 1 -frameRate 30 -bitRate 4000000 " +
+                  std::string(kGrpcSocketName) + " -iFrameInterval 2000 &";
+        } else {
+            cmd = "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so -scale 1 -frameRate 30 -bitRate 4000000 -p 5000 -iFrameInterval 2000 &";
+        }
+        LOGI("Starting uitest: %s", cmd.c_str());
+        hdc_.shell_command(cmd, nullptr, 5);
     }
-    LOGI("Starting uitest: %s", cmd.c_str());
-    hdc_.shell_command(cmd, nullptr, 5);
 
     bool extension_ready = false;
     for (int i = 0; i < 30; i++) {
@@ -441,17 +446,6 @@ static bool is_local_port_free(uint16_t port) {
 }
 
 bool ScreenCapture::setup_port_forward() {
-    std::string remote_pattern;
-    if (use_abstract_socket_) {
-        remote_pattern = kGrpcSocketName;
-    } else {
-        char rp[32];
-        snprintf(rp, sizeof(rp), "tcp:%u", uitest_port_);
-        remote_pattern = rp;
-    }
-    LOGI("Cleaning up stale video forwards for remote: %s", remote_pattern.c_str());
-    hdc_.forward_remove_by_remote(remote_pattern);
-
     for (uint16_t base = kDefaultLocalBasePort; base < kDefaultLocalBasePort + 500; base += 2) {
         if (!is_local_port_free(base) || !is_local_port_free(base + 1)) continue;
 
@@ -619,33 +613,8 @@ void ScreenCapture::stop() {
                             use_abstract_socket_ ? kGrpcSocketName : "");
     }
 
-    hdc_.forward_remove_by_remote(use_abstract_socket_ ? kGrpcSocketName : "tcp:5000");
-    hdc_.forward_remove_by_remote(kUitestSocketName);
-    hdc_.forward_remove_by_remote("tcp:8012");
-
     if (mode_ == CaptureMode::kGrpcStream) {
-        LOGI("Killing uitest extension on stop");
-        std::string ps_out;
-        hdc_.shell_command("ps -ef | grep libscreen_casting | grep -v grep", &ps_out, 3);
-        std::vector<std::string> pids;
-        std::istringstream iss(ps_out);
-        std::string line;
-        while (std::getline(iss, line)) {
-            if (line.find("libscreen_casting") == std::string::npos) continue;
-            if (line.find("grep") != std::string::npos) continue;
-            std::istringstream ls(line);
-            std::string user, pid_str;
-            if (ls >> user >> pid_str) {
-                bool all_digit = true;
-                for (char c : pid_str) { if (c < '0' || c > '9') { all_digit = false; break; } }
-                if (all_digit && !pid_str.empty()) pids.push_back(pid_str);
-            }
-        }
-        if (!pids.empty()) {
-            std::string kill_cmd = "kill -9";
-            for (auto &p : pids) kill_cmd += " " + p;
-            hdc_.shell_command(kill_cmd, nullptr, 3);
-        }
+        LOGI("Leaving uitest extension running for potential reuse by other instances");
     }
 }
 
