@@ -6,6 +6,7 @@
 #include <string>
 #include <atomic>
 #include <mutex>
+#include <thread>
 
 namespace hscrcpy {
 
@@ -39,15 +40,18 @@ private:
     bool setup_control_port();
     bool push_agent_so();
     bool ensure_uitest_agent();
+    void reconnect_loop();
 
     HdcWrapper &hdc_;
     uint16_t base_port_ = 0;
     uint16_t local_control_port_ = 0;
     bool use_abstract_control_ = false;
-    bool use_socket_mode_ = false;
-    int control_sock_ = -1;
+    std::atomic<bool> use_socket_mode_{false};
+    std::atomic<int> control_sock_{-1};
     std::string uitest_version_;
     std::mutex socket_mutex_;
+    std::atomic<bool> reconnect_running_{false};
+    std::thread reconnect_thread_;
 };
 
 } // namespace hscrcpy

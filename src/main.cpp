@@ -25,6 +25,7 @@ static ScreenCapture *g_capture = nullptr;
 static InputInjector *g_input = nullptr;
 static uint32_t g_screen_w = 0, g_screen_h = 0;
 static bool g_mirroring = false;
+static bool g_starting = false;
 static HWND g_hwnd = nullptr;
 static HWND g_combo_hwnd = nullptr;
 static HWND g_btn_start_hwnd = nullptr;
@@ -284,13 +285,15 @@ static void try_update_frame() {
     }
 }
 
-static void stop_mirroring() {
-    if (!g_mirroring) return;
-    g_mirroring = false;
+static bool g_stopping = false;
 
-    if (g_capture) { g_capture->stop(); delete g_capture; g_capture = nullptr; }
-    if (g_input) { delete g_input; g_input = nullptr; }
-    if (g_hdc) { delete g_hdc; g_hdc = nullptr; }
+static void stop_mirroring() {
+    if (!g_mirroring && !g_starting) return;
+    if (g_stopping) return;
+
+    g_mirroring = false;
+    g_starting = false;
+    g_stopping = true;
 
     g_screen_w = 0;
     g_screen_h = 0;
@@ -300,101 +303,69 @@ static void stop_mirroring() {
     }
 
     SetWindowTextA(g_btn_start_hwnd, "Start Mirroring");
-    set_status("Stopped");
+    EnableWindow(g_btn_start_hwnd, FALSE);
+    set_status("Stopping...");
     g_snapshot_warned = false;
 
     InvalidateRect(g_canvas_hwnd, NULL, TRUE);
+
+    auto *cap = g_capture;
+    auto *inp = g_input;
+    auto *hdc = g_hdc;
+    g_capture = nullptr;
+    g_input = nullptr;
+    g_hdc = nullptr;
+
+    std::thread([cap, inp, hdc]() {
+        if (cap) { cap->stop(); delete cap; }
+        if (inp) { delete inp; }
+        if (hdc) { delete hdc; }
+        PostMessageA(g_hwnd, WM_USER + 4, 0, 0);
+    }).detach();
 }
 
 static void start_mirroring(const std::string &serial, const std::string &ip = "127.0.0.1", const std::string &port = "8710") {
-    if (g_mirroring) {
-        stop_mirroring();
+    if (g_mirroring || g_starting || g_stopping) {
+        return;
     }
 
+    g_starting = true;
     set_status("Connecting...");
     EnableWindow(g_btn_start_hwnd, FALSE);
 
     g_hdc = new HdcWrapper(serial, ip, port);
     g_capture = new ScreenCapture(*g_hdc, 30);
 
-    if (!g_capture->start()) {
-        show_error("Failed to start screen capture.");
-        delete g_capture; g_capture = nullptr;
-        delete g_hdc; g_hdc = nullptr;
-        EnableWindow(g_btn_start_hwnd, TRUE);
-        set_status("Failed");
-        return;
-    }
-
-    set_status("Waiting for frame...");
-    for (int i = 0; i < 100 && g_capture->width() == 0; i++) {
-        MSG msg;
-        while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
+    std::thread([serial, ip, port]() {
+        bool ok = false;
+        try {
+            ok = g_capture->start();
+        } catch (const std::exception &e) {
+            LOGE("g_capture->start() exception: %s", e.what());
+            ok = false;
         }
-        if (g_capture->frame_event()) {
-            WaitForSingleObject(g_capture->frame_event(), 200);
-        } else {
-            Sleep(50);
+
+        if (!ok) {
+            PostMessageA(g_hwnd, WM_USER + 1, 0, 0);
+            return;
         }
-    }
 
-    if (g_capture->width() == 0) {
-        show_error("No frame received.");
-        g_capture->stop();
-        delete g_capture; g_capture = nullptr;
-        delete g_hdc; g_hdc = nullptr;
-        EnableWindow(g_btn_start_hwnd, TRUE);
-        set_status("No frame");
-        return;
-    }
+        HANDLE evt = g_capture->frame_event();
+        for (int i = 0; i < 150 && g_capture->width() == 0; i++) {
+            if (evt) {
+                WaitForSingleObject(evt, 100);
+            } else {
+                Sleep(100);
+            }
+        }
 
-    g_screen_w = g_capture->width();
-    g_screen_h = g_capture->height();
+        if (g_capture->width() == 0) {
+            PostMessageA(g_hwnd, WM_USER + 2, 0, 0);
+            return;
+        }
 
-    g_input = new InputInjector(*g_hdc, g_capture->local_base_port());
-    std::thread input_init_thread([]() {
-        g_input->init(g_capture->uitest_version());
-    });
-    input_init_thread.detach();
-
-    g_mirroring = true;
-    SetWindowTextA(g_btn_start_hwnd, "Stop Mirroring");
-    EnableWindow(g_btn_start_hwnd, TRUE);
-
-    double aspect = (double)g_screen_w / g_screen_h;
-    int min_w = 440;
-    int init_h = 480;
-    int init_w = (int)(init_h * aspect);
-    if (init_w < min_w) {
-        init_w = min_w;
-        init_h = (int)(init_w / aspect);
-    }
-
-    RECT wr = {0, 0, init_w, init_h + TOOLBAR_H};
-    AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
-    SetWindowPos(g_hwnd, NULL, CW_USEDEFAULT, CW_USEDEFAULT,
-                 wr.right - wr.left, wr.bottom - wr.top, SWP_NOMOVE | SWP_NOZORDER);
-
-    char buf[256];
-    const char *mode_str = g_capture->mode() == CaptureMode::kGrpcStream ? "gRPC" : "snapshot";
-    snprintf(buf, sizeof(buf), "HScrcpy - %s %ux%u (%s)",
-             serial.c_str(), g_screen_w, g_screen_h, mode_str);
-    SetWindowTextA(g_hwnd, buf);
-    set_status(buf);
-
-    if (g_capture->mode() == CaptureMode::kSnapshotFallback && !g_snapshot_warned) {
-        g_snapshot_warned = true;
-        MessageBoxA(g_hwnd,
-                    "Virtual screen streaming unavailable (FFmpeg DLLs not found or gRPC failed).\n"
-                    "Falling back to screenshot mode (~2 FPS).\n\n"
-                    "To enable gRPC virtual screen streaming, download FFmpeg shared DLLs:\n"
-                    "https://github.com/BtbN/FFmpeg-Builds/releases\n"
-                    "Copy avcodec-62.dll, avutil-60.dll, swscale-9.dll, swresample-6.dll\n"
-                    "to the exe directory.",
-                    "HScrcpy - Screenshot Mode", MB_OK | MB_ICONWARNING);
-    }
+        PostMessageA(g_hwnd, WM_USER + 3, 0, 0);
+    }).detach();
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -551,8 +522,100 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         break;
+    case WM_USER + 1: {
+        g_starting = false;
+        show_error("Failed to start screen capture.");
+        auto *cap = g_capture;
+        auto *hdc_ptr = g_hdc;
+        g_capture = nullptr;
+        g_hdc = nullptr;
+        EnableWindow(g_btn_start_hwnd, TRUE);
+        set_status("Failed");
+        std::thread([cap, hdc_ptr]() {
+            if (cap) { cap->stop(); delete cap; }
+            delete hdc_ptr;
+        }).detach();
+        break;
+    }
+    case WM_USER + 2: {
+        g_starting = false;
+        show_error("No frame received.");
+        auto *cap = g_capture;
+        auto *hdc_ptr = g_hdc;
+        g_capture = nullptr;
+        g_hdc = nullptr;
+        EnableWindow(g_btn_start_hwnd, TRUE);
+        set_status("No frame");
+        std::thread([cap, hdc_ptr]() {
+            if (cap) { cap->stop(); delete cap; }
+            delete hdc_ptr;
+        }).detach();
+        break;
+    }
+    case WM_USER + 3: {
+        g_starting = false;
+        g_screen_w = g_capture->width();
+        g_screen_h = g_capture->height();
+
+        g_input = new InputInjector(*g_hdc, g_capture->local_base_port());
+        std::thread input_init_thread([]() {
+            g_input->init(g_capture->uitest_version());
+        });
+        input_init_thread.detach();
+
+        g_mirroring = true;
+        SetWindowTextA(g_btn_start_hwnd, "Stop Mirroring");
+        EnableWindow(g_btn_start_hwnd, TRUE);
+
+        double aspect = (double)g_screen_w / g_screen_h;
+        int min_w = 440;
+        int init_h = 480;
+        int init_w = (int)(init_h * aspect);
+        if (init_w < min_w) {
+            init_w = min_w;
+            init_h = (int)(init_w / aspect);
+        }
+
+        RECT wr = {0, 0, init_w, init_h + TOOLBAR_H};
+        AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+        SetWindowPos(g_hwnd, NULL, CW_USEDEFAULT, CW_USEDEFAULT,
+                     wr.right - wr.left, wr.bottom - wr.top, SWP_NOMOVE | SWP_NOZORDER);
+
+        std::string serial = g_hdc->serial();
+        char buf[256];
+        const char *mode_str = g_capture->mode() == CaptureMode::kGrpcStream ? "gRPC" : "snapshot";
+        snprintf(buf, sizeof(buf), "HScrcpy - %s %ux%u (%s)",
+                 serial.c_str(), g_screen_w, g_screen_h, mode_str);
+        SetWindowTextA(g_hwnd, buf);
+        set_status(buf);
+
+        if (g_capture->mode() == CaptureMode::kSnapshotFallback && !g_snapshot_warned) {
+            g_snapshot_warned = true;
+            MessageBoxA(g_hwnd,
+                        "Virtual screen streaming unavailable (FFmpeg DLLs not found or gRPC failed).\n"
+                        "Falling back to screenshot mode (~2 FPS).\n\n"
+                        "To enable gRPC virtual screen streaming, download FFmpeg shared DLLs:\n"
+                        "https://github.com/BtbN/FFmpeg-Builds/releases\n"
+                        "Copy avcodec-62.dll, avutil-60.dll, swscale-9.dll, swresample-6.dll\n"
+                        "to the exe directory.",
+                        "HScrcpy - Screenshot Mode", MB_OK | MB_ICONWARNING);
+        }
+        break;
+    }
+    case WM_USER + 4: {
+        g_stopping = false;
+        EnableWindow(g_btn_start_hwnd, TRUE);
+        set_status("Stopped");
+        break;
+    }
     case WM_DESTROY:
-        if (g_mirroring) stop_mirroring();
+        if (g_mirroring || g_starting) {
+            g_mirroring = false;
+            g_starting = false;
+            if (g_capture) { g_capture->stop(); delete g_capture; g_capture = nullptr; }
+            if (g_input) { delete g_input; g_input = nullptr; }
+            if (g_hdc) { delete g_hdc; g_hdc = nullptr; }
+        }
         KillTimer(hwnd, 1);
         PostQuitMessage(0);
         break;

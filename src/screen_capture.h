@@ -58,8 +58,8 @@ private:
 
     HdcWrapper &hdc_;
     uint32_t fps_ = 30;
-    uint32_t width_ = 0;
-    uint32_t height_ = 0;
+    std::atomic<uint32_t> width_{0};
+    std::atomic<uint32_t> height_{0};
     CaptureMode mode_ = CaptureMode::kGrpcStream;
 
     std::atomic<bool> running_{false};

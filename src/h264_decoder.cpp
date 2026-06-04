@@ -3,6 +3,10 @@
 #include <cstring>
 #include <cstdio>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
@@ -11,6 +15,21 @@ extern "C" {
 }
 
 namespace hscrcpy {
+
+static bool preload_ffmpeg_dlls() {
+    const char *dlls[] = {"swresample-6.dll", "avutil-60.dll", "swscale-9.dll", "avcodec-62.dll"};
+    for (auto name : dlls) {
+        if (!GetModuleHandleA(name)) {
+            HMODULE h = LoadLibraryA(name);
+            if (!h) {
+                LOGE("LoadLibrary('%s') failed: error %lu", name, GetLastError());
+                return false;
+            }
+            LOGI("Preloaded %s", name);
+        }
+    }
+    return true;
+}
 
 H264Decoder::H264Decoder() {}
 
@@ -21,9 +40,15 @@ H264Decoder::~H264Decoder() {
 bool H264Decoder::init() {
     if (initialized_) return true;
 
+    if (!preload_ffmpeg_dlls()) {
+        LOGE("FFmpeg DLLs not available - gRPC streaming disabled");
+        LOGE("Required: avcodec-62.dll, avutil-60.dll, swscale-9.dll, swresample-6.dll in exe directory");
+        return false;
+    }
+
     const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
     if (!codec) {
-        LOGE("H264 codec not found");
+        LOGE("H264 codec not found - FFmpeg DLL may be incompatible");
         return false;
     }
 

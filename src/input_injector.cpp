@@ -25,7 +25,11 @@ namespace hscrcpy {
 
 InputInjector::InputInjector(HdcWrapper &hdc, uint16_t base_port) : hdc_(hdc), base_port_(base_port) {}
 
-InputInjector::~InputInjector() { cleanup(); }
+InputInjector::~InputInjector() {
+    reconnect_running_ = false;
+    if (reconnect_thread_.joinable()) reconnect_thread_.join();
+    cleanup();
+}
 
 bool InputInjector::init(const std::string &uitest_version) {
     if (!uitest_version.empty()) {
@@ -66,14 +70,17 @@ bool InputInjector::init(const std::string &uitest_version) {
     }
 
     use_socket_mode_ = true;
+    reconnect_running_ = true;
+    reconnect_thread_ = std::thread(&InputInjector::reconnect_loop, this);
     LOGI("Input injector initialized (socket mode, abstract_control=%s)", use_abstract_control_ ? "true" : "false");
     return true;
 }
 
 void InputInjector::cleanup() {
-    if (control_sock_ >= 0) {
-        CLOSE_SOCKET(static_cast<socket_t>(control_sock_));
-        control_sock_ = -1;
+    reconnect_running_ = false;
+    int sock = control_sock_.exchange(-1);
+    if (sock >= 0) {
+        CLOSE_SOCKET(static_cast<socket_t>(sock));
     }
     if (local_control_port_ > 0) {
         hdc_.forward_remove(local_control_port_, use_abstract_control_,
@@ -181,8 +188,8 @@ bool InputInjector::setup_control_port() {
         return false;
     }
 
-    control_sock_ = static_cast<int>(socket(AF_INET, SOCK_STREAM, 0));
-    if (control_sock_ == static_cast<int>(INVALID_SOCK)) {
+    int sock = static_cast<int>(socket(AF_INET, SOCK_STREAM, 0));
+    if (sock == static_cast<int>(INVALID_SOCK)) {
         LOGE("Failed to create control socket");
         return false;
     }
@@ -192,49 +199,39 @@ bool InputInjector::setup_control_port() {
     addr.sin_port = htons(local_control_port_);
     inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
-    if (::connect(static_cast<socket_t>(control_sock_),
+    if (::connect(static_cast<socket_t>(sock),
                   reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0) {
         LOGW("Failed to connect to control port %u (abstract=%s)", local_control_port_,
              use_abstract_control_ ? "true" : "false");
-        CLOSE_SOCKET(static_cast<socket_t>(control_sock_));
-        control_sock_ = -1;
+        CLOSE_SOCKET(static_cast<socket_t>(sock));
         return false;
     }
 
+    control_sock_.store(sock);
     LOGI("Control socket connected on port %u (abstract=%s)", local_control_port_,
          use_abstract_control_ ? "true" : "false");
     return true;
 }
 
 bool InputInjector::send_to_socket(const std::string &json) {
-    std::lock_guard<std::mutex> lock(socket_mutex_);
-
-    if (control_sock_ < 0) {
-        if (!setup_control_port()) {
-            LOGW("setup_control_port failed, falling back to shell mode");
-            use_socket_mode_ = false;
-            return false;
-        }
+    int sock = control_sock_.load();
+    if (sock < 0) {
+        return false;
     }
 
-    int n = ::send(static_cast<socket_t>(control_sock_),
+    std::lock_guard<std::mutex> lock(socket_mutex_);
+    sock = control_sock_.load();
+    if (sock < 0) {
+        return false;
+    }
+
+    int n = ::send(static_cast<socket_t>(sock),
                    json.c_str(), static_cast<int>(json.size()), 0);
     if (n <= 0) {
-        LOGW("send to socket failed (n=%d), reconnecting...", n);
-        CLOSE_SOCKET(static_cast<socket_t>(control_sock_));
-        control_sock_ = -1;
-        Sleep(50);
-        if (setup_control_port()) {
-            n = ::send(static_cast<socket_t>(control_sock_),
-                       json.c_str(), static_cast<int>(json.size()), 0);
-            if (n <= 0) {
-                LOGW("send still failed after reconnect");
-                return false;
-            }
-        } else {
-            LOGW("reconnect failed");
-            return false;
-        }
+        LOGW("send to socket failed (n=%d)", n);
+        CLOSE_SOCKET(static_cast<socket_t>(sock));
+        control_sock_.store(-1);
+        return false;
     }
     return true;
 }
@@ -363,6 +360,41 @@ bool InputInjector::inject_wheel(uint32_t x, uint32_t y, int32_t delta) {
     } else {
         return inject_swipe(x, y - distance, x, y + distance, velocity);
     }
+}
+
+void InputInjector::reconnect_loop() {
+    LOGI("Reconnect loop started");
+    while (reconnect_running_) {
+        Sleep(2000);
+        if (!reconnect_running_) break;
+        if (control_sock_.load() >= 0) continue;
+
+        LOGI("Control socket disconnected, attempting reconnect...");
+
+        if (!ensure_uitest_agent()) {
+            LOGW("Reconnect: uitest agent not available");
+            continue;
+        }
+
+        int old_sock = control_sock_.exchange(-1);
+        uint16_t old_port = local_control_port_;
+        local_control_port_ = 0;
+
+        if (old_sock >= 0) {
+            CLOSE_SOCKET(static_cast<socket_t>(old_sock));
+        }
+        if (old_port > 0) {
+            hdc_.forward_remove(old_port, use_abstract_control_,
+                                use_abstract_control_ ? kUitestSocketName : "");
+        }
+
+        if (setup_control_port()) {
+            LOGI("Control socket reconnected on port %u", local_control_port_);
+        } else {
+            LOGW("Reconnect: setup_control_port failed");
+        }
+    }
+    LOGI("Reconnect loop ended");
 }
 
 } // namespace hscrcpy

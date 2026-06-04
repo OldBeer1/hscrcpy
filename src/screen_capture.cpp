@@ -308,8 +308,10 @@ bool ScreenCapture::start_uitest_with_extension() {
         }
     }
 
-    if (!ver_raw.empty()) {
+    if (!ver_raw.empty() && ver_raw.find('.') != std::string::npos) {
         uitest_version_ = ver_raw;
+    } else if (!ver_raw.empty()) {
+        LOGW("Parsed uitest version '%s' has no dot, ignoring (likely PID from ps output)", ver_raw.c_str());
     }
     LOGI("uitest version: '%s', device_md5: '%s'", uitest_version_.c_str(), device_md5.c_str());
 
@@ -560,13 +562,13 @@ bool ScreenCapture::setup_snapshot_fallback() {
         sscanf(output.c_str(), " %*[^w]width %u, height %u", &w, &h) == 2) {
         width_ = w;
         height_ = h;
-        LOGI("Screen resolution from snapshot: %ux%u", width_, height_);
+        LOGI("Screen resolution from snapshot: %ux%u", width_.load(), height_.load());
     }
 
     if (width_ == 0) {
         width_ = 1260;
         height_ = 2720;
-        LOGI("Using default resolution: %ux%u", width_, height_);
+        LOGI("Using default resolution: %ux%u", width_.load(), height_.load());
     }
 
     return true;
@@ -665,7 +667,7 @@ void ScreenCapture::grpc_stream_loop() {
                 if (width_ == 0) {
                     width_ = w;
                     height_ = h;
-                    LOGI("Screen resolution from stream: %ux%u", width_, height_);
+                    LOGI("Screen resolution from stream: %ux%u", width_.load(), height_.load());
                 }
                 frame_count_++;
                 if (frame_event_) SetEvent(frame_event_);
