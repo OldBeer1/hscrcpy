@@ -277,6 +277,13 @@ static void try_update_frame() {
     if (fc != g_last_rendered_seq) {
         std::shared_ptr<DecodedImage> img;
         if (g_capture->get_latest_frame(img) && img && !img->data.empty()) {
+            if (img->width != g_screen_w || img->height != g_screen_h) {
+                LOGI("Frame resolution changed: %ux%u -> %ux%u",
+                     g_screen_w, g_screen_h, img->width, img->height);
+                g_screen_w = img->width;
+                g_screen_h = img->height;
+                PostMessageA(g_hwnd, WM_USER + 5, 0, 0);
+            }
             std::lock_guard<std::mutex> lock(g_frame_mutex);
             g_cur_frame = std::move(img);
             g_last_rendered_seq = fc;
@@ -606,6 +613,33 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_stopping = false;
         EnableWindow(g_btn_start_hwnd, TRUE);
         set_status("Stopped");
+        break;
+    }
+    case WM_USER + 5: {
+        if (!g_mirroring || !g_capture || !g_hdc) break;
+
+        double aspect = (double)g_screen_w / g_screen_h;
+        int min_w = 440;
+        int init_h = 480;
+        int init_w = (int)(init_h * aspect);
+        if (init_w < min_w) {
+            init_w = min_w;
+            init_h = (int)(init_w / aspect);
+        }
+
+        RECT wr = {0, 0, init_w, init_h + TOOLBAR_H};
+        AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+        SetWindowPos(g_hwnd, NULL, 0, 0,
+                     wr.right - wr.left, wr.bottom - wr.top,
+                     SWP_NOMOVE | SWP_NOZORDER);
+
+        std::string serial = g_hdc->serial();
+        char buf[256];
+        const char *mode_str = g_capture->mode() == CaptureMode::kGrpcStream ? "gRPC" : "snapshot";
+        snprintf(buf, sizeof(buf), "HScrcpy - %s %ux%u (%s)",
+                 serial.c_str(), g_screen_w, g_screen_h, mode_str);
+        SetWindowTextA(g_hwnd, buf);
+        set_status(buf);
         break;
     }
     case WM_DESTROY:

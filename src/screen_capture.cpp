@@ -664,10 +664,10 @@ void ScreenCapture::grpc_stream_loop() {
                     std::lock_guard<std::mutex> lock(mutex_);
                     latest_frame_ = frame;
                 }
-                if (width_ == 0) {
+                if (w != width_.load() || h != height_.load()) {
                     width_ = w;
                     height_ = h;
-                    LOGI("Screen resolution from stream: %ux%u", width_.load(), height_.load());
+                    LOGI("Screen resolution changed: %ux%u", width_.load(), height_.load());
                 }
                 frame_count_++;
                 if (frame_event_) SetEvent(frame_event_);
@@ -704,12 +704,13 @@ bool ScreenCapture::capture_one_snapshot() {
         return false;
     }
 
-    if (width_ == 0) {
-        unsigned w = 0, h = 0;
-        if (sscanf(output.c_str(), "process: display %*d: width %u, height %u", &w, &h) == 2 ||
-            sscanf(output.c_str(), " %*[^w]width %u, height %u", &w, &h) == 2) {
+    unsigned w = 0, h = 0;
+    if (sscanf(output.c_str(), "process: display %*d: width %u, height %u", &w, &h) == 2 ||
+        sscanf(output.c_str(), " %*[^w]width %u, height %u", &w, &h) == 2) {
+        if (w != width_.load() || h != height_.load()) {
             width_ = w;
             height_ = h;
+            LOGI("Screen resolution changed: %ux%u", width_.load(), height_.load());
         }
     }
 
