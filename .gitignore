@@ -8,6 +8,7 @@ build/
 
 # VS
 .vs/
+.vscode/
 CMakeFiles/
 cmake_install.cmake
 CMakeCache.txt

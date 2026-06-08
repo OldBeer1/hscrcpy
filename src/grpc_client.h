@@ -1,6 +1,11 @@
 #ifndef HSCRCPY_GRPC_CLIENT_H
 #define HSCRCPY_GRPC_CLIENT_H
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
 #include <cstdint>
 #include <vector>
 #include <string>

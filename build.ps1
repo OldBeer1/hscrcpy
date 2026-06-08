@@ -170,6 +170,16 @@ if (-not (Test-Path "build\server")) {
     Write-Ok "server\ - already exists"
 }
 
+if (-not (Test-Path "build\res")) {
+    if (Test-Path "res") {
+        Copy-Item -Recurse -Force "res" "build\res"
+        Write-Ok "res\ - copied"
+    }
+} else {
+    Copy-Item -Force "res\*" "build\res\"
+    Write-Ok "res\ - updated"
+}
+
 if ($ffmpegBinDir -and (Test-Path $ffmpegBinDir)) {
     foreach ($dll in @("avcodec-62.dll","avutil-60.dll","swscale-9.dll","swresample-6.dll")) {
         $src = "$ffmpegBinDir\$dll"
@@ -185,5 +195,5 @@ Write-Host "=== Build succeeded ===" -ForegroundColor Green
 Write-Host "Output: build\hscrcpy.exe"
 Write-Host ""
 Write-Host "Next steps:"
-Write-Host "  1. Connect a HarmonyOS device via USB"
+Write-Host "  1. Connect a HarmonyOS device via USB or TCP"
 Write-Host "  2. Run: .\build\hscrcpy.exe"

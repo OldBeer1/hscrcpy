@@ -6,8 +6,6 @@
 #include <sstream>
 
 #ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
 using socket_t = SOCKET;
 #define INVALID_SOCK INVALID_SOCKET
 #define CLOSE_SOCKET closesocket
@@ -324,6 +322,49 @@ bool InputInjector::inject_touch_up(uint32_t x, uint32_t y) {
         return send_to_socket(json);
     }
     return true;
+}
+
+bool InputInjector::inject_mouse_down(const std::string &button, uint32_t x, uint32_t y) {
+    if (use_socket_mode_) {
+        char json[512];
+        snprintf(json, sizeof(json),
+                 "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
+                 "\"params\":{\"api\":\"mouseDown\",\"args\":{\"x\":%u,\"y\":%u,\"mouseType\":\"%s\"}}}",
+                 x, y, button.c_str());
+        return send_to_socket(json);
+    }
+    return inject_touch_down(x, y);
+}
+
+bool InputInjector::inject_mouse_move(const std::string &button, uint32_t x, uint32_t y) {
+    if (use_socket_mode_) {
+        char json[512];
+        if (button.empty()) {
+            snprintf(json, sizeof(json),
+                     "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
+                     "\"params\":{\"api\":\"mouseMove\",\"args\":{\"x\":%u,\"y\":%u}}}",
+                     x, y);
+        } else {
+            snprintf(json, sizeof(json),
+                     "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
+                     "\"params\":{\"api\":\"mouseMove\",\"args\":{\"x\":%u,\"y\":%u,\"mouseType\":\"%s\"}}}",
+                     x, y, button.c_str());
+        }
+        return send_to_socket(json);
+    }
+    return inject_touch_move(x, y);
+}
+
+bool InputInjector::inject_mouse_up(const std::string &button, uint32_t x, uint32_t y) {
+    if (use_socket_mode_) {
+        char json[512];
+        snprintf(json, sizeof(json),
+                 "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
+                 "\"params\":{\"api\":\"mouseUp\",\"args\":{\"x\":%u,\"y\":%u,\"mouseType\":\"%s\"}}}",
+                 x, y, button.c_str());
+        return send_to_socket(json);
+    }
+    return inject_touch_up(x, y);
 }
 
 bool InputInjector::inject_swipe(uint32_t from_x, uint32_t from_y, uint32_t to_x, uint32_t to_y, uint32_t velocity) {

@@ -1,10 +1,17 @@
 #ifndef HSCRCPY_SCREEN_CAPTURE_H
 #define HSCRCPY_SCREEN_CAPTURE_H
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#endif
+
 #include "hdc_wrapper.h"
 #include "grpc_client.h"
 #include "h264_decoder.h"
 #include "jpeg_decoder.h"
+#include "protocol.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -25,7 +32,7 @@ enum class CaptureMode {
 
 class ScreenCapture {
 public:
-    ScreenCapture(HdcWrapper &hdc, uint32_t fps = 30);
+    ScreenCapture(HdcWrapper &hdc, const CaptureConfig &config = CaptureConfig{});
     ~ScreenCapture();
 
     bool start();
@@ -41,6 +48,7 @@ public:
     const std::string &uitest_version() const { return uitest_version_; }
     uint16_t local_base_port() const { return local_base_port_; }
     HANDLE frame_event() const { return frame_event_; }
+    const CaptureConfig &config() const { return config_; }
 
 private:
     bool setup_grpc_stream(bool force_restart = false);
@@ -58,7 +66,7 @@ private:
     bool capture_one_snapshot();
 
     HdcWrapper &hdc_;
-    uint32_t fps_ = 30;
+    CaptureConfig config_;
     std::atomic<uint32_t> width_{0};
     std::atomic<uint32_t> height_{0};
     CaptureMode mode_ = CaptureMode::kGrpcStream;

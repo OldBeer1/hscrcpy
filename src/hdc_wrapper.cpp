@@ -15,7 +15,7 @@ HdcWrapper::HdcWrapper(const std::string &serial,
     : serial_(serial), ip_(ip), port_(port) {}
 
 bool HdcWrapper::ensure_connected() {
-    if (!is_tcp_device()) return true;
+    if (!is_tcp()) return true;
 
     std::string result;
     std::string cmd = "tconn " + serial_;
@@ -42,8 +42,73 @@ std::string HdcWrapper::build_hdc_cmd(const std::string &subcmd) {
     return cmd;
 }
 
-bool HdcWrapper::is_tcp_device() const {
+bool HdcWrapper::is_tcp() const {
     return serial_.find(':') != std::string::npos;
+}
+
+bool HdcWrapper::get_screen_resolution(uint32_t &width, uint32_t &height) {
+    std::string output;
+    if (!shell_command("hidumper -s RenderService -a screen", &output, 10)) {
+        LOGW("hidumper failed, trying display manager");
+        return false;
+    }
+
+    std::istringstream iss(output);
+    std::string line;
+    bool found_physical = false;
+    while (std::getline(iss, line)) {
+        if (line.find("isvirtual=true") != std::string::npos ||
+            line.find("isVirtual=true") != std::string::npos) {
+            found_physical = false;
+            continue;
+        }
+        if (line.find("isvirtual=false") != std::string::npos ||
+            line.find("isVirtual=false") != std::string::npos) {
+            found_physical = true;
+        }
+        if (!found_physical) continue;
+
+        unsigned w = 0, h = 0;
+        if (line.find("render size:") != std::string::npos) {
+            auto pos = line.find("render size:");
+            if (sscanf(line.c_str() + pos, "render size: %ux%u", &w, &h) == 2) {
+                width = w;
+                height = h;
+                LOGI("Physical screen resolution (render size): %ux%u", w, h);
+                return true;
+            }
+        }
+        if (line.find("render resolution=") != std::string::npos) {
+            auto pos = line.find("render resolution=");
+            if (sscanf(line.c_str() + pos, "render resolution=%ux%u", &w, &h) == 2) {
+                width = w;
+                height = h;
+                LOGI("Physical screen resolution (render resolution): %ux%u", w, h);
+                return true;
+            }
+        }
+        if (line.find("physical screen resolution:") != std::string::npos) {
+            auto pos = line.find("physical screen resolution:");
+            if (sscanf(line.c_str() + pos, "physical screen resolution: %ux%u", &w, &h) == 2) {
+                width = w;
+                height = h;
+                LOGI("Physical screen resolution (physical): %ux%u", w, h);
+                return true;
+            }
+        }
+        if (line.find("physical resolution=") != std::string::npos) {
+            auto pos = line.find("physical resolution=");
+            if (sscanf(line.c_str() + pos, "physical resolution=%ux%u", &w, &h) == 2) {
+                width = w;
+                height = h;
+                LOGI("Physical screen resolution (physical resolution): %ux%u", w, h);
+                return true;
+            }
+        }
+    }
+
+    LOGW("Could not parse physical screen resolution from hidumper output");
+    return false;
 }
 
 int HdcWrapper::run_process(const std::string &cmd, std::string *output, int timeout_ms) {

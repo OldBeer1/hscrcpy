@@ -15,6 +15,8 @@ struct CliArgs {
     bool verbose     = false;
     bool auto_start  = false;
     int display_id   = 0;
+    int scale        = 0;
+    int bitrate      = 0;
 };
 
 class CliParser {

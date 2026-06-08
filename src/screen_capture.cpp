@@ -7,16 +7,10 @@
 #include <algorithm>
 #include <sstream>
 
-#ifdef _WIN32
-#include <windows.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#endif
-
 namespace hscrcpy {
 
-ScreenCapture::ScreenCapture(HdcWrapper &hdc, uint32_t fps)
-    : hdc_(hdc), fps_(fps) {
+ScreenCapture::ScreenCapture(HdcWrapper &hdc, const CaptureConfig &config)
+    : hdc_(hdc), config_(config) {
     char exe_path[MAX_PATH];
     GetModuleFileNameA(NULL, exe_path, MAX_PATH);
     std::string exe_dir(exe_path);
@@ -203,11 +197,25 @@ std::string ScreenCapture::find_matching_agent_so() {
 }
 
 std::string ScreenCapture::build_extension_cmd() const {
+    char cmd[512];
     if (use_abstract_socket_) {
-        return "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so -scale 1 -frameRate 30 -bitRate 31457280 " +
-               std::string(kGrpcSocketName) + " -screenId 0 -encodeType 0 -iFrameInterval 2000 -repeatInterval 33";
+        snprintf(cmd, sizeof(cmd),
+                 "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so "
+                 "-scale %d -frameRate %d -bitRate %d %s -screenId 0 -encodeType 0 "
+                 "-iFrameInterval %d -repeatInterval %d",
+                 config_.scale, config_.frame_rate, config_.bit_rate,
+                 kGrpcSocketName, config_.iframe_interval,
+                 1000 / config_.frame_rate);
+    } else {
+        snprintf(cmd, sizeof(cmd),
+                 "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so "
+                 "-scale %d -frameRate %d -bitRate %d -p 5000 -screenId 0 -encodeType 0 "
+                 "-iFrameInterval %d -repeatInterval %d",
+                 config_.scale, config_.frame_rate, config_.bit_rate,
+                 config_.iframe_interval,
+                 1000 / config_.frame_rate);
     }
-    return "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so -scale 1 -frameRate 30 -bitRate 31457280 -p 5000 -screenId 0 -encodeType 0 -iFrameInterval 2000 -repeatInterval 33";
+    return cmd;
 }
 
 bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
@@ -800,7 +808,7 @@ bool ScreenCapture::capture_one_snapshot() {
 void ScreenCapture::snapshot_loop() {
     LOGI("Snapshot loop started");
 
-    auto interval = std::chrono::milliseconds(1000 / fps_);
+    auto interval = std::chrono::milliseconds(1000 / config_.frame_rate);
 
     while (running_) {
         auto start = std::chrono::steady_clock::now();

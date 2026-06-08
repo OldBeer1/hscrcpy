@@ -18,6 +18,13 @@ constexpr int kVersionMajor = 1;
 constexpr int kVersionMinor = 0;
 constexpr int kVersionPatch = 0;
 
+struct CaptureConfig {
+    int scale = 1;
+    int bit_rate = 31457280;
+    int frame_rate = 30;
+    int iframe_interval = 2000;
+};
+
 constexpr const char *kDeviceSoPath = "/data/local/tmp/libscreen_casting.z.so";
 constexpr const char *kDeviceAgentPath = "/data/local/tmp/agent.so";
 constexpr const char *kGrpcSocketName = "scrcpy_grpc_socket";

@@ -3,6 +3,10 @@
 #include "screen_capture.h"
 #include "input_injector.h"
 #include "h264_decoder.h"
+#include <cmath>
+#include <objidl.h>
+#include <gdiplus.h>
+#pragma comment(lib, "gdiplus.lib")
 #include <chrono>
 #include "log.h"
 #include "version.h"
@@ -37,6 +41,7 @@ static HWND g_btn_volup_hwnd = nullptr;
 static HWND g_btn_voldown_hwnd = nullptr;
 static HWND g_btn_power_hwnd = nullptr;
 static HWND g_btn_reboot_hwnd = nullptr;
+static HWND g_btn_quality_hwnd = nullptr;
 static HWND g_status_hwnd = nullptr;
 static HWND g_canvas_hwnd = nullptr;
 
@@ -55,6 +60,9 @@ static bool g_mouse_down = false;
 static uint32_t g_drag_start_x = 0, g_drag_start_y = 0;
 static auto g_last_click_time = std::chrono::steady_clock::now();
 
+static CaptureConfig g_capture_config;
+static uint32_t g_device_screen_w = 0, g_device_screen_h = 0;
+
 #define ID_COMBO       1001
 #define ID_BTN_START   1002
 #define ID_BTN_REFRESH 1003
@@ -65,6 +73,41 @@ static auto g_last_click_time = std::chrono::steady_clock::now();
 #define ID_BTN_HOME    1008
 #define ID_BTN_REBOOT  1009
 #define ID_BTN_RECENT  1010
+#define ID_BTN_QUALITY 1011
+
+static ULONG_PTR g_gdiplus_token = 0;
+
+static HICON load_png_icon(const char *relative_path, int size) {
+    char exe_path[MAX_PATH];
+    GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+    std::string dir(exe_path);
+    auto sep = dir.find_last_of("\\/");
+    if (sep != std::string::npos) dir = dir.substr(0, sep + 1);
+    std::string path = dir + relative_path;
+
+    HICON icon = NULL;
+    Gdiplus::Bitmap *src = Gdiplus::Bitmap::FromFile(std::wstring(path.begin(), path.end()).c_str());
+    if (src && src->GetLastStatus() == Gdiplus::Ok) {
+        int sw = src->GetWidth(), sh = src->GetHeight();
+        int dw = size, dh = size;
+        if (sw * dh > sh * dw) {
+            dh = (int)(size * (double)sh / sw);
+        } else {
+            dw = (int)(size * (double)sw / sh);
+        }
+        int ox = (size - dw) / 2, oy = (size - dh) / 2;
+
+        Gdiplus::Bitmap *dst = new Gdiplus::Bitmap(size, size, PixelFormat32bppARGB);
+        Gdiplus::Graphics g(dst);
+        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
+        g.Clear(Gdiplus::Color(0, 0, 0, 0));
+        g.DrawImage(src, ox, oy, dw, dh);
+        dst->GetHICON(&icon);
+        delete dst;
+        delete src;
+    }
+    return icon;
+}
 
 static void show_error(const char *msg) {
     MessageBoxA(g_hwnd, msg, "HScrcpy Error", MB_OK | MB_ICONERROR);
@@ -72,6 +115,215 @@ static void show_error(const char *msg) {
 
 static void set_status(const char *msg) {
     if (g_status_hwnd) SetWindowTextA(g_status_hwnd, msg);
+}
+
+static const char *bitrate_label(int bitrate) {
+    if (bitrate >= 1000000) {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "%dM", bitrate / 1000000);
+        return buf;
+    }
+    if (bitrate >= 1000) {
+        static char buf[32];
+        snprintf(buf, sizeof(buf), "%dK", bitrate / 1000);
+        return buf;
+    }
+    return "?";
+}
+
+static void auto_select_config() {
+    if (!g_hdc) return;
+    uint32_t w = 0, h = 0;
+    bool got = g_hdc->get_screen_resolution(w, h);
+    if (got && w > 0) {
+        g_device_screen_w = w;
+        g_device_screen_h = h;
+        LOGI("Device physical screen: %ux%u (tcp=%s)", w, h, g_hdc->is_tcp() ? "yes" : "no");
+    } else {
+        LOGW("Failed to get device screen resolution, using defaults");
+        g_device_screen_w = 0;
+        g_device_screen_h = 0;
+    }
+
+    g_capture_config = CaptureConfig{};
+    g_capture_config.frame_rate = 30;
+    g_capture_config.bit_rate = 8388608;
+
+    uint32_t eff_w = g_device_screen_w > 0 ? g_device_screen_w : 1260;
+    if (eff_w > 720) {
+        g_capture_config.scale = 2;
+        LOGI("Auto: %ux%u -> scale=2 (~720p), 8M, 30fps", eff_w, g_device_screen_h);
+    } else {
+        g_capture_config.scale = 1;
+        LOGI("Auto: %ux%u -> scale=1, 8M, 30fps", eff_w, g_device_screen_h);
+    }
+}
+
+static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_INITDIALOG: {
+        RECT pr, dr;
+        GetWindowRect(g_hwnd, &pr);
+        GetWindowRect(hDlg, &dr);
+        int x = pr.left + (pr.right - pr.left - (dr.right - dr.left)) / 2;
+        int y = pr.top + (pr.bottom - pr.top - (dr.bottom - dr.top)) / 2;
+        SetWindowPos(hDlg, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+
+        HWND hScale = GetDlgItem(hDlg, 100);
+        HWND hBitrate = GetDlgItem(hDlg, 101);
+        HWND hFps = GetDlgItem(hDlg, 102);
+
+        uint32_t dw = g_device_screen_w > 0 ? g_device_screen_w : 1260;
+        uint32_t dh = g_device_screen_h > 0 ? g_device_screen_h : 2720;
+
+        char label[64];
+        for (int s = 1; s <= 5; s++) {
+            snprintf(label, sizeof(label), "%d  (%ux%u)", s, dw / s, dh / s);
+            int idx = (int)SendMessageA(hScale, CB_ADDSTRING, 0, (LPARAM)label);
+            SendMessageA(hScale, CB_SETITEMDATA, idx, s);
+        }
+        int sel_scale = g_capture_config.scale - 1;
+        SendMessageA(hScale, CB_SETCURSEL, sel_scale, 0);
+
+        struct BitrateEntry { const char *label; int value; };
+        BitrateEntry bitrates[] = {
+            {"30 Mbps (USB Original)", 31457280},
+            {"20 Mbps (USB 2K Scaled)", 20971520},
+            {"8 Mbps (WiFi Balanced)", 8388608},
+            {"4 Mbps (WiFi Low BW)", 4194304},
+            {"2 Mbps (Remote TCP)", 2097152},
+        };
+        int sel_br = 0;
+        for (int i = 0; i < 5; i++) {
+            int idx = (int)SendMessageA(hBitrate, CB_ADDSTRING, 0, (LPARAM)bitrates[i].label);
+            SendMessageA(hBitrate, CB_SETITEMDATA, idx, bitrates[i].value);
+            if (bitrates[i].value == g_capture_config.bit_rate) sel_br = i;
+        }
+        SendMessageA(hBitrate, CB_SETCURSEL, sel_br, 0);
+
+        struct FpsEntry { const char *label; int value; };
+        FpsEntry fpses[] = {
+            {"60 fps", 60},
+            {"30 fps", 30},
+            {"24 fps", 24},
+            {"15 fps", 15},
+            {"10 fps", 10},
+        };
+        int sel_fps = 1;
+        for (int i = 0; i < 5; i++) {
+            int idx = (int)SendMessageA(hFps, CB_ADDSTRING, 0, (LPARAM)fpses[i].label);
+            SendMessageA(hFps, CB_SETITEMDATA, idx, fpses[i].value);
+            if (fpses[i].value == g_capture_config.frame_rate) sel_fps = i;
+        }
+        SendMessageA(hFps, CB_SETCURSEL, sel_fps, 0);
+
+        char info[128];
+        snprintf(info, sizeof(info), "Device: %ux%u  |  Current: scale=%d, %s, %dfps",
+                 dw, dh, g_capture_config.scale,
+                 bitrate_label(g_capture_config.bit_rate), g_capture_config.frame_rate);
+        SetWindowTextA(GetDlgItem(hDlg, 103), info);
+
+        return TRUE;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK) {
+            HWND hScale = GetDlgItem(hDlg, 100);
+            HWND hBitrate = GetDlgItem(hDlg, 101);
+            HWND hFps = GetDlgItem(hDlg, 102);
+
+            int s = (int)SendMessageA(hScale, CB_GETCURSEL, 0, 0);
+            int scale_val = (int)SendMessageA(hScale, CB_GETITEMDATA, s, 0);
+            int b = (int)SendMessageA(hBitrate, CB_GETCURSEL, 0, 0);
+            int br_val = (int)SendMessageA(hBitrate, CB_GETITEMDATA, b, 0);
+            int f = (int)SendMessageA(hFps, CB_GETCURSEL, 0, 0);
+            int fps_val = (int)SendMessageA(hFps, CB_GETITEMDATA, f, 0);
+
+            CaptureConfig old_config = g_capture_config;
+            g_capture_config.scale = scale_val;
+            g_capture_config.bit_rate = br_val;
+            g_capture_config.frame_rate = fps_val;
+
+            LOGI("User set: scale=%d, bitrate=%d, fps=%d", scale_val, br_val, fps_val);
+            EndDialog(hDlg, IDOK);
+
+            if (g_mirroring && (old_config.scale != g_capture_config.scale ||
+                                old_config.bit_rate != g_capture_config.bit_rate ||
+                                old_config.frame_rate != g_capture_config.frame_rate)) {
+                if (MessageBoxA(g_hwnd,
+                                "Quality settings changed. Restart mirroring to apply?",
+                                "HScrcpy", MB_YESNO | MB_ICONQUESTION | MB_TASKMODAL) == IDYES) {
+                    PostMessageA(g_hwnd, WM_USER + 7, 0, 0);
+                }
+            }
+            return TRUE;
+        }
+        if (LOWORD(wp) == IDCANCEL) {
+            EndDialog(hDlg, IDCANCEL);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+static void show_settings_dialog() {
+    struct {
+        DLGTEMPLATE dlg;
+        WORD menu, cls, title;
+    } tmpl = {};
+    tmpl.dlg.style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_CENTER | DS_MODALFRAME;
+    tmpl.dlg.cx = 240;
+    tmpl.dlg.cy = 140;
+    tmpl.dlg.cdit = 8;
+    tmpl.menu = 0;
+    tmpl.cls = 0;
+    tmpl.title = 0;
+
+    struct Item {
+        DLGITEMTEMPLATE item;
+        WORD cls;
+        WORD id_lo;
+        WORD id_hi;
+        WORD text;
+    };
+
+    static std::vector<BYTE> data;
+    data.resize(4096);
+    BYTE *p = data.data();
+    auto align = [&]() { p += (4 - ((ULONG_PTR)p % 4)) % 4; };
+    auto write = [&](const void *src, size_t len) { memcpy(p, src, len); p += len; };
+
+    write(&tmpl.dlg, sizeof(tmpl.dlg));
+    p += sizeof(WORD) * 3;
+
+    auto writeItem = [&](DWORD style, WORD x, WORD y, WORD cx, WORD cy, WORD id, const wchar_t *cls, const wchar_t *text) {
+        align();
+        DLGITEMTEMPLATE item = {};
+        item.style = style;
+        item.x = x; item.y = y; item.cx = cx; item.cy = cy;
+        item.id = id;
+        write(&item, sizeof(item));
+        size_t clsLen = (wcslen(cls) + 1) * sizeof(wchar_t);
+        write(cls, clsLen);
+        size_t txtLen = (wcslen(text) + 1) * sizeof(wchar_t);
+        write(text, txtLen);
+        p += sizeof(WORD);
+    };
+
+    writeItem(WS_CHILD | WS_VISIBLE | SS_LEFT, 7, 7, 60, 8, 10, L"STATIC", L"Scale:");
+    writeItem(WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 70, 5, 150, 200, 100, L"COMBOBOX", L"");
+    writeItem(WS_CHILD | WS_VISIBLE | SS_LEFT, 7, 27, 60, 8, 11, L"STATIC", L"Bitrate:");
+    writeItem(WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 70, 25, 150, 200, 101, L"COMBOBOX", L"");
+    writeItem(WS_CHILD | WS_VISIBLE | SS_LEFT, 7, 47, 60, 8, 12, L"STATIC", L"Frame Rate:");
+    writeItem(WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 70, 45, 150, 200, 102, L"COMBOBOX", L"");
+    writeItem(WS_CHILD | WS_VISIBLE | SS_LEFT, 7, 70, 213, 10, 103, L"STATIC", L"");
+    writeItem(WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP, 120, 90, 50, 14, IDOK, L"BUTTON", L"OK");
+    writeItem(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP, 175, 90, 50, 14, IDCANCEL, L"BUTTON", L"Cancel");
+
+    tmpl.dlg.cdit = 8;
+    memcpy(data.data(), &tmpl.dlg, sizeof(tmpl.dlg));
+
+    DialogBoxIndirectParamA(g_hInst, (DLGTEMPLATE *)data.data(), g_hwnd, SettingsDlgProc, 0);
 }
 
 static void refresh_devices() {
@@ -149,8 +401,11 @@ static std::pair<uint32_t, uint32_t> canvas_to_screen(int wx, int wy) {
     if (rel_x > draw_w) rel_x = draw_w;
     if (rel_y > draw_h) rel_y = draw_h;
 
-    return {static_cast<uint32_t>(rel_x * g_screen_w / draw_w),
-            static_cast<uint32_t>(rel_y * g_screen_h / draw_h)};
+    uint32_t phy_w = g_screen_w * g_capture_config.scale;
+    uint32_t phy_h = g_screen_h * g_capture_config.scale;
+
+    return {static_cast<uint32_t>(rel_x * phy_w / draw_w),
+            static_cast<uint32_t>(rel_y * phy_h / draw_h)};
 }
 
 static WNDPROC g_canvas_orig_wndproc = nullptr;
@@ -331,6 +586,7 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 bih.biPlanes   = 1;
                 bih.biBitCount = 24;
                 bih.biCompression = BI_RGB;
+                bih.biSizeImage = g_cur_frame->data.size();
 
                 SetStretchBltMode(memdc, HALFTONE);
                 StretchDIBits(memdc, off_x, off_y, draw_w, draw_h,
@@ -371,7 +627,11 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (g_mouse_down && g_mirroring && g_input) {
             POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             auto [x, y] = canvas_to_screen(pt.x, pt.y);
-            g_input->inject_touch_move(x, y);
+            if (x != g_last_touch_x || y != g_last_touch_y) {
+                g_last_touch_x = x;
+                g_last_touch_y = y;
+                g_input->inject_touch_move(x, y);
+            }
         }
         return 0;
     }
@@ -415,6 +675,8 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 }
 
 static uint64_t g_last_drawn_frame = 0;
+static uint64_t g_fps_counter = 0;
+static DWORD g_fps_start_tick = 0;
 
 static void try_update_frame() {
     if (!g_capture) return;
@@ -433,6 +695,19 @@ static void try_update_frame() {
             g_cur_frame = std::move(img);
             g_last_rendered_seq = fc;
             InvalidateRect(g_canvas_hwnd, NULL, FALSE);
+
+            g_fps_counter++;
+            DWORD now = GetTickCount();
+            if (g_fps_start_tick == 0) g_fps_start_tick = now;
+            if (now - g_fps_start_tick >= 3000) {
+                DWORD fps = (DWORD)(g_fps_counter * 1000 / (now - g_fps_start_tick));
+                LOGI("Render FPS: %d (scale=%d, %s)", fps, g_capture_config.scale, bitrate_label(g_capture_config.bit_rate));
+                char buf[64];
+                snprintf(buf, sizeof(buf), "%dfps", fps);
+                set_status(buf);
+                g_fps_counter = 0;
+                g_fps_start_tick = now;
+            }
         }
     }
 }
@@ -502,9 +777,30 @@ static void start_mirroring(const std::string &serial, const std::string &ip = "
     EnableWindow(g_btn_start_hwnd, FALSE);
 
     g_hdc = new HdcWrapper(serial, ip, port);
-    g_capture = new ScreenCapture(*g_hdc, 30);
 
     std::thread([serial, ip, port]() {
+        auto_select_config();
+
+        if (g_cli_args.scale > 0) {
+            g_capture_config.scale = g_cli_args.scale;
+            LOGI("CLI override: scale=%d", g_cli_args.scale);
+        }
+        if (g_cli_args.bitrate > 0) {
+            g_capture_config.bit_rate = g_cli_args.bitrate;
+            LOGI("CLI override: bitrate=%d", g_cli_args.bitrate);
+        }
+        if (g_cli_args.fps != kDefaultFps) {
+            g_capture_config.frame_rate = g_cli_args.fps;
+            LOGI("CLI override: fps=%u", g_cli_args.fps);
+        }
+
+        g_capture = new ScreenCapture(*g_hdc, g_capture_config);
+
+        char status_buf[256];
+        snprintf(status_buf, sizeof(status_buf), "Connecting... (scale=%d, %s, %dfps)",
+                 g_capture_config.scale, bitrate_label(g_capture_config.bit_rate), g_capture_config.frame_rate);
+        PostMessageA(g_hwnd, WM_USER + 6, 0, 0);
+
         bool ok = false;
         try {
             ok = g_capture->start();
@@ -574,12 +870,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                           262, 34, 48, 22, hwnd, (HMENU)ID_BTN_POWER, g_hInst, NULL);
         g_btn_reboot_hwnd = CreateWindowA("BUTTON", "Reboot",
-                                            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                            314, 34, 50, 22, hwnd, (HMENU)ID_BTN_REBOOT, g_hInst, NULL);
+                                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                             314, 34, 50, 22, hwnd, (HMENU)ID_BTN_REBOOT, g_hInst, NULL);
+
+        g_btn_quality_hwnd = CreateWindowA("BUTTON", "",
+                                            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_ICON,
+                                            370, 34, 26, 22, hwnd, (HMENU)ID_BTN_QUALITY, g_hInst, NULL);
+        HICON hGear = load_png_icon("res\\settings_icon.png", 20);
+        if (hGear) {
+            SendMessageA(g_btn_quality_hwnd, BM_SETIMAGE, IMAGE_ICON, (LPARAM)hGear);
+        } else {
+            SetWindowTextA(g_btn_quality_hwnd, "\xE2\x9A\x99");
+        }
 
         g_status_hwnd = CreateWindowA("STATIC", "",
                                        WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                       370, 38, 400, 18, hwnd, NULL, g_hInst, NULL);
+                                       426, 38, 400, 18, hwnd, NULL, g_hInst, NULL);
 
         g_canvas_hwnd = CreateWindowA(CANVAS_CLASS, "",
                                        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_TABSTOP,
@@ -644,6 +950,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (g_input) g_input->inject_reboot();
                 }
             }
+            break;
+        case ID_BTN_QUALITY:
+            show_settings_dialog();
             break;
         }
         break;
@@ -750,8 +1059,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         std::string serial = g_hdc->serial();
         char buf[256];
         const char *mode_str = g_capture->mode() == CaptureMode::kGrpcStream ? "gRPC" : "snapshot";
-        snprintf(buf, sizeof(buf), "HScrcpy - %s %ux%u (%s)",
-                 serial.c_str(), g_screen_w, g_screen_h, mode_str);
+        snprintf(buf, sizeof(buf), "HScrcpy - %s | Device %ux%u | Stream %ux%u (%s, scale=%d, %s, %dfps)",
+                 serial.c_str(), g_device_screen_w, g_device_screen_h, g_screen_w, g_screen_h, mode_str,
+                 g_capture_config.scale, bitrate_label(g_capture_config.bit_rate),
+                 g_capture_config.frame_rate);
         SetWindowTextA(g_hwnd, buf);
         set_status(buf);
 
@@ -809,10 +1120,32 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         std::string serial = g_hdc->serial();
         char buf[256];
         const char *mode_str = g_capture->mode() == CaptureMode::kGrpcStream ? "gRPC" : "snapshot";
-        snprintf(buf, sizeof(buf), "HScrcpy - %s %ux%u (%s)",
-                 serial.c_str(), g_screen_w, g_screen_h, mode_str);
+        snprintf(buf, sizeof(buf), "HScrcpy - %s | Device %ux%u | Stream %ux%u (%s, scale=%d, %s, %dfps)",
+                 serial.c_str(), g_device_screen_w, g_device_screen_h, g_screen_w, g_screen_h, mode_str,
+                 g_capture_config.scale, bitrate_label(g_capture_config.bit_rate),
+                 g_capture_config.frame_rate);
         SetWindowTextA(g_hwnd, buf);
         set_status(buf);
+        break;
+    }
+    case WM_USER + 6: {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "Connecting... (scale=%d, %s, %dfps)",
+                 g_capture_config.scale, bitrate_label(g_capture_config.bit_rate),
+                 g_capture_config.frame_rate);
+        set_status(buf);
+        break;
+    }
+    case WM_USER + 7: {
+        if (g_mirroring && g_hdc) {
+            std::string serial = g_hdc->serial();
+            std::string ip = g_hdc->ip();
+            std::string port = g_hdc->port();
+            stop_mirroring();
+            g_pending_start_serial = serial;
+            g_pending_start_ip = ip;
+            g_pending_start_port = port;
+        }
         break;
     }
     case WM_DESTROY:
@@ -838,6 +1171,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     g_hInst = hInst;
+
+    Gdiplus::GdiplusStartupInput gdi_si;
+    Gdiplus::GdiplusStartup(&g_gdiplus_token, &gdi_si, NULL);
 
     {
         std::string cmd_line(GetCommandLineA());
@@ -905,5 +1241,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         DispatchMessage(&msg);
     }
 
+    Gdiplus::GdiplusShutdown(g_gdiplus_token);
     return 0;
 }

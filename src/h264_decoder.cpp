@@ -173,7 +173,7 @@ bool H264Decoder::decode(const uint8_t *h264_data, size_t h264_size) {
                     av_freep(&frame_rgb_->data[0]);
 
                 int img_ret = av_image_alloc(frame_rgb_->data, frame_rgb_->linesize,
-                                              w, h, AV_PIX_FMT_BGR24, 1);
+                                              w, h, AV_PIX_FMT_BGR24, 4);
                 if (img_ret < 0) {
                     LOGE("av_image_alloc failed for %dx%d ret=%d", w, h, img_ret);
                     break;

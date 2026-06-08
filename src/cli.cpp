@@ -23,6 +23,13 @@ bool CliParser::parse(CliArgs &args, int argc, char *argv[]) {
             args.auto_start = true;
         } else if (arg == "-v" || arg == "--verbose") {
             args.verbose = true;
+        } else if ((arg == "--scale") && i + 1 < argc) {
+            args.scale = std::atoi(argv[++i]);
+            if (args.scale < 1) args.scale = 1;
+            if (args.scale > 5) args.scale = 5;
+        } else if ((arg == "--bitrate") && i + 1 < argc) {
+            args.bitrate = std::atoi(argv[++i]);
+            if (args.bitrate < 1) args.bitrate = 1;
         } else if (arg == "--help") {
             args.show_help = true;
             return true;
@@ -44,6 +51,8 @@ void CliParser::print_usage(const char *prog) {
     printf("  -n, --no-control       Disable device control\n");
     printf("  -a, --auto-start       Auto connect and start mirroring on launch\n");
     printf("  -v, --verbose          Verbose output\n");
+    printf("      --scale=N          Resolution scale divisor 1-5 (default: auto)\n");
+    printf("      --bitrate=N        Video bitrate in bps (default: auto)\n");
     printf("      --help             Show this help\n");
     printf("\nVideo stream: gRPC H264 (primary), snapshot_display (fallback)\n");
     printf("Input injection: uitest socket JSON protocol\n");

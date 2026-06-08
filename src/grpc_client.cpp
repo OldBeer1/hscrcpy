@@ -4,8 +4,6 @@
 #include <cstdio>
 
 #ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
 using socket_t = SOCKET;
 #define INVALID_SOCK INVALID_SOCKET
 #define CLOSE_SOCKET closesocket

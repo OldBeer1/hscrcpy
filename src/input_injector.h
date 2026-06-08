@@ -1,6 +1,11 @@
 #ifndef HSCRCPY_INPUT_INJECTOR_H
 #define HSCRCPY_INPUT_INJECTOR_H
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
 #include "hdc_wrapper.h"
 #include <cstdint>
 #include <string>

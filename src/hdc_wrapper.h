@@ -36,12 +36,13 @@ public:
     const std::string &serial() const { return serial_; }
     const std::string &ip() const { return ip_; }
     const std::string &port() const { return port_; }
+    bool is_tcp() const;
+
+    bool get_screen_resolution(uint32_t &width, uint32_t &height);
 
 private:
     int run_process(const std::string &cmd, std::string *output = nullptr, int timeout_ms = 30000);
     std::string build_hdc_cmd(const std::string &subcmd);
-
-    bool is_tcp_device() const;
 
     std::string serial_;
     std::string ip_;
