@@ -2,6 +2,8 @@
 
 Windows 端鸿蒙设备投屏控制工具，Base On [HOScrcpy](https://gitcode.com/OpenHarmonyToolkitsPlaza/HOScrcpy/)。
 
+![image.png](https://raw.gitcode.com/user-images/assets/10037292/03d5b62a-3aaa-424a-8d29-5086782b9cef/image.png 'image.png')
+
 ## 功能特性
 
 - **H264 实时投屏**：通过 gRPC 虚拟屏流 + FFmpeg 硬解，低延迟实时画面
