@@ -97,7 +97,7 @@ static void hpack_encode_literal_header_new_name(std::vector<uint8_t> &out,
 
 static void build_grpc_headers(std::vector<uint8_t> &hpack_block,
                                 const std::string &path,
-                                const std::string &authority = "127.0.0.1:5000") {
+                                const std::string &authority) {
     hpack_block.push_back(0x83);
     hpack_block.push_back(0x86);
     hpack_encode_literal_header_indexed_name(hpack_block, 0x44, path);
@@ -280,6 +280,9 @@ static bool extract_h264_from_reply(const uint8_t *pb, size_t pb_len, std::vecto
 bool GrpcClient::connect(const std::string &host, uint16_t port) {
     if (connected_) disconnect();
 
+    connected_host_ = host;
+    connected_port_ = port;
+
     LOGI("GrpcClient::connect(%s, %u) starting", host.c_str(), port);
 
     sock_ = static_cast<int>(socket(AF_INET, SOCK_STREAM, 0));
@@ -315,8 +318,15 @@ bool GrpcClient::connect(const std::string &host, uint16_t port) {
         return false;
     }
 
-    uint8_t client_settings[] = {0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00};
-    if (!send_all(sock_, client_settings, 9)) {
+    uint8_t client_settings_payload[] = {
+        0x00, 0x01, 0x00, 0x00, 0x10, 0x00,
+        0x00, 0x03, 0x7F, 0xFF, 0xFF, 0xFF,
+        0x00, 0x04, 0x00, 0x40, 0x00, 0x00,
+        0x00, 0x05, 0x00, 0x01, 0x00, 0x00,
+    };
+    std::vector<uint8_t> client_settings_frame;
+    write_frame(client_settings_frame, 0x04, 0x00, 0, client_settings_payload, sizeof(client_settings_payload));
+    if (!send_all(sock_, client_settings_frame.data(), client_settings_frame.size())) {
         CLOSE_SOCKET(static_cast<socket_t>(sock_));
         sock_ = -1;
         return false;
@@ -399,7 +409,8 @@ bool GrpcClient::start_streaming(const std::function<void(const std::vector<uint
     on_frame_ = on_h264_frame;
 
     std::vector<uint8_t> hpack_block;
-    build_grpc_headers(hpack_block, "/ScrcpyService/onStart");
+    std::string authority = connected_host_ + ":" + std::to_string(connected_port_);
+    build_grpc_headers(hpack_block, "/ScrcpyService/onStart", authority);
 
     std::vector<uint8_t> headers_frame;
     write_frame(headers_frame, 0x01, 0x04, 1,
@@ -440,7 +451,8 @@ bool GrpcClient::request_idr_frame() {
     next_stream_id_ += 2;
 
     std::vector<uint8_t> hpack_block;
-    build_grpc_headers(hpack_block, "/ScrcpyService/onRequestIDRFrame");
+    std::string authority = connected_host_ + ":" + std::to_string(connected_port_);
+    build_grpc_headers(hpack_block, "/ScrcpyService/onRequestIDRFrame", authority);
 
     std::vector<uint8_t> headers_frame;
     write_frame(headers_frame, 0x01, 0x04, sid,
@@ -460,12 +472,13 @@ bool GrpcClient::request_idr_frame() {
 void GrpcClient::streaming_loop() {
     LOGI("Streaming loop started, sock=%d, streaming=%d, connected=%d", sock_, (int)streaming_.load(), (int)connected_.load());
 
-    std::vector<uint8_t> recv_buf(4 * 1024 * 1024);
+    if (recv_buffer_.size() < 4 * 1024 * 1024)
+        recv_buffer_.resize(4 * 1024 * 1024);
     size_t buf_used = 0;
 
     if (!leftover_buf_.empty()) {
-        size_t copy_len = std::min(leftover_buf_.size(), recv_buf.size());
-        memcpy(recv_buf.data(), leftover_buf_.data(), copy_len);
+        size_t copy_len = std::min(leftover_buf_.size(), recv_buffer_.size());
+        memcpy(recv_buffer_.data(), leftover_buf_.data(), copy_len);
         buf_used = copy_len;
         leftover_buf_.clear();
         LOGI("Preloaded %zu bytes from connect phase", copy_len);
@@ -477,6 +490,8 @@ void GrpcClient::streaming_loop() {
     uint32_t window_update_threshold = 32768;
 
     std::vector<uint8_t> grpc_msg_buf;
+    grpc_msg_buf.reserve(512 * 1024);
+    size_t grpc_consumed = 0;
     uint32_t grpc_expected_len = 0;
     bool grpc_header_parsed = false;
 
@@ -487,7 +502,7 @@ void GrpcClient::streaming_loop() {
         struct timeval tv = {3, 0};
         int sel = select(static_cast<int>(sock_) + 1, &readfds, nullptr, nullptr, &tv);
         if (sel < 0) {
-            LOGI("select returned %d, wsa=%d", sel, WSAGetLastError());
+            LOGI("select returned %d, wsa=%d, exiting streaming loop", sel, WSAGetLastError());
             break;
         }
         if (sel == 0) {
@@ -496,82 +511,76 @@ void GrpcClient::streaming_loop() {
                 LOGI("No data for 300s, stream dead");
                 break;
             }
-            if (idle_count == 10 && got_first_data) {
-                request_idr_frame();
-                LOGI("Requested IDR frame for keepalive");
-            }
             continue;
         }
         idle_count = 0;
 
         int n = ::recv(static_cast<socket_t>(sock_),
-                       reinterpret_cast<char *>(recv_buf.data() + buf_used),
-                       static_cast<int>(recv_buf.size() - buf_used), 0);
+                       reinterpret_cast<char *>(recv_buffer_.data() + buf_used),
+                       static_cast<int>(recv_buffer_.size() - buf_used), 0);
         if (n <= 0) {
             int err = WSAGetLastError();
-            LOGI("recv returned %d, wsa=%d, buf_used=%zu", n, err, buf_used);
+            LOGI("recv returned %d, wsa=%d, buf_used=%zu, exiting streaming loop", n, err, buf_used);
             break;
         }
         buf_used += n;
 
         size_t pos = 0;
         while (pos + 9 <= buf_used) {
-            uint32_t frame_len = (static_cast<uint32_t>(recv_buf[pos]) << 16) |
-                                 (static_cast<uint32_t>(recv_buf[pos + 1]) << 8) |
-                                 static_cast<uint32_t>(recv_buf[pos + 2]);
-            uint8_t frame_type = recv_buf[pos + 3];
-            uint8_t flags = recv_buf[pos + 4];
-            uint32_t stream_id = (static_cast<uint32_t>(recv_buf[pos + 5]) << 24) |
-                                 (static_cast<uint32_t>(recv_buf[pos + 6]) << 16) |
-                                 (static_cast<uint32_t>(recv_buf[pos + 7]) << 8) |
-                                 static_cast<uint32_t>(recv_buf[pos + 8]);
+            uint32_t frame_len = (static_cast<uint32_t>(recv_buffer_[pos]) << 16) |
+                                 (static_cast<uint32_t>(recv_buffer_[pos + 1]) << 8) |
+                                 static_cast<uint32_t>(recv_buffer_[pos + 2]);
+            uint8_t frame_type = recv_buffer_[pos + 3];
+            uint8_t flags = recv_buffer_[pos + 4];
+            uint32_t stream_id = (static_cast<uint32_t>(recv_buffer_[pos + 5]) << 24) |
+                                 (static_cast<uint32_t>(recv_buffer_[pos + 6]) << 16) |
+                                 (static_cast<uint32_t>(recv_buffer_[pos + 7]) << 8) |
+                                 static_cast<uint32_t>(recv_buffer_[pos + 8]);
             stream_id &= 0x7FFFFFFF;
 
             size_t total = 9 + frame_len;
             if (pos + total > buf_used) break;
 
             if (frame_type == 0x00) {
-                LOGI("DATA frame: stream=%u len=%u flags=0x%02x", stream_id, frame_len, flags);
-                const uint8_t *payload = recv_buf.data() + pos + 9;
+                const uint8_t *payload = recv_buffer_.data() + pos + 9;
                 bytes_received_on_stream += frame_len;
 
                 if (stream_id == 1) {
+                    if (grpc_consumed > 0 && grpc_consumed < grpc_msg_buf.size()) {
+                        size_t remaining = grpc_msg_buf.size() - grpc_consumed;
+                        memmove(grpc_msg_buf.data(), grpc_msg_buf.data() + grpc_consumed, remaining);
+                        grpc_msg_buf.resize(remaining);
+                    } else if (grpc_consumed >= grpc_msg_buf.size()) {
+                        grpc_msg_buf.clear();
+                    }
+                    grpc_consumed = 0;
                     grpc_msg_buf.insert(grpc_msg_buf.end(), payload, payload + frame_len);
 
                     while (true) {
-                        if (!grpc_header_parsed && grpc_msg_buf.size() >= 5) {
-                            grpc_expected_len = (static_cast<uint32_t>(grpc_msg_buf[1]) << 24) |
-                                                (static_cast<uint32_t>(grpc_msg_buf[2]) << 16) |
-                                                (static_cast<uint32_t>(grpc_msg_buf[3]) << 8) |
-                                                static_cast<uint32_t>(grpc_msg_buf[4]);
+                        size_t avail = grpc_msg_buf.size() - grpc_consumed;
+                        if (!grpc_header_parsed && avail >= 5) {
+                            const uint8_t *hdr = grpc_msg_buf.data() + grpc_consumed;
+                            grpc_expected_len = (static_cast<uint32_t>(hdr[1]) << 24) |
+                                                (static_cast<uint32_t>(hdr[2]) << 16) |
+                                                (static_cast<uint32_t>(hdr[3]) << 8) |
+                                                static_cast<uint32_t>(hdr[4]);
                             grpc_header_parsed = true;
-                            LOGI("gRPC msg header: compressed=%u len=%u buf=%zu", grpc_msg_buf[0], grpc_expected_len, grpc_msg_buf.size());
                         }
 
                         if (!grpc_header_parsed) break;
 
                         size_t needed = 5 + grpc_expected_len;
-                        if (grpc_msg_buf.size() < needed) break;
+                        if (avail < needed) break;
 
                         std::vector<uint8_t> h264_data;
-                        if (extract_h264_from_reply(grpc_msg_buf.data() + 5, grpc_expected_len, h264_data)) {
+                        if (extract_h264_from_reply(grpc_msg_buf.data() + grpc_consumed + 5, grpc_expected_len, h264_data)) {
                             if (!h264_data.empty() && on_frame_) {
-                                if (got_first_data || h264_data.size() > 100) {
-                                    LOGI("H264 frame extracted: %zu bytes, first16:", h264_data.size());
-                                } else {
-                                    char hex[128];
-                                    int hex_pos = 0;
-                                    for (size_t i = 0; i < h264_data.size() && i < 16; i++) {
-                                        hex_pos += snprintf(hex + hex_pos, sizeof(hex) - hex_pos, "%02x ", h264_data[i]);
-                                    }
-                                    LOGI("H264 frame extracted: %zu bytes, hex: %s", h264_data.size(), hex);
-                                }
                                 on_frame_(h264_data);
                                 got_first_data = true;
                             }
                         }
 
-                        grpc_msg_buf.erase(grpc_msg_buf.begin(), grpc_msg_buf.begin() + needed);
+                        grpc_consumed += needed;
                         grpc_header_parsed = false;
                         grpc_expected_len = 0;
                     }
@@ -590,21 +599,18 @@ void GrpcClient::streaming_loop() {
                     }
                 }
             } else if (frame_type == 0x01) {
-                LOGI("HEADERS frame: stream=%u len=%u flags=0x%02x", stream_id, frame_len, flags);
                 if (stream_id == 1 && !idr_requested_) {
                     idr_requested_ = true;
-                    request_idr_frame();
-                    LOGI("Sent IDR request after stream 1 HEADERS");
                 }
             } else if (frame_type == 0x04) {
                 if (!(flags & 0x01)) {
-                    auto s = parse_settings(recv_buf.data() + pos + 9, frame_len);
+                    auto s = parse_settings(recv_buffer_.data() + pos + 9, frame_len);
                     server_window_size_ = s.initial_window_size;
                     send_settings_ack(sock_);
                 }
             } else if (frame_type == 0x06) {
                 if (!(flags & 0x01)) {
-                    send_ping_ack(sock_, recv_buf.data() + pos + 9);
+                    send_ping_ack(sock_, recv_buffer_.data() + pos + 9);
                 }
             } else if (frame_type == 0x07) {
                 LOGW("Received GOAWAY");
@@ -615,9 +621,6 @@ void GrpcClient::streaming_loop() {
                     streaming_ = false;
                 }
             } else if (frame_type == 0x08) {
-                LOGI("WINDOW_UPDATE: stream=%u", stream_id);
-            } else {
-                LOGI("Unknown frame: type=0x%02x stream=%u len=%u flags=0x%02x", frame_type, stream_id, frame_len, flags);
             }
 
             pos += total;
@@ -625,14 +628,14 @@ void GrpcClient::streaming_loop() {
 
         if (pos > 0) {
             if (pos < buf_used) {
-                memmove(recv_buf.data(), recv_buf.data() + pos, buf_used - pos);
+                memmove(recv_buffer_.data(), recv_buffer_.data() + pos, buf_used - pos);
             }
             buf_used -= pos;
         }
     }
 
     streaming_ = false;
-    LOGI("Streaming loop ended, got_data=%d", got_first_data);
+    LOGI("Streaming loop ended, got_data=%d, connected=%d", got_first_data, (int)connected_.load());
 }
 
 } // namespace hscrcpy

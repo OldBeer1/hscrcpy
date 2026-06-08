@@ -13,6 +13,8 @@
 #include <thread>
 #include <functional>
 #include <memory>
+#include <condition_variable>
+#include <deque>
 
 namespace hscrcpy {
 
@@ -41,18 +43,17 @@ public:
     HANDLE frame_event() const { return frame_event_; }
 
 private:
-    bool setup_grpc_stream();
+    bool setup_grpc_stream(bool force_restart = false);
     bool setup_snapshot_fallback();
-    bool push_server_so();
-    bool start_uitest_with_extension();
+    bool start_uitest_with_extension(bool force_restart = false);
     bool setup_port_forward();
-    std::string get_uitest_version();
-    std::string get_device_so_md5();
     std::string get_local_so_md5(const std::string &filepath);
     std::string find_matching_so_with_md5(const std::string &device_md5);
     std::string find_matching_agent_so();
-    bool push_agent_so();
+    std::string build_extension_cmd() const;
+    void kill_uitest_extension();
     void grpc_stream_loop();
+    void decode_loop();
     void snapshot_loop();
     bool capture_one_snapshot();
 
@@ -64,10 +65,17 @@ private:
 
     std::atomic<bool> running_{false};
     std::thread thread_;
+    std::thread decode_thread_;
     std::mutex mutex_;
     std::shared_ptr<DecodedImage> latest_frame_;
     std::atomic<uint64_t> frame_count_{0};
+    std::atomic<bool> got_stream_data_{false};
     HANDLE frame_event_ = nullptr;
+
+    std::mutex h264_queue_mutex_;
+    std::condition_variable h264_queue_cv_;
+    std::deque<std::vector<uint8_t>> h264_queue_;
+    static constexpr size_t kMaxH264QueueSize = 5;
 
     GrpcClient grpc_client_;
     H264Decoder decoder_;

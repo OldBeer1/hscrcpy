@@ -3,11 +3,11 @@
 #include "screen_capture.h"
 #include "input_injector.h"
 #include "h264_decoder.h"
+#include <chrono>
 #include "log.h"
 #include "version.h"
 #include <cstdio>
 #include <memory>
-#include <chrono>
 #include <algorithm>
 
 #include <windows.h>
@@ -438,6 +438,7 @@ static void try_update_frame() {
 }
 
 static bool g_stopping = false;
+static std::string g_cleanup_serial;
 static std::string g_pending_start_serial;
 static std::string g_pending_start_ip;
 static std::string g_pending_start_port;
@@ -446,9 +447,13 @@ static void stop_mirroring() {
     if (!g_mirroring && !g_starting) return;
     if (g_stopping) return;
 
+    std::string stopping_serial;
+    if (g_hdc) stopping_serial = g_hdc->serial();
+
     g_mirroring = false;
     g_starting = false;
     g_stopping = true;
+    g_cleanup_serial = stopping_serial;
 
     g_screen_w = 0;
     g_screen_h = 0;
@@ -458,7 +463,7 @@ static void stop_mirroring() {
     }
 
     SetWindowTextA(g_btn_start_hwnd, "Start Mirroring");
-    EnableWindow(g_btn_start_hwnd, FALSE);
+    EnableWindow(g_btn_start_hwnd, TRUE);
     set_status("Stopping...");
     g_snapshot_warned = false;
 
@@ -484,10 +489,12 @@ static void start_mirroring(const std::string &serial, const std::string &ip = "
         return;
     }
     if (g_stopping) {
-        g_pending_start_serial = serial;
-        g_pending_start_ip = ip;
-        g_pending_start_port = port;
-        return;
+        if (!g_cleanup_serial.empty() && serial == g_cleanup_serial) {
+            g_pending_start_serial = serial;
+            g_pending_start_ip = ip;
+            g_pending_start_port = port;
+            return;
+        }
     }
 
     g_starting = true;
@@ -653,9 +660,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!g_cjk_buf.empty() && g_cjk_buf_time > 0 && GetTickCount64() - g_cjk_buf_time >= 100) {
                 flush_cjk_buffer();
             }
-            if (g_capture && g_capture->frame_event()) {
-                WaitForSingleObject(g_capture->frame_event(), 33);
-            }
         }
         if (wp == 2) {
             KillTimer(hwnd, 2);
@@ -766,8 +770,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_USER + 4: {
         g_stopping = false;
-        EnableWindow(g_btn_start_hwnd, TRUE);
-        set_status("Stopped");
+        std::string cleaned = std::move(g_cleanup_serial);
+        g_cleanup_serial.clear();
+
         if (!g_pending_start_serial.empty()) {
             std::string s = std::move(g_pending_start_serial);
             std::string i = std::move(g_pending_start_ip);
@@ -776,6 +781,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_pending_start_ip.clear();
             g_pending_start_port.clear();
             start_mirroring(s, i, p);
+        } else {
+            if (!g_mirroring && !g_starting) {
+                set_status("Stopped");
+            }
         }
         break;
     }
@@ -881,7 +890,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
                               NULL, NULL, hInst, NULL);
     if (!g_hwnd) return 1;
 
-    SetTimer(g_hwnd, 1, 33, NULL);
+    SetTimer(g_hwnd, 1, 16, NULL);
 
     ShowWindow(g_hwnd, SW_SHOW);
     UpdateWindow(g_hwnd);

@@ -62,11 +62,7 @@ bool JpegDecoder::decode(const uint8_t *jpeg_data, size_t jpeg_size) {
     for (UINT y = 0; y < h; y++) {
         auto *src = static_cast<uint8_t *>(bd.Scan0) + y * bd.Stride;
         auto *dst = image_.data.data() + y * image_.stride;
-        for (UINT x = 0; x < w; x++) {
-            dst[x * 3 + 0] = src[x * 3 + 2];
-            dst[x * 3 + 1] = src[x * 3 + 1];
-            dst[x * 3 + 2] = src[x * 3 + 0];
-        }
+        memcpy(dst, src, w * 3);
     }
 
     bitmap->UnlockBits(&bd);

@@ -37,6 +37,8 @@ private:
     void streaming_loop();
 
     int sock_ = -1;
+    std::string connected_host_;
+    uint16_t connected_port_ = 0;
     std::atomic<bool> connected_{false};
     std::atomic<bool> streaming_{false};
     std::thread stream_thread_;

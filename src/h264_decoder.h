@@ -7,6 +7,7 @@
 struct AVCodecContext;
 struct AVCodecParserContext;
 struct AVFrame;
+struct AVPacket;
 struct SwsContext;
 
 namespace hscrcpy {
@@ -38,12 +39,14 @@ private:
     AVCodecParserContext *parser_ctx_ = nullptr;
     AVFrame *frame_      = nullptr;
     AVFrame *frame_rgb_  = nullptr;
+    AVPacket *pkt_       = nullptr;
     SwsContext *sws_ctx_ = nullptr;
 
     bool sws_initialized_ = false;
     int last_width_  = 0;
     int last_height_ = 0;
     int last_pix_fmt_ = 0;
+    size_t rgb_buf_size_ = 0;
 };
 
 } // namespace hscrcpy

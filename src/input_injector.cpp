@@ -23,6 +23,18 @@ using socket_t = int;
 
 namespace hscrcpy {
 
+static bool is_local_port_free(uint16_t port) {
+    socket_t s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == INVALID_SOCK) return false;
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bool free = (bind(s, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    CLOSE_SOCKET(s);
+    return free;
+}
+
 InputInjector::InputInjector(HdcWrapper &hdc, uint16_t base_port) : hdc_(hdc), base_port_(base_port) {}
 
 InputInjector::~InputInjector() {
@@ -35,6 +47,8 @@ InputInjector::~InputInjector() {
 }
 
 bool InputInjector::init(const std::string &uitest_version) {
+    hdc_.ensure_connected();
+
     if (!uitest_version.empty()) {
         uitest_version_ = uitest_version;
         LOGI("Input: uitest version (shared): %s", uitest_version_.c_str());
@@ -97,14 +111,14 @@ bool InputInjector::ensure_uitest_agent() {
     for (int i = 0; i < 10; i++) {
         std::string output;
 
-        hdc_.shell_command("cat /proc/net/unix | grep uitest_socket", &output, 3);
+        hdc_.shell_command("cat /proc/net/unix", &output, 3);
         if (output.find("uitest_socket") != std::string::npos) {
             LOGI("uitest agent listening on abstract socket uitest_socket (check %d)", i + 1);
             use_abstract_control_ = true;
             return true;
         }
 
-        hdc_.shell_command("netstat -an | grep 8012 | grep LISTEN", &output, 3);
+        hdc_.shell_command("netstat -an", &output, 3);
         if (output.find("8012") != std::string::npos && output.find("LISTEN") != std::string::npos) {
             LOGI("uitest agent listening on TCP port 8012 (check %d)", i + 1);
             use_abstract_control_ = false;
@@ -164,49 +178,51 @@ bool InputInjector::push_agent_so() {
 
 bool InputInjector::setup_control_port() {
     uint16_t start_port = base_port_ > 0 ? base_port_ + 1 : 9950;
-    uint16_t end_port = 10050;
+    uint16_t end_port = start_port + 5;
 
     for (uint16_t port = start_port; port < end_port; port++) {
+        if (!is_local_port_free(port)) continue;
+
         bool ok;
         if (use_abstract_control_) {
             ok = hdc_.forward_localabstract(port, kUitestSocketName);
         } else {
             ok = hdc_.forward_tcp(port, kDefaultControlPort);
         }
-        if (ok) {
-            local_control_port_ = port;
-            break;
+        if (!ok) continue;
+
+        int sock = static_cast<int>(socket(AF_INET, SOCK_STREAM, 0));
+        if (sock == static_cast<int>(INVALID_SOCK)) {
+            LOGE("Failed to create control socket");
+            hdc_.forward_remove(port, use_abstract_control_,
+                                use_abstract_control_ ? kUitestSocketName : "");
+            continue;
         }
-    }
 
-    if (local_control_port_ == 0) {
-        LOGE("Failed to setup control port forward");
-        return false;
-    }
+        struct sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
-    int sock = static_cast<int>(socket(AF_INET, SOCK_STREAM, 0));
-    if (sock == static_cast<int>(INVALID_SOCK)) {
-        LOGE("Failed to create control socket");
-        return false;
-    }
+        if (::connect(static_cast<socket_t>(sock),
+                      reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0) {
+            LOGW("Forward OK but connect to control port %u failed (abstract=%s)",
+                 port, use_abstract_control_ ? "true" : "false");
+            CLOSE_SOCKET(static_cast<socket_t>(sock));
+            hdc_.forward_remove(port, use_abstract_control_,
+                                use_abstract_control_ ? kUitestSocketName : "");
+            continue;
+        }
 
-    struct sockaddr_in addr = {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(local_control_port_);
-    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-
-    if (::connect(static_cast<socket_t>(sock),
-                  reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0) {
-        LOGW("Failed to connect to control port %u (abstract=%s)", local_control_port_,
+        local_control_port_ = port;
+        control_sock_.store(sock);
+        LOGI("Control socket connected on port %u (abstract=%s)", local_control_port_,
              use_abstract_control_ ? "true" : "false");
-        CLOSE_SOCKET(static_cast<socket_t>(sock));
-        return false;
+        return true;
     }
 
-    control_sock_.store(sock);
-    LOGI("Control socket connected on port %u (abstract=%s)", local_control_port_,
-         use_abstract_control_ ? "true" : "false");
-    return true;
+    LOGE("Failed to setup control port forward after %d attempts", end_port - start_port);
+    return false;
 }
 
 bool InputInjector::send_to_socket(const std::string &json) {
@@ -425,15 +441,27 @@ bool InputInjector::inject_wheel(uint32_t x, uint32_t y, int32_t delta) {
 
 void InputInjector::reconnect_loop() {
     LOGI("Reconnect loop started");
+    int consecutive_failures = 0;
     while (reconnect_running_) {
         Sleep(2000);
         if (!reconnect_running_) break;
-        if (control_sock_.load() >= 0) continue;
+        if (control_sock_.load() >= 0) {
+            consecutive_failures = 0;
+            continue;
+        }
+
+        if (consecutive_failures >= 5) {
+            LOGW("Control socket reconnect failed %d times, backing off for 30s", consecutive_failures);
+            for (int i = 0; i < 30 && reconnect_running_; i++) Sleep(1000);
+            consecutive_failures = 0;
+            continue;
+        }
 
         LOGI("Control socket disconnected, attempting reconnect...");
 
         if (!ensure_uitest_agent()) {
             LOGW("Reconnect: uitest agent not available");
+            consecutive_failures++;
             continue;
         }
 
@@ -451,8 +479,10 @@ void InputInjector::reconnect_loop() {
 
         if (setup_control_port()) {
             LOGI("Control socket reconnected on port %u", local_control_port_);
+            consecutive_failures = 0;
         } else {
             LOGW("Reconnect: setup_control_port failed");
+            consecutive_failures++;
         }
     }
     LOGI("Reconnect loop ended");

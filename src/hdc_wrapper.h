@@ -20,11 +20,15 @@ public:
                         const std::string &ip = "127.0.0.1",
                         const std::string &port = "8710");
 
+    bool ensure_connected();
+
     std::vector<HdcDevice> list_devices();
     bool forward_tcp(uint16_t local_port, uint16_t remote_port);
     bool forward_localabstract(uint16_t local_port, const std::string &socket_name);
     bool forward_remove(uint16_t local_port, bool is_abstract, const std::string &socket_name = "");
     bool forward_remove_all();
+    int forward_count();
+    bool cleanup_stale_forwards();
     bool shell_command(const std::string &cmd, std::string *output = nullptr, int timeout_sec = 30);
     bool push_file(const std::string &local_path, const std::string &remote_path);
     bool pull_file(const std::string &remote_path, const std::string &local_path);

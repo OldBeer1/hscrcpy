@@ -3,7 +3,6 @@
 #include "protocol.h"
 #include <cstdio>
 #include <cstring>
-#include <chrono>
 #include <fstream>
 #include <algorithm>
 #include <sstream>
@@ -30,18 +29,6 @@ ScreenCapture::~ScreenCapture() {
     stop();
 }
 
-std::string ScreenCapture::get_uitest_version() {
-    std::string output;
-    hdc_.shell_command("/system/bin/uitest --version", &output, 5);
-    std::string ver;
-    for (auto &c : output) {
-        if ((c >= '0' && c <= '9') || c == '.') ver += c;
-        else if (!ver.empty()) break;
-    }
-    LOGI("uitest version: '%s' (raw: '%s')", ver.c_str(), output.c_str());
-    return ver;
-}
-
 static std::string version_compare_result(const std::string &v1, const std::string &v2) {
     std::istringstream s1(v1), s2(v2);
     std::string p1, p2;
@@ -54,22 +41,6 @@ static std::string version_compare_result(const std::string &v1, const std::stri
     if (std::getline(s1, p1, '.')) return "greater";
     if (std::getline(s2, p2, '.')) return "less";
     return "equal";
-}
-
-std::string ScreenCapture::get_device_so_md5() {
-    std::string output;
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "md5sum %s", kDeviceSoPath);
-    hdc_.shell_command(cmd, &output, 8);
-    auto pos = output.find(' ');
-    if (pos != std::string::npos) return output.substr(0, pos);
-    auto pos2 = output.find('\t');
-    if (pos2 != std::string::npos) return output.substr(0, pos2);
-    pos2 = output.find('\n');
-    if (pos2 != std::string::npos) return output.substr(0, pos2);
-    while (!output.empty() && (output.back() == '\r' || output.back() == '\n' || output.back() == ' '))
-        output.pop_back();
-    return output;
 }
 
 std::string ScreenCapture::get_local_so_md5(const std::string &filepath) {
@@ -163,15 +134,8 @@ std::string ScreenCapture::find_matching_so_with_md5(const std::string &device_m
     for (auto &name : candidates) {
         std::string path = server_dir_ + "\\" + name;
         if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            if (!device_md5.empty()) {
-                std::string local_md5 = get_local_so_md5(path);
-                if (!local_md5.empty() && local_md5 == device_md5) {
-                    LOGI("MD5 matched: %s", name.c_str());
-                    return path;
-                }
-            } else {
-                return path;
-            }
+            LOGI("Selected server SO: %s (by version priority)", name.c_str());
+            return path;
         }
     }
 
@@ -238,89 +202,108 @@ std::string ScreenCapture::find_matching_agent_so() {
     return "";
 }
 
-bool ScreenCapture::push_server_so() {
-    std::string device_md5 = get_device_so_md5();
-    std::string local_so = find_matching_so_with_md5(device_md5);
-    if (local_so.empty()) {
-        LOGE("No matching server .z.so found in %s", server_dir_.c_str());
-        return false;
+std::string ScreenCapture::build_extension_cmd() const {
+    if (use_abstract_socket_) {
+        return "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so -scale 1 -frameRate 30 -bitRate 31457280 " +
+               std::string(kGrpcSocketName) + " -screenId 0 -encodeType 0 -iFrameInterval 2000 -repeatInterval 33";
     }
-    LOGI("Using server SO: %s", local_so.c_str());
-
-    std::string local_md5 = get_local_so_md5(local_so);
-    LOGI("Device SO md5: %s, Local SO md5: %s", device_md5.c_str(), local_md5.c_str());
-
-    if (!device_md5.empty() && device_md5 == local_md5) {
-        LOGI("Server SO already up to date on device");
-        return true;
-    }
-
-    LOGI("Pushing %s to %s", local_so.c_str(), kDeviceSoPath);
-    if (!hdc_.push_file(local_so, kDeviceSoPath)) {
-        LOGE("Failed to push server SO");
-        return false;
-    }
-    return true;
+    return "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so -scale 1 -frameRate 30 -bitRate 31457280 -p 5000 -screenId 0 -encodeType 0 -iFrameInterval 2000 -repeatInterval 33";
 }
 
-bool ScreenCapture::push_agent_so() {
-    std::string local_agent = find_matching_agent_so();
-    if (local_agent.empty()) {
-        LOGW("No matching uitest agent .so found");
-        return false;
+bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
+    hdc_.ensure_connected();
+
+    for (int precheck = 0; precheck < 10; precheck++) {
+        std::string check;
+        hdc_.shell_command("echo ok", &check, 3);
+        if (check.find("ok") != std::string::npos) break;
+        LOGW("hdc not ready (attempt %d/10): '%s'", precheck + 1, check.c_str());
+        Sleep(2000);
     }
-    LOGI("Using agent SO: %s", local_agent.c_str());
-
-    std::string check_output;
-    hdc_.shell_command("cat /data/local/tmp/agent.so | grep -a UITEST_AGENT_LIBRARY", &check_output, 5);
-    if (check_output.find("UITEST_AGENT_LIBRARY") != std::string::npos) {
-        LOGI("Agent already exists on device");
-        return true;
-    }
-
-    LOGI("Pushing agent %s to %s", local_agent.c_str(), kDeviceAgentPath);
-    return hdc_.push_file(local_agent, kDeviceAgentPath);
-}
-
-bool ScreenCapture::start_uitest_with_extension() {
-    std::string combined;
-    hdc_.shell_command("/system/bin/uitest --version; echo '---'; md5sum /data/local/tmp/libscreen_casting.z.so; echo '---'; ps -ef | grep extension-name | grep -v grep", &combined, 10);
 
     std::string ver_raw;
-    std::string device_md5;
-    std::string ps_output;
-    std::istringstream iss(combined);
-    std::string line;
-    int section = 0;
-    while (std::getline(iss, line)) {
-        if (line.find("---") != std::string::npos) { section++; continue; }
-        if (section == 0 && ver_raw.empty()) {
-            for (auto &c : line) {
+    {
+        for (int attempt = 0; attempt < 3; attempt++) {
+            std::string ver_output;
+            hdc_.shell_command("/system/bin/uitest --version", &ver_output, 8);
+            if (ver_output.find("[Fail]") != std::string::npos || ver_output.find("Fail") != std::string::npos) {
+                LOGW("uitest --version returned error (attempt %d): '%s'", attempt + 1, ver_output.c_str());
+                Sleep(1000);
+                continue;
+            }
+            std::string ver_line;
+            for (auto &c : ver_output) {
+                if (c == '\r' || c == '\n') {
+                    if (!ver_line.empty()) break;
+                    continue;
+                }
+                ver_line += c;
+            }
+            for (auto &c : ver_line) {
                 if ((c >= '0' && c <= '9') || c == '.') ver_raw += c;
                 else if (!ver_raw.empty()) break;
             }
-        } else if (section == 1 && device_md5.empty()) {
-            auto pos = line.find(' ');
-            if (pos == std::string::npos) pos = line.find('\t');
-            if (pos != std::string::npos) device_md5 = line.substr(0, pos);
-        } else if (section == 2) {
-            ps_output += line + "\n";
+            if (!ver_raw.empty() && ver_raw.find('.') != std::string::npos) {
+                uitest_version_ = ver_raw;
+                break;
+            } else if (!ver_raw.empty()) {
+                LOGW("Parsed uitest version '%s' has no dot, ignoring", ver_raw.c_str());
+            }
+            break;
         }
     }
 
-    if (!ver_raw.empty() && ver_raw.find('.') != std::string::npos) {
-        uitest_version_ = ver_raw;
-    } else if (!ver_raw.empty()) {
-        LOGW("Parsed uitest version '%s' has no dot, ignoring (likely PID from ps output)", ver_raw.c_str());
+    std::string device_md5;
+    {
+        for (int attempt = 0; attempt < 3; attempt++) {
+            std::string md5_output;
+            char md5_cmd[256];
+            snprintf(md5_cmd, sizeof(md5_cmd), "md5sum %s", kDeviceSoPath);
+            hdc_.shell_command(md5_cmd, &md5_output, 8);
+            if (md5_output.find("[Fail]") != std::string::npos || md5_output.find("Fail") != std::string::npos) {
+                LOGW("md5sum returned error (attempt %d): '%s'", attempt + 1, md5_output.c_str());
+                Sleep(1000);
+                continue;
+            }
+            auto pos = md5_output.find(' ');
+            if (pos == std::string::npos) pos = md5_output.find('\t');
+            if (pos != std::string::npos) device_md5 = md5_output.substr(0, pos);
+            while (!device_md5.empty() && (device_md5.back() == '\r' || device_md5.back() == '\n'))
+                device_md5.pop_back();
+            break;
+        }
     }
+
+    std::string ps_output;
+    {
+        std::string ps_raw;
+        hdc_.shell_command("ps -ef", &ps_raw, 5);
+        std::istringstream iss(ps_raw);
+        std::string line;
+        while (std::getline(iss, line)) {
+            if (line.find("extension-name") != std::string::npos && line.find("grep") == std::string::npos) {
+                ps_output += line + "\n";
+            }
+        }
+    }
+
     LOGI("uitest version: '%s', device_md5: '%s'", uitest_version_.c_str(), device_md5.c_str());
 
     use_abstract_socket_ = version_compare_result(uitest_version_, "6.0.2.1") != "less";
+    if (!use_abstract_socket_ && uitest_version_.empty()) {
+        std::string check;
+        hdc_.shell_command("cat /proc/net/unix", &check, 3);
+        if (check.find("scrcpy_grpc_socket") != std::string::npos) {
+            use_abstract_socket_ = true;
+            LOGI("uitest version unknown but abstract socket found, using abstract socket mode");
+        }
+    }
     LOGI("use_abstract_socket: %s", use_abstract_socket_ ? "true" : "false");
 
     bool extension_running = false;
     std::vector<std::string> pids;
     std::istringstream piss(ps_output);
+    std::string line;
     while (std::getline(piss, line)) {
         if (line.find("extension-name") == std::string::npos) continue;
         if (line.find("grep") != std::string::npos) continue;
@@ -341,81 +324,70 @@ bool ScreenCapture::start_uitest_with_extension() {
     }
     LOGI("Using server SO: %s", local_so.c_str());
 
-    bool so_up_to_date = !device_md5.empty();
-    if (so_up_to_date) {
-        std::string local_md5 = get_local_so_md5(local_so);
-        so_up_to_date = (local_md5 == device_md5);
-        LOGI("Device SO md5: %s, Local SO md5: %s, up_to_date: %s",
-             device_md5.c_str(), local_md5.c_str(), so_up_to_date ? "true" : "false");
-    } else {
-        LOGI("Device SO md5 empty, will push");
+    std::string local_md5 = get_local_so_md5(local_so);
+    bool so_up_to_date = !device_md5.empty() && (local_md5 == device_md5);
+    LOGI("Device SO md5: %s, Local SO md5: %s, up_to_date: %s",
+         device_md5.c_str(), local_md5.c_str(), so_up_to_date ? "true" : "false");
+
+    if (extension_running && !pids.empty()) {
+        LOGI("Killing existing uitest extension (%zu process(es))", pids.size());
+        std::string kill_cmd = "kill -9";
+        for (auto &p : pids) kill_cmd += " " + p;
+        hdc_.shell_command(kill_cmd, nullptr, 3);
+        Sleep(500);
+    } else if (extension_running) {
+        LOGI("Extension running but PID not found, killing by name");
+        hdc_.shell_command("pkill -9 -f extension-name", nullptr, 3);
+        Sleep(500);
     }
 
-    bool can_reuse = extension_running && so_up_to_date;
-    if (can_reuse) {
-        LOGI("Extension already running with up-to-date SO, reusing");
-    } else {
-        if (!pids.empty()) {
-            LOGI("Killing %zu existing uitest extension process(es) for restart", pids.size());
-            std::string kill_cmd = "kill -9";
-            for (auto &p : pids) kill_cmd += " " + p;
-            hdc_.shell_command(kill_cmd, nullptr, 3);
-            Sleep(300);
-        } else if (extension_running) {
-            LOGI("Extension running but PID not found, re-querying");
-            std::string ps2;
-            hdc_.shell_command("ps -ef | grep libscreen_casting | grep -v grep", &ps2, 3);
-            std::istringstream iss2(ps2);
-            std::string line2;
-            while (std::getline(iss2, line2)) {
-                if (line2.find("grep") != std::string::npos) continue;
-                std::istringstream ls2(line2);
-                std::string user2, pid2;
-                if (ls2 >> user2 >> pid2) {
-                    bool all_digit = true;
-                    for (char c : pid2) { if (c < '0' || c > '9') { all_digit = false; break; } }
-                    if (all_digit && !pid2.empty()) {
-                        hdc_.shell_command("kill -9 " + pid2, nullptr, 3);
-                    }
-                }
+    std::string daemon_check;
+    hdc_.shell_command("ps -ef", &daemon_check, 3);
+    bool daemon_running = false;
+    {
+        std::istringstream iss(daemon_check);
+        std::string line;
+        while (std::getline(iss, line)) {
+            if (line.find("uitest") != std::string::npos &&
+                line.find("start-daemon") != std::string::npos &&
+                line.find("grep") == std::string::npos &&
+                line.find("extension-name") == std::string::npos) {
+                daemon_running = true;
+                break;
             }
-            Sleep(300);
         }
-
-        if (!so_up_to_date) {
-            LOGI("Pushing %s to %s", local_so.c_str(), kDeviceSoPath);
-            if (!hdc_.push_file(local_so, kDeviceSoPath)) {
-                LOGE("Failed to push server SO");
-                return false;
-            }
-        } else {
-            LOGI("Server SO already up to date on device");
-        }
-
-        std::string cmd;
-        if (use_abstract_socket_) {
-            cmd = "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so -scale 1 -frameRate 30 -bitRate 4000000 " +
-                  std::string(kGrpcSocketName) + " -iFrameInterval 2000 &";
-        } else {
-            cmd = "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so -scale 1 -frameRate 30 -bitRate 4000000 -p 5000 -iFrameInterval 2000 &";
-        }
-        LOGI("Starting uitest: %s", cmd.c_str());
-        hdc_.shell_command(cmd, nullptr, 5);
     }
+    if (!daemon_running) {
+        LOGI("uitest main daemon not running, starting...");
+        hdc_.shell_command("uitest start-daemon singleness", nullptr, 5);
+        Sleep(500);
+    } else {
+        LOGI("uitest main daemon already running");
+    }
+
+    LOGI("Pushing %s to %s (md5_match=%s)", local_so.c_str(), kDeviceSoPath, so_up_to_date ? "yes" : "no");
+    if (!hdc_.push_file(local_so, kDeviceSoPath)) {
+        LOGE("Failed to push server SO");
+        return false;
+    }
+
+    std::string cmd = build_extension_cmd();
+    LOGI("Starting uitest extension: %s", cmd.c_str());
+    hdc_.shell_command(cmd, nullptr, 5);
 
     bool extension_ready = false;
     for (int i = 0; i < 30; i++) {
         Sleep(100);
         std::string check;
         if (use_abstract_socket_) {
-            hdc_.shell_command("cat /proc/net/unix | grep " + std::string(kGrpcSocketName), &check, 3);
+            hdc_.shell_command("cat /proc/net/unix", &check, 3);
             if (check.find(kGrpcSocketName) != std::string::npos) {
                 LOGI("uitest extension ready (abstract socket) after %d ms", (i + 1) * 100);
                 extension_ready = true;
                 break;
             }
         } else {
-            hdc_.shell_command("netstat -an | grep 5000 | grep LISTEN", &check, 3);
+            hdc_.shell_command("netstat -an", &check, 3);
             if (check.find("5000") != std::string::npos && check.find("LISTEN") != std::string::npos) {
                 LOGI("uitest extension ready (port 5000) after %d ms", (i + 1) * 100);
                 extension_ready = true;
@@ -425,9 +397,26 @@ bool ScreenCapture::start_uitest_with_extension() {
     }
 
     if (!extension_ready) {
-        LOGE("uitest extension failed to start (port 5000 not listening after 3s)");
+        LOGE("uitest extension failed to start (%s not listening after 3s)",
+             use_abstract_socket_ ? "abstract socket" : "port 5000");
+
+        std::string ps_debug;
+        hdc_.shell_command("ps -ef", &ps_debug, 3);
+        {
+            std::istringstream iss(ps_debug);
+            std::string line;
+            std::string filtered;
+            while (std::getline(iss, line)) {
+                if (line.find("uitest") != std::string::npos && line.find("grep") == std::string::npos) {
+                    filtered += line + "\n";
+                }
+            }
+            LOGI("uitest processes after failed start: '%s'", filtered.c_str());
+        }
         return false;
     }
+
+    Sleep(500);
 
     uitest_port_ = kDefaultVideoPort;
     return true;
@@ -446,7 +435,9 @@ static bool is_local_port_free(uint16_t port) {
 }
 
 bool ScreenCapture::setup_port_forward() {
-    for (uint16_t base = kDefaultLocalBasePort; base < kDefaultLocalBasePort + 500; base += 2) {
+    hdc_.cleanup_stale_forwards();
+
+    for (uint16_t base = kDefaultLocalBasePort; base < kDefaultLocalBasePort + 100; base += 2) {
         if (!is_local_port_free(base) || !is_local_port_free(base + 1)) continue;
 
         local_video_port_ = base;
@@ -481,8 +472,8 @@ bool ScreenCapture::setup_port_forward() {
     return true;
 }
 
-bool ScreenCapture::setup_grpc_stream() {
-    LOGI("setup_grpc_stream: serial='%s'", hdc_.serial().c_str());
+bool ScreenCapture::setup_grpc_stream(bool force_restart) {
+    LOGI("setup_grpc_stream: serial='%s'%s", hdc_.serial().c_str(), force_restart ? " (force_restart)" : "");
 
     if (!decoder_.init()) {
         LOGW("H264 decoder not available (FFmpeg DLLs not found), skipping gRPC stream");
@@ -492,7 +483,7 @@ bool ScreenCapture::setup_grpc_stream() {
         return false;
     }
 
-    if (!start_uitest_with_extension()) {
+    if (!start_uitest_with_extension(force_restart)) {
         LOGE("Failed to start uitest with extension");
         return false;
     }
@@ -512,14 +503,7 @@ bool ScreenCapture::setup_grpc_stream() {
         }
         if (retry == 1) {
             LOGI("Retrying uitest extension start...");
-            std::string cmd;
-            if (use_abstract_socket_) {
-                cmd = "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so -scale 1 -frameRate 30 -bitRate 4000000 " +
-                      std::string(kGrpcSocketName) + " -iFrameInterval 2000 &";
-            } else {
-                cmd = "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so -scale 1 -frameRate 30 -bitRate 4000000 -p 5000 -iFrameInterval 2000 &";
-            }
-            hdc_.shell_command(cmd, nullptr, 5);
+            hdc_.shell_command(build_extension_cmd(), nullptr, 5);
             Sleep(1000);
         } else {
             Sleep(500);
@@ -533,11 +517,6 @@ bool ScreenCapture::setup_grpc_stream() {
 
     mode_ = CaptureMode::kGrpcStream;
     LOGI("gRPC stream setup complete, starting streaming");
-
-    std::thread([this]() {
-        hdc_.shell_command("power-shell wakeup", nullptr, 5);
-        LOGI("Sent power-shell wakeup (async)");
-    }).detach();
 
     return true;
 }
@@ -590,6 +569,43 @@ bool ScreenCapture::start() {
         }
     }
 
+    if (mode_ == CaptureMode::kGrpcStream && grpc_ok) {
+        running_ = true;
+        got_stream_data_ = false;
+        if (!frame_event_) frame_event_ = CreateEventA(NULL, FALSE, FALSE, NULL);
+        decode_thread_ = std::thread(&ScreenCapture::decode_loop, this);
+        thread_ = std::thread(&ScreenCapture::grpc_stream_loop, this);
+
+        uint64_t frames_before = frame_count_.load();
+
+        for (int i = 0; i < 30 && frame_count_.load() == frames_before; i++) {
+            if (i == 3 && frame_count_.load() == frames_before) {
+                LOGI("No frame after 300ms, requesting IDR frame...");
+                grpc_client_.request_idr_frame();
+            }
+            if (i == 8 && frame_count_.load() == frames_before) {
+                LOGI("No frame after 800ms, sending screen wakeup trigger...");
+                hdc_.shell_command("power-shell wakeup", nullptr, 5);
+                Sleep(100);
+                hdc_.shell_command("uinput -M -m 100 100 500 500 --trace", nullptr, 5);
+            }
+            if (i == 18 && frame_count_.load() == frames_before) {
+                LOGI("No frame after 1800ms, retrying IDR + trigger...");
+                grpc_client_.request_idr_frame();
+                hdc_.shell_command("uinput -M -m 200 200 100 100 --trace", nullptr, 5);
+            }
+            if (frame_event_) WaitForSingleObject(frame_event_, 100);
+            else Sleep(100);
+        }
+
+        if (frame_count_.load() > frames_before) {
+            LOGI("First frame received, streaming OK");
+        } else {
+            LOGI("No frame yet after 3s, continuing (screen may be static)...");
+        }
+        return true;
+    }
+
     running_ = true;
     if (!frame_event_) frame_event_ = CreateEventA(NULL, FALSE, FALSE, NULL);
     if (mode_ == CaptureMode::kGrpcStream) {
@@ -602,26 +618,101 @@ bool ScreenCapture::start() {
 
 void ScreenCapture::stop() {
     running_ = false;
+    h264_queue_cv_.notify_all();
+    if (decode_thread_.joinable()) decode_thread_.join();
     if (thread_.joinable()) thread_.join();
 
     grpc_client_.disconnect();
     decoder_.cleanup();
 
     if (frame_event_) { CloseHandle(frame_event_); frame_event_ = nullptr; }
+
     if (local_video_port_ > 0) {
         hdc_.forward_remove(local_video_port_, use_abstract_socket_,
                             use_abstract_socket_ ? kGrpcSocketName : "");
+        local_video_port_ = 0;
     }
 
-    if (mode_ == CaptureMode::kGrpcStream) {
-        LOGI("Leaving uitest extension running for potential reuse by other instances");
+    if (local_control_port_ > 0) {
+        hdc_.forward_remove(local_control_port_, use_abstract_socket_,
+                            use_abstract_socket_ ? kUitestSocketName : "");
+        local_control_port_ = 0;
     }
+
+    kill_uitest_extension();
+}
+
+void ScreenCapture::kill_uitest_extension() {
+    std::string ps_raw;
+    hdc_.shell_command("ps -ef", &ps_raw, 5);
+    LOGI("kill_uitest_extension: ps output='%s'", ps_raw.c_str());
+    std::istringstream iss(ps_raw);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (line.find("extension-name") == std::string::npos || line.find("grep") != std::string::npos) continue;
+        std::istringstream ls(line);
+        std::string user, pid_str;
+        if (ls >> user >> pid_str) {
+            bool all_digit = true;
+            for (char c : pid_str) { if (c < '0' || c > '9') { all_digit = false; break; } }
+            if (all_digit && !pid_str.empty()) {
+                std::string kill_result;
+                hdc_.shell_command("kill -9 " + pid_str, &kill_result, 3);
+                LOGI("kill -9 %s result: '%s'", pid_str.c_str(), kill_result.c_str());
+            }
+        }
+    }
+    Sleep(300);
 }
 
 void ScreenCapture::grpc_stream_loop() {
     LOGI("gRPC stream loop started");
 
     auto on_frame = [this](const std::vector<uint8_t> &h264_data) {
+        got_stream_data_ = true;
+        {
+            std::lock_guard<std::mutex> lock(h264_queue_mutex_);
+            if (h264_queue_.size() >= kMaxH264QueueSize) {
+                h264_queue_.pop_front();
+            }
+            h264_queue_.push_back(h264_data);
+        }
+        h264_queue_cv_.notify_one();
+    };
+
+    if (!grpc_client_.start_streaming(on_frame)) {
+        LOGE("Failed to start gRPC streaming");
+        running_ = false;
+        return;
+    }
+
+    LOGI("gRPC streaming started (IDR already requested)");
+
+    while (running_ && grpc_client_.is_connected()) {
+        Sleep(100);
+    }
+
+    grpc_client_.stop_streaming();
+    h264_queue_cv_.notify_all();
+    LOGI("gRPC stream loop ended, frames: %llu", (unsigned long long)frame_count_.load());
+}
+
+void ScreenCapture::decode_loop() {
+    LOGI("Decode loop started");
+
+    while (running_) {
+        std::vector<uint8_t> h264_data;
+        {
+            std::unique_lock<std::mutex> lock(h264_queue_mutex_);
+            h264_queue_cv_.wait_for(lock, std::chrono::milliseconds(100), [this] {
+                return !h264_queue_.empty() || !running_;
+            });
+            if (!running_ && h264_queue_.empty()) break;
+            if (h264_queue_.empty()) continue;
+            h264_data = std::move(h264_queue_.front());
+            h264_queue_.pop_front();
+        }
+
         bool ok = decoder_.decode(h264_data.data(), h264_data.size());
         if (ok) {
             auto &img = decoder_.image();
@@ -640,28 +731,16 @@ void ScreenCapture::grpc_stream_loop() {
                 }
                 frame_count_++;
                 if (frame_event_) SetEvent(frame_event_);
-            } else {
-                LOGW("Decoded frame but width=0 height=0");
             }
         } else {
-            LOGW("H264 decode failed for %zu bytes", h264_data.size());
+            static int decode_fail_count = 0;
+            if (++decode_fail_count <= 3) {
+                LOGW("H264 decode failed (%zu bytes)", h264_data.size());
+            }
         }
-    };
-
-    if (!grpc_client_.start_streaming(on_frame)) {
-        LOGE("Failed to start gRPC streaming");
-        running_ = false;
-        return;
     }
 
-    LOGI("gRPC streaming started (IDR already requested)");
-
-    while (running_ && grpc_client_.is_connected()) {
-        Sleep(100);
-    }
-
-    grpc_client_.stop_streaming();
-    LOGI("gRPC stream loop ended, frames: %llu", (unsigned long long)frame_count_.load());
+    LOGI("Decode loop ended");
 }
 
 bool ScreenCapture::capture_one_snapshot() {
@@ -683,11 +762,9 @@ bool ScreenCapture::capture_one_snapshot() {
         }
     }
 
-    char exe_path[MAX_PATH];
-    GetModuleFileNameA(NULL, exe_path, MAX_PATH);
-    std::string exe_dir(exe_path);
-    auto last_sep = exe_dir.find_last_of("\\/");
-    if (last_sep != std::string::npos) exe_dir = exe_dir.substr(0, last_sep + 1);
+    std::string exe_dir = server_dir_;
+    auto sep = exe_dir.find_last_of("\\/");
+    if (sep != std::string::npos) exe_dir = exe_dir.substr(0, sep + 1);
     std::string local_file = exe_dir + "hscrcpy_cap.jpeg";
 
     if (!hdc_.pull_file("/data/local/tmp/hscrcpy_cap.jpeg", local_file)) {

@@ -14,6 +14,25 @@ HdcWrapper::HdcWrapper(const std::string &serial,
                        const std::string &port)
     : serial_(serial), ip_(ip), port_(port) {}
 
+bool HdcWrapper::ensure_connected() {
+    if (!is_tcp_device()) return true;
+
+    std::string result;
+    std::string cmd = "tconn " + serial_;
+    int ret = run_process(build_hdc_cmd(cmd), &result, 10000);
+    if (result.find("Connect OK") != std::string::npos) {
+        LOGI("tconn %s: OK", serial_.c_str());
+        return true;
+    }
+    if (result.find("already connected") != std::string::npos ||
+        result.find("repeat operation") != std::string::npos) {
+        LOGI("tconn %s: already connected", serial_.c_str());
+        return true;
+    }
+    LOGW("tconn %s failed: ret=%d, result='%s'", serial_.c_str(), ret, result.c_str());
+    return false;
+}
+
 std::string HdcWrapper::build_hdc_cmd(const std::string &subcmd) {
     std::string cmd = "hdc";
     if (!serial_.empty()) {
@@ -159,8 +178,9 @@ bool HdcWrapper::forward_tcp(uint16_t local_port, uint16_t remote_port) {
     snprintf(subcmd, sizeof(subcmd), "fport tcp:%u tcp:%u", local_port, remote_port);
     std::string result;
     int ret = run_process(build_hdc_cmd(subcmd), &result, 10000);
-    LOGD("forward_tcp result: %s (ret=%d)", result.c_str(), ret);
-    return ret == 0;
+    bool ok = (ret == 0) && (result.find("OK") != std::string::npos) && (result.find("Fail") == std::string::npos);
+    LOGD("forward_tcp result: %s (ret=%d, ok=%s)", result.c_str(), ret, ok ? "true" : "false");
+    return ok;
 }
 
 bool HdcWrapper::forward_localabstract(uint16_t local_port, const std::string &socket_name) {
@@ -168,8 +188,9 @@ bool HdcWrapper::forward_localabstract(uint16_t local_port, const std::string &s
     snprintf(subcmd, sizeof(subcmd), "fport tcp:%u localabstract:%s", local_port, socket_name.c_str());
     std::string result;
     int ret = run_process(build_hdc_cmd(subcmd), &result, 10000);
-    LOGD("forward_localabstract result: %s (ret=%d)", result.c_str(), ret);
-    return ret == 0;
+    bool ok = (ret == 0) && (result.find("OK") != std::string::npos) && (result.find("Fail") == std::string::npos);
+    LOGD("forward_localabstract result: %s (ret=%d, ok=%s)", result.c_str(), ret, ok ? "true" : "false");
+    return ok;
 }
 
 bool HdcWrapper::forward_remove(uint16_t local_port, bool is_abstract, const std::string &socket_name) {
@@ -211,6 +232,48 @@ bool HdcWrapper::forward_remove_all() {
         }
     }
     return any_removed;
+}
+
+int HdcWrapper::forward_count() {
+    std::string output;
+    run_process(build_hdc_cmd("fport ls"), &output, 10000);
+    int count = 0;
+    std::istringstream iss(output);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (line.find("tcp:") != std::string::npos) count++;
+    }
+    return count;
+}
+
+bool HdcWrapper::cleanup_stale_forwards() {
+    std::string output;
+    run_process(build_hdc_cmd("fport ls"), &output, 10000);
+    std::istringstream iss(output);
+    std::string line;
+    int removed = 0;
+    while (std::getline(iss, line)) {
+        auto pos = line.find("tcp:");
+        if (pos == std::string::npos) continue;
+        std::string entry = line.substr(pos);
+        while (!entry.empty() && (entry.back() == '\r' || entry.back() == '\n' || entry.back() == ' '))
+            entry.pop_back();
+
+        bool is_our_forward = entry.find("scrcpy_grpc_socket") != std::string::npos ||
+                              entry.find("tcp:5000") != std::string::npos ||
+                              entry.find("uitest_socket") != std::string::npos ||
+                              entry.find("tcp:8012") != std::string::npos;
+        if (!is_our_forward) continue;
+
+        std::string rm_cmd = "fport rm " + entry;
+        if (run_process(build_hdc_cmd(rm_cmd), nullptr, 5000) == 0) {
+            removed++;
+        }
+    }
+    if (removed > 0) {
+        LOGI("Cleaned up %d stale forwards for device %s", removed, serial_.c_str());
+    }
+    return removed > 0;
 }
 
 bool HdcWrapper::shell_command(const std::string &cmd, std::string *output, int timeout_sec) {
