@@ -110,7 +110,7 @@ static HICON load_png_icon(const char *relative_path, int size) {
 }
 
 static void show_error(const char *msg) {
-    MessageBoxA(g_hwnd, msg, "HScrcpy Error", MB_OK | MB_ICONERROR);
+    MessageBoxA(g_hwnd, msg, "HScrcpy Error", MB_OK | MB_ICONERROR | MB_TASKMODAL);
 }
 
 static void set_status(const char *msg) {
@@ -853,7 +853,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         g_btn_back_hwnd = CreateWindowA("BUTTON", "Back",
                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                         12, 34, 48, 22, hwnd, (HMENU)ID_BTN_BACK, g_hInst, NULL);
+                                         8, 34, 48, 22, hwnd, (HMENU)ID_BTN_BACK, g_hInst, NULL);
         g_btn_home_hwnd = CreateWindowA("BUTTON", "Home",
                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
                                          64, 34, 48, 22, hwnd, (HMENU)ID_BTN_HOME, g_hInst, NULL);
@@ -885,7 +885,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         g_status_hwnd = CreateWindowA("STATIC", "",
                                        WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                       426, 38, 400, 18, hwnd, NULL, g_hInst, NULL);
+                                       402, 38, 400, 18, hwnd, NULL, g_hInst, NULL);
 
         g_canvas_hwnd = CreateWindowA(CANVAS_CLASS, "",
                                        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_TABSTOP,
@@ -946,7 +946,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case ID_BTN_REBOOT:
             if (g_mirroring) {
-                if (MessageBoxA(g_hwnd, "Reboot device?", "HScrcpy", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                if (MessageBoxA(g_hwnd, "Reboot device?", "HScrcpy", MB_YESNO | MB_ICONQUESTION | MB_TASKMODAL) == IDYES) {
                     if (g_input) g_input->inject_reboot();
                 }
             }
@@ -1075,7 +1075,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         "https://github.com/BtbN/FFmpeg-Builds/releases\n"
                         "Copy avcodec-62.dll, avutil-60.dll, swscale-9.dll, swresample-6.dll\n"
                         "to the exe directory.",
-                        "HScrcpy - Screenshot Mode", MB_OK | MB_ICONWARNING);
+                        "HScrcpy - Screenshot Mode", MB_OK | MB_ICONWARNING | MB_TASKMODAL);
         }
         break;
     }
