@@ -293,7 +293,8 @@ bool InputInjector::inject_touch_down(uint32_t x, uint32_t y) {
                  "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
                  "\"params\":{\"api\":\"touchDown\",\"args\":{\"x\":%u,\"y\":%u}}}",
                  x, y);
-        return send_to_socket(json);
+        if (send_to_socket(json)) return true;
+        LOGW("touch_down socket failed, fallback to shell");
     }
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "uitest uiInput click %u %u", x, y);
@@ -307,7 +308,7 @@ bool InputInjector::inject_touch_move(uint32_t x, uint32_t y) {
                  "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
                  "\"params\":{\"api\":\"touchMove\",\"args\":{\"x\":%u,\"y\":%u}}}",
                  x, y);
-        return send_to_socket(json);
+        if (send_to_socket(json)) return true;
     }
     return true;
 }
@@ -319,7 +320,7 @@ bool InputInjector::inject_touch_up(uint32_t x, uint32_t y) {
                  "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
                  "\"params\":{\"api\":\"touchUp\",\"args\":{\"x\":%u,\"y\":%u}}}",
                  x, y);
-        return send_to_socket(json);
+        if (send_to_socket(json)) return true;
     }
     return true;
 }
@@ -331,7 +332,8 @@ bool InputInjector::inject_mouse_down(const std::string &button, uint32_t x, uin
                  "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
                  "\"params\":{\"api\":\"mouseDown\",\"args\":{\"x\":%u,\"y\":%u,\"mouseType\":\"%s\"}}}",
                  x, y, button.c_str());
-        return send_to_socket(json);
+        if (send_to_socket(json)) return true;
+        LOGW("mouse_down socket failed, fallback to touch_down shell");
     }
     return inject_touch_down(x, y);
 }
@@ -350,7 +352,7 @@ bool InputInjector::inject_mouse_move(const std::string &button, uint32_t x, uin
                      "\"params\":{\"api\":\"mouseMove\",\"args\":{\"x\":%u,\"y\":%u,\"mouseType\":\"%s\"}}}",
                      x, y, button.c_str());
         }
-        return send_to_socket(json);
+        if (send_to_socket(json)) return true;
     }
     return inject_touch_move(x, y);
 }
@@ -362,7 +364,7 @@ bool InputInjector::inject_mouse_up(const std::string &button, uint32_t x, uint3
                  "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
                  "\"params\":{\"api\":\"mouseUp\",\"args\":{\"x\":%u,\"y\":%u,\"mouseType\":\"%s\"}}}",
                  x, y, button.c_str());
-        return send_to_socket(json);
+        if (send_to_socket(json)) return true;
     }
     return inject_touch_up(x, y);
 }
