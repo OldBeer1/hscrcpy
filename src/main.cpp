@@ -78,6 +78,43 @@ static uint32_t g_device_screen_w = 0, g_device_screen_h = 0;
 
 static ULONG_PTR g_gdiplus_token = 0;
 
+// Persistent backbuffer for GDI rendering
+static HDC g_backbuffer_dc = nullptr;
+static HBITMAP g_backbuffer_bmp = nullptr;
+static HBITMAP g_backbuffer_old = nullptr;
+static int g_backbuffer_w = 0;
+static int g_backbuffer_h = 0;
+
+static void destroy_backbuffer() {
+    if (g_backbuffer_dc) {
+        if (g_backbuffer_old) SelectObject(g_backbuffer_dc, g_backbuffer_old);
+        if (g_backbuffer_bmp) DeleteObject(g_backbuffer_bmp);
+        DeleteDC(g_backbuffer_dc);
+    }
+    g_backbuffer_dc = nullptr;
+    g_backbuffer_bmp = nullptr;
+    g_backbuffer_old = nullptr;
+    g_backbuffer_w = 0;
+    g_backbuffer_h = 0;
+}
+
+static bool ensure_backbuffer(int w, int h) {
+    if (g_backbuffer_dc && g_backbuffer_w >= w && g_backbuffer_h >= h) return true;
+    destroy_backbuffer();
+    HDC screen_dc = GetDC(nullptr);
+    g_backbuffer_dc = CreateCompatibleDC(screen_dc);
+    g_backbuffer_bmp = CreateCompatibleBitmap(screen_dc, w, h);
+    ReleaseDC(nullptr, screen_dc);
+    if (!g_backbuffer_dc || !g_backbuffer_bmp) {
+        destroy_backbuffer();
+        return false;
+    }
+    g_backbuffer_old = (HBITMAP)SelectObject(g_backbuffer_dc, g_backbuffer_bmp);
+    g_backbuffer_w = w;
+    g_backbuffer_h = h;
+    return true;
+}
+
 static HICON load_png_icon(const char *relative_path, int size) {
     char exe_path[MAX_PATH];
     GetModuleFileNameA(NULL, exe_path, MAX_PATH);
@@ -591,51 +628,46 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         GetClientRect(hwnd, &rc);
         int cw = rc.right, ch = rc.bottom;
 
-        HDC memdc = CreateCompatibleDC(hdc);
-        HBITMAP membmp = CreateCompatibleBitmap(hdc, cw, ch);
-        HBITMAP oldbmp = (HBITMAP)SelectObject(memdc, membmp);
+        if (ensure_backbuffer(cw, ch)) {
+            HBRUSH bg = CreateSolidBrush(RGB(30, 30, 30));
+            FillRect(g_backbuffer_dc, &rc, bg);
+            DeleteObject(bg);
 
-        HBRUSH bg = CreateSolidBrush(RGB(30, 30, 30));
-        FillRect(memdc, &rc, bg);
-        DeleteObject(bg);
+            {
+                std::lock_guard<std::mutex> lock(g_frame_mutex);
+                if (g_cur_frame && !g_cur_frame->data.empty() && g_cur_frame->width > 0) {
+                    double aspect = (double)g_cur_frame->width / g_cur_frame->height;
+                    int draw_w, draw_h, off_x, off_y;
+                    if ((double)cw / ch > aspect) {
+                        draw_h = ch;
+                        draw_w = (int)(ch * aspect);
+                    } else {
+                        draw_w = cw;
+                        draw_h = (int)(cw / aspect);
+                    }
+                    off_x = (cw - draw_w) / 2;
+                    off_y = (ch - draw_h) / 2;
 
-        {
-            std::lock_guard<std::mutex> lock(g_frame_mutex);
-            if (g_cur_frame && !g_cur_frame->data.empty() && g_cur_frame->width > 0) {
-                double aspect = (double)g_cur_frame->width / g_cur_frame->height;
-                int draw_w, draw_h, off_x, off_y;
-                if ((double)cw / ch > aspect) {
-                    draw_h = ch;
-                    draw_w = (int)(ch * aspect);
-                } else {
-                    draw_w = cw;
-                    draw_h = (int)(cw / aspect);
+                    BITMAPINFOHEADER bih = {};
+                    bih.biSize     = sizeof(bih);
+                    bih.biWidth    = static_cast<LONG>(g_cur_frame->width);
+                    bih.biHeight   = -static_cast<LONG>(g_cur_frame->height);
+                    bih.biPlanes   = 1;
+                    bih.biBitCount = 24;
+                    bih.biCompression = BI_RGB;
+                    bih.biSizeImage = g_cur_frame->data.size();
+
+                    SetStretchBltMode(g_backbuffer_dc, HALFTONE);
+                    StretchDIBits(g_backbuffer_dc, off_x, off_y, draw_w, draw_h,
+                                  0, 0, g_cur_frame->width, g_cur_frame->height,
+                                  g_cur_frame->data.data(),
+                                  reinterpret_cast<BITMAPINFO *>(&bih),
+                                  DIB_RGB_COLORS, SRCCOPY);
                 }
-                off_x = (cw - draw_w) / 2;
-                off_y = (ch - draw_h) / 2;
-
-                BITMAPINFOHEADER bih = {};
-                bih.biSize     = sizeof(bih);
-                bih.biWidth    = static_cast<LONG>(g_cur_frame->width);
-                bih.biHeight   = -static_cast<LONG>(g_cur_frame->height);
-                bih.biPlanes   = 1;
-                bih.biBitCount = 24;
-                bih.biCompression = BI_RGB;
-                bih.biSizeImage = g_cur_frame->data.size();
-
-                SetStretchBltMode(memdc, HALFTONE);
-                StretchDIBits(memdc, off_x, off_y, draw_w, draw_h,
-                              0, 0, g_cur_frame->width, g_cur_frame->height,
-                              g_cur_frame->data.data(),
-                              reinterpret_cast<BITMAPINFO *>(&bih),
-                              DIB_RGB_COLORS, SRCCOPY);
             }
-        }
 
-        BitBlt(hdc, 0, 0, cw, ch, memdc, 0, 0, SRCCOPY);
-        SelectObject(memdc, oldbmp);
-        DeleteObject(membmp);
-        DeleteDC(memdc);
+            BitBlt(hdc, 0, 0, cw, ch, g_backbuffer_dc, 0, 0, SRCCOPY);
+        }
 
         EndPaint(hwnd, &ps);
         return 0;
@@ -715,6 +747,17 @@ static uint64_t g_last_drawn_frame = 0;
 static uint64_t g_fps_counter = 0;
 static DWORD g_fps_start_tick = 0;
 
+// Track background threads to avoid detach
+static std::thread g_cleanup_thread;
+static std::thread g_startup_thread;
+
+static void join_cleanup_thread() {
+    if (g_cleanup_thread.joinable()) g_cleanup_thread.join();
+}
+static void join_startup_thread() {
+    if (g_startup_thread.joinable()) g_startup_thread.join();
+}
+
 static void try_update_frame() {
     if (!g_capture) return;
     auto fc = g_capture->frame_count();
@@ -788,12 +831,13 @@ static void stop_mirroring() {
     g_input = nullptr;
     g_hdc = nullptr;
 
-    std::thread([cap, inp, hdc]() {
+    join_cleanup_thread();
+    g_cleanup_thread = std::thread([cap, inp, hdc]() {
         if (cap) { cap->stop(); delete cap; }
         if (inp) { delete inp; }
         if (hdc) { delete hdc; }
         PostMessageA(g_hwnd, WM_USER + 4, 0, 0);
-    }).detach();
+    });
 }
 
 static void start_mirroring(const std::string &serial, const std::string &ip = "127.0.0.1", const std::string &port = "8710") {
@@ -815,7 +859,8 @@ static void start_mirroring(const std::string &serial, const std::string &ip = "
 
     g_hdc = new HdcWrapper(serial, ip, port);
 
-    std::thread([serial, ip, port]() {
+    join_startup_thread();
+    g_startup_thread = std::thread([serial, ip, port]() {
         if (!g_config_initialized) {
             auto_select_config();
             g_config_initialized = true;
@@ -871,7 +916,7 @@ static void start_mirroring(const std::string &serial, const std::string &ip = "
         }
 
         PostMessageA(g_hwnd, WM_USER + 3, 0, 0);
-    }).detach();
+    });
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1003,6 +1048,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RECT rc;
         GetClientRect(hwnd, &rc);
         MoveWindow(g_canvas_hwnd, 0, TOOLBAR_H, rc.right, rc.bottom - TOOLBAR_H, FALSE);
+        destroy_backbuffer();
         InvalidateRect(g_canvas_hwnd, NULL, FALSE);
         break;
     }
@@ -1049,10 +1095,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_hdc = nullptr;
         EnableWindow(g_btn_start_hwnd, TRUE);
         set_status("Failed");
-        std::thread([cap, hdc_ptr]() {
+        join_cleanup_thread();
+        g_cleanup_thread = std::thread([cap, hdc_ptr]() {
             if (cap) { cap->stop(); delete cap; }
             delete hdc_ptr;
-        }).detach();
+        });
         break;
     }
     case WM_USER + 2: {
@@ -1064,10 +1111,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_hdc = nullptr;
         EnableWindow(g_btn_start_hwnd, TRUE);
         set_status("No frame");
-        std::thread([cap, hdc_ptr]() {
+        join_cleanup_thread();
+        g_cleanup_thread = std::thread([cap, hdc_ptr]() {
             if (cap) { cap->stop(); delete cap; }
             delete hdc_ptr;
-        }).detach();
+        });
         break;
     }
     case WM_USER + 3: {
@@ -1076,10 +1124,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_screen_h = g_capture->height();
 
         g_input = new InputInjector(*g_hdc, g_capture->local_base_port());
-        std::thread input_init_thread([]() {
-            g_input->init(g_capture->uitest_version());
+        join_startup_thread();
+        g_startup_thread = std::thread([]() {
+            if (g_input) g_input->init(g_capture ? g_capture->uitest_version() : "");
         });
-        input_init_thread.detach();
 
         g_mirroring = true;
         SetWindowTextA(g_btn_start_hwnd, "Stop Mirroring");
@@ -1192,6 +1240,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     }
     case WM_DESTROY:
+        destroy_backbuffer();
+        join_cleanup_thread();
+        join_startup_thread();
         if (g_canvas_orig_wndproc && g_canvas_hwnd) {
             SetWindowLongPtrA(g_canvas_hwnd, GWLP_WNDPROC, (LONG_PTR)g_canvas_orig_wndproc);
             g_canvas_orig_wndproc = nullptr;

@@ -387,27 +387,53 @@ bool InputInjector::inject_swipe(uint32_t from_x, uint32_t from_y, uint32_t to_x
     return hdc_.shell_command(cmd, nullptr, 5);
 }
 
+bool InputInjector::inject_key_via_socket(int key_code, bool shift) {
+    if (!use_socket_mode_) return false;
+    char json[384];
+    if (shift) {
+        snprintf(json, sizeof(json),
+                 "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"KeyEvent\","
+                 "\"params\":{\"api\":\"keyCode\",\"args\":{\"code\":%d,\"shift\":true}}}",
+                 key_code);
+    } else {
+        snprintf(json, sizeof(json),
+                 "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"KeyEvent\","
+                 "\"params\":{\"api\":\"keyCode\",\"args\":{\"code\":%d}}}",
+                 key_code);
+    }
+    if (send_to_socket(json)) return true;
+    LOGW("key_event socket failed (%d), fallback to shell", key_code);
+    return false;
+}
+
 bool InputInjector::inject_back() {
+    if (inject_key_via_socket(2)) return true;
     return hdc_.shell_command("uinput -K -d 2 -u 2", nullptr, 3);
 }
 
 bool InputInjector::inject_home() {
+    if (inject_key_via_socket(1)) return true;
     return hdc_.shell_command("uinput -K -d 1 -u 1", nullptr, 3);
 }
 
 bool InputInjector::inject_recent() {
+    if (inject_key_via_socket(10011)) return true;
     return hdc_.shell_command("uitest uiInput keyEvent 10011", nullptr, 3);
 }
 
 bool InputInjector::inject_power() {
+    if (inject_key_via_socket(18)) return true;
     return hdc_.shell_command("uinput -K -d 18 -u 18", nullptr, 3);
 }
 
 bool InputInjector::inject_key_event(const std::string &key) {
+    int code = std::atoi(key.c_str());
+    if (code > 0 && inject_key_via_socket(code)) return true;
     return hdc_.shell_command("uinput -K -d " + key + " -u " + key, nullptr, 3);
 }
 
 bool InputInjector::inject_key_code(int key_code, bool shift) {
+    if (inject_key_via_socket(key_code, shift)) return true;
     char cmd[256];
     if (shift) {
         snprintf(cmd, sizeof(cmd), "uinput -K -d 2047 -d %d -u %d -u 2047", key_code, key_code);
@@ -425,16 +451,33 @@ bool InputInjector::inject_key_code(int key_code, bool shift) {
 
 bool InputInjector::inject_text(const std::string &text, uint32_t x, uint32_t y) {
     LOGI("inject_text: '%s' at (%u, %u)", text.c_str(), x, y);
-    std::string escaped;
+    if (use_socket_mode_) {
+        char json[1024];
+        char escaped[512];
+        size_t j = 0;
+        for (size_t i = 0; i < text.size() && j < sizeof(escaped) - 6; i++) {
+            char c = text[i];
+            if (c == '\\' || c == '"') { escaped[j++] = '\\'; }
+            escaped[j++] = c;
+        }
+        escaped[j] = '\0';
+        snprintf(json, sizeof(json),
+                 "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"InputText\","
+                 "\"params\":{\"api\":\"inputText\",\"args\":{\"x\":%u,\"y\":%u,\"text\":\"%s\"}}}",
+                 x, y, escaped);
+        if (send_to_socket(json)) return true;
+        LOGW("inject_text socket failed, fallback to shell");
+    }
+    std::string escaped2;
     for (char c : text) {
-        if (c == '\'') escaped += "'\\''";
-        else escaped += c;
+        if (c == '\'') escaped2 += "'\\''";
+        else escaped2 += c;
     }
     char cmd[512];
     if (x > 0 || y > 0) {
-        snprintf(cmd, sizeof(cmd), "uitest uiInput inputText %u %u '%s'", x, y, escaped.c_str());
+        snprintf(cmd, sizeof(cmd), "uitest uiInput inputText %u %u '%s'", x, y, escaped2.c_str());
     } else {
-        snprintf(cmd, sizeof(cmd), "uitest uiInput inputText 0 0 '%s'", escaped.c_str());
+        snprintf(cmd, sizeof(cmd), "uitest uiInput inputText 0 0 '%s'", escaped2.c_str());
     }
     std::lock_guard<std::mutex> lock(task_mutex_);
     task_queue_.push([this, cmd]() {

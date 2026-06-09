@@ -2,6 +2,7 @@
 #include "log.h"
 #include <cstring>
 #include <cstdio>
+#include <thread>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -58,7 +59,8 @@ bool H264Decoder::init() {
         return false;
     }
 
-    codec_ctx_->thread_count = 2;
+    int hw_threads = static_cast<int>(std::thread::hardware_concurrency());
+    codec_ctx_->thread_count = (std::max)(1, (std::min)(hw_threads / 4, 4));
     codec_ctx_->thread_type = FF_THREAD_SLICE;
 
     if (avcodec_open2(codec_ctx_, codec, nullptr) < 0) {
@@ -202,9 +204,9 @@ bool H264Decoder::decode(const uint8_t *h264_data, size_t h264_size) {
             image_.width = static_cast<uint32_t>(w);
             image_.height = static_cast<uint32_t>(h);
             image_.stride = frame_rgb_->linesize[0];
-            if (image_.data.size() != rgb_buf_size_)
-                image_.data.resize(rgb_buf_size_);
-            memcpy(image_.data.data(), frame_rgb_->data[0], rgb_buf_size_);
+            decode_buffer_.resize(rgb_buf_size_);
+            memcpy(decode_buffer_.data(), frame_rgb_->data[0], rgb_buf_size_);
+            image_.data.swap(decode_buffer_);
             got_frame = true;
         }
     }
