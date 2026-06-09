@@ -61,6 +61,7 @@ static uint32_t g_drag_start_x = 0, g_drag_start_y = 0;
 static auto g_last_click_time = std::chrono::steady_clock::now();
 
 static CaptureConfig g_capture_config;
+static bool g_config_initialized = false;
 static uint32_t g_device_screen_w = 0, g_device_screen_h = 0;
 
 #define ID_COMBO       1001
@@ -109,8 +110,32 @@ static HICON load_png_icon(const char *relative_path, int size) {
     return icon;
 }
 
+static HHOOK g_msgbox_hook = NULL;
+
+static LRESULT CALLBACK MsgBoxCBTProc(int nCode, WPARAM wp, LPARAM lp) {
+    if (nCode == HCBT_CREATEWND) {
+        HWND hMsg = (HWND)wp;
+        if (g_hwnd) {
+            RECT pr, mr;
+            GetWindowRect(g_hwnd, &pr);
+            GetWindowRect(hMsg, &mr);
+            int x = pr.left + (pr.right - pr.left - (mr.right - mr.left)) / 2;
+            int y = pr.top + (pr.bottom - pr.top - (mr.bottom - mr.top)) / 2;
+            SetWindowPos(hMsg, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        UnhookWindowsHookEx(g_msgbox_hook);
+        g_msgbox_hook = NULL;
+    }
+    return CallNextHookEx(g_msgbox_hook, nCode, wp, lp);
+}
+
+static int center_msgbox(const char *text, const char *title, UINT type) {
+    g_msgbox_hook = SetWindowsHookExA(WH_CBT, MsgBoxCBTProc, NULL, GetCurrentThreadId());
+    return MessageBoxA(g_hwnd, text, title, type);
+}
+
 static void show_error(const char *msg) {
-    MessageBoxA(g_hwnd, msg, "HScrcpy Error", MB_OK | MB_ICONERROR | MB_TASKMODAL);
+    center_msgbox(msg, "HScrcpy Error", MB_OK | MB_ICONERROR);
 }
 
 static void set_status(const char *msg) {
@@ -131,7 +156,7 @@ static const char *bitrate_label(int bitrate) {
     return "?";
 }
 
-static void auto_select_config() {
+static void query_device_resolution() {
     if (!g_hdc) return;
     uint32_t w = 0, h = 0;
     bool got = g_hdc->get_screen_resolution(w, h);
@@ -144,18 +169,29 @@ static void auto_select_config() {
         g_device_screen_w = 0;
         g_device_screen_h = 0;
     }
+}
+
+static void auto_select_config() {
+    query_device_resolution();
 
     g_capture_config = CaptureConfig{};
-    g_capture_config.frame_rate = 30;
-    g_capture_config.bit_rate = 8388608;
+    bool is_tcp = g_hdc && g_hdc->is_tcp();
 
     uint32_t eff_w = g_device_screen_w > 0 ? g_device_screen_w : 1260;
     if (eff_w > 720) {
         g_capture_config.scale = 2;
-        LOGI("Auto: %ux%u -> scale=2 (~720p), 8M, 30fps", eff_w, g_device_screen_h);
     } else {
         g_capture_config.scale = 1;
-        LOGI("Auto: %ux%u -> scale=1, 8M, 30fps", eff_w, g_device_screen_h);
+    }
+
+    if (is_tcp) {
+        g_capture_config.bit_rate = 4194304;
+        g_capture_config.frame_rate = 24;
+        LOGI("Auto TCP: %ux%u -> scale=%d, 4M, 24fps", eff_w, g_device_screen_h, g_capture_config.scale);
+    } else {
+        g_capture_config.bit_rate = 8388608;
+        g_capture_config.frame_rate = 30;
+        LOGI("Auto USB: %ux%u -> scale=%d, 8M, 30fps", eff_w, g_device_screen_h, g_capture_config.scale);
     }
 }
 
@@ -249,9 +285,8 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             if (g_mirroring && (old_config.scale != g_capture_config.scale ||
                                 old_config.bit_rate != g_capture_config.bit_rate ||
                                 old_config.frame_rate != g_capture_config.frame_rate)) {
-                if (MessageBoxA(g_hwnd,
-                                "Quality settings changed. Restart mirroring to apply?",
-                                "HScrcpy", MB_YESNO | MB_ICONQUESTION | MB_TASKMODAL) == IDYES) {
+                if (center_msgbox("Quality settings changed. Restart mirroring to apply?",
+                                  "HScrcpy", MB_YESNO | MB_ICONQUESTION) == IDYES) {
                     PostMessageA(g_hwnd, WM_USER + 7, 0, 0);
                 }
             }
@@ -627,7 +662,9 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (g_mouse_down && g_mirroring && g_input) {
             POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             auto [x, y] = canvas_to_screen(pt.x, pt.y);
-            if (x != g_last_touch_x || y != g_last_touch_y) {
+            int dx = (int)x - (int)g_last_touch_x;
+            int dy = (int)y - (int)g_last_touch_y;
+            if (dx * dx + dy * dy >= 16) {
                 g_last_touch_x = x;
                 g_last_touch_y = y;
                 g_input->inject_touch_move(x, y);
@@ -779,7 +816,12 @@ static void start_mirroring(const std::string &serial, const std::string &ip = "
     g_hdc = new HdcWrapper(serial, ip, port);
 
     std::thread([serial, ip, port]() {
-        auto_select_config();
+        if (!g_config_initialized) {
+            auto_select_config();
+            g_config_initialized = true;
+        } else {
+            query_device_resolution();
+        }
 
         if (g_cli_args.scale > 0) {
             g_capture_config.scale = g_cli_args.scale;
@@ -906,6 +948,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (g_mirroring) {
                         auto dev = get_selected_device();
                         if (!dev.serial.empty() && dev.serial != g_hdc->serial()) {
+                            g_config_initialized = false;
                             start_mirroring(dev.serial, dev.ip, dev.port);
                         }
                     } else {
@@ -946,7 +989,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case ID_BTN_REBOOT:
             if (g_mirroring) {
-                if (MessageBoxA(g_hwnd, "Reboot device?", "HScrcpy", MB_YESNO | MB_ICONQUESTION | MB_TASKMODAL) == IDYES) {
+                if (center_msgbox("Reboot device?", "HScrcpy", MB_YESNO | MB_ICONQUESTION) == IDYES) {
                     if (g_input) g_input->inject_reboot();
                 }
             }
@@ -1068,14 +1111,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         if (g_capture->mode() == CaptureMode::kSnapshotFallback && !g_snapshot_warned) {
             g_snapshot_warned = true;
-            MessageBoxA(g_hwnd,
-                        "Virtual screen streaming unavailable (FFmpeg DLLs not found or gRPC failed).\n"
-                        "Falling back to screenshot mode (~2 FPS).\n\n"
-                        "To enable gRPC virtual screen streaming, download FFmpeg shared DLLs:\n"
-                        "https://github.com/BtbN/FFmpeg-Builds/releases\n"
-                        "Copy avcodec-62.dll, avutil-60.dll, swscale-9.dll, swresample-6.dll\n"
-                        "to the exe directory.",
-                        "HScrcpy - Screenshot Mode", MB_OK | MB_ICONWARNING | MB_TASKMODAL);
+            center_msgbox("Virtual screen streaming unavailable (FFmpeg DLLs not found or gRPC failed).\n"
+                          "Falling back to screenshot mode (~2 FPS).\n\n"
+                          "To enable gRPC virtual screen streaming, download FFmpeg shared DLLs:\n"
+                          "https://github.com/BtbN/FFmpeg-Builds/releases\n"
+                          "Copy avcodec-62.dll, avutil-60.dll, swscale-9.dll, swresample-6.dll\n"
+                          "to the exe directory.",
+                          "HScrcpy - Screenshot Mode", MB_OK | MB_ICONWARNING);
         }
         break;
     }
@@ -1141,6 +1183,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             std::string serial = g_hdc->serial();
             std::string ip = g_hdc->ip();
             std::string port = g_hdc->port();
+            EnableWindow(g_btn_start_hwnd, FALSE);
             stop_mirroring();
             g_pending_start_serial = serial;
             g_pending_start_ip = ip;

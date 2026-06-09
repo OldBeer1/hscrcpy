@@ -753,7 +753,13 @@ void ScreenCapture::decode_loop() {
 
 bool ScreenCapture::capture_one_snapshot() {
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "snapshot_display -f /data/local/tmp/hscrcpy_cap.jpeg");
+    if (config_.scale > 1 && width_.load() > 0 && height_.load() > 0) {
+        snprintf(cmd, sizeof(cmd),
+                 "snapshot_display -f /data/local/tmp/hscrcpy_cap.jpeg -w %u -h %u",
+                 width_.load() / config_.scale, height_.load() / config_.scale);
+    } else {
+        snprintf(cmd, sizeof(cmd), "snapshot_display -f /data/local/tmp/hscrcpy_cap.jpeg");
+    }
 
     std::string output;
     if (!hdc_.shell_command(cmd, &output, 10)) {
