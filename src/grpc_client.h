@@ -51,6 +51,7 @@ private:
     std::mutex mutex_;
     std::vector<uint8_t> recv_buffer_;
     std::vector<uint8_t> leftover_buf_;
+    std::vector<uint8_t> h264_scratch_;  // pre-allocated to avoid per-frame allocation
     uint32_t server_window_size_ = 65535;
     bool idr_requested_ = false;
     uint32_t next_stream_id_ = 3;

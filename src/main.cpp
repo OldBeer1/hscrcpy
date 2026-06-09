@@ -657,7 +657,7 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     bih.biCompression = BI_RGB;
                     bih.biSizeImage = g_cur_frame->data.size();
 
-                    SetStretchBltMode(g_backbuffer_dc, HALFTONE);
+                    SetStretchBltMode(g_backbuffer_dc, COLORONCOLOR);
                     StretchDIBits(g_backbuffer_dc, off_x, off_y, draw_w, draw_h,
                                   0, 0, g_cur_frame->width, g_cur_frame->height,
                                   g_cur_frame->data.data(),

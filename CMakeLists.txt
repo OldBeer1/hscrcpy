@@ -4,6 +4,9 @@ project(hscrcpy CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -march=native")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O2 -march=native")
+
 add_executable(hscrcpy WIN32
     src/main.cpp
     src/hdc_wrapper.cpp
@@ -87,6 +90,7 @@ target_link_libraries(hscrcpy
 )
 
 target_compile_definitions(hscrcpy PRIVATE _CRT_SECURE_NO_WARNINGS)
-target_link_options(hscrcpy PRIVATE -static -static-libgcc -static-libstdc++)
+target_compile_options(hscrcpy PRIVATE -flto)
+target_link_options(hscrcpy PRIVATE -static -static-libgcc -static-libstdc++ -flto)
 
 install(TARGETS hscrcpy DESTINATION bin)

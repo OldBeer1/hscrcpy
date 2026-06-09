@@ -82,8 +82,8 @@ private:
 
     std::mutex h264_queue_mutex_;
     std::condition_variable h264_queue_cv_;
-    std::deque<std::vector<uint8_t>> h264_queue_;
-    static constexpr size_t kMaxH264QueueSize = 5;
+    std::deque<std::shared_ptr<std::vector<uint8_t>>> h264_queue_;
+    static constexpr size_t kMaxH264QueueSize = 10;
 
     GrpcClient grpc_client_;
     H264Decoder decoder_;

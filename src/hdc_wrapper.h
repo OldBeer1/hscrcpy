@@ -5,6 +5,10 @@
 #include <vector>
 #include <cstdint>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace hscrcpy {
 
 struct HdcDevice {
@@ -19,6 +23,7 @@ public:
     explicit HdcWrapper(const std::string &serial = "",
                         const std::string &ip = "127.0.0.1",
                         const std::string &port = "8710");
+    ~HdcWrapper();
 
     bool ensure_connected();
 
@@ -43,6 +48,17 @@ public:
 private:
     int run_process(const std::string &cmd, std::string *output = nullptr, int timeout_ms = 30000);
     std::string build_hdc_cmd(const std::string &subcmd);
+
+    // Persistent hdc shell session
+    bool ensure_persistent_shell();
+    void close_persistent_shell();
+    bool shell_via_persistent(const std::string &cmd, std::string *output, int timeout_sec);
+
+#ifdef _WIN32
+    HANDLE shell_process_ = nullptr;
+    HANDLE shell_stdin_ = nullptr;
+    HANDLE shell_stdout_ = nullptr;
+#endif
 
     std::string serial_;
     std::string ip_;

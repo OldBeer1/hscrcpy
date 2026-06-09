@@ -683,7 +683,7 @@ void ScreenCapture::grpc_stream_loop() {
             if (h264_queue_.size() >= kMaxH264QueueSize) {
                 h264_queue_.pop_front();
             }
-            h264_queue_.push_back(h264_data);
+            h264_queue_.push_back(std::make_shared<std::vector<uint8_t>>(h264_data));
         }
         h264_queue_cv_.notify_one();
     };
@@ -709,10 +709,10 @@ void ScreenCapture::decode_loop() {
     LOGI("Decode loop started");
 
     while (running_) {
-        std::vector<uint8_t> h264_data;
+        std::shared_ptr<std::vector<uint8_t>> h264_data;
         {
             std::unique_lock<std::mutex> lock(h264_queue_mutex_);
-            h264_queue_cv_.wait_for(lock, std::chrono::milliseconds(100), [this] {
+            h264_queue_cv_.wait(lock, [this] {
                 return !h264_queue_.empty() || !running_;
             });
             if (!running_ && h264_queue_.empty()) break;
@@ -721,7 +721,7 @@ void ScreenCapture::decode_loop() {
             h264_queue_.pop_front();
         }
 
-        bool ok = decoder_.decode(h264_data.data(), h264_data.size());
+        bool ok = decoder_.decode(h264_data->data(), h264_data->size());
         if (ok) {
             auto &img = decoder_.image();
             if (img.width > 0 && img.height > 0) {
@@ -743,7 +743,7 @@ void ScreenCapture::decode_loop() {
         } else {
             static int decode_fail_count = 0;
             if (++decode_fail_count <= 3) {
-                LOGW("H264 decode failed (%zu bytes)", h264_data.size());
+                LOGW("H264 decode failed (%zu bytes)", h264_data->size());
             }
         }
     }

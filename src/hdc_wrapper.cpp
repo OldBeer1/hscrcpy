@@ -14,6 +14,10 @@ HdcWrapper::HdcWrapper(const std::string &serial,
                        const std::string &port)
     : serial_(serial), ip_(ip), port_(port) {}
 
+HdcWrapper::~HdcWrapper() {
+    close_persistent_shell();
+}
+
 bool HdcWrapper::ensure_connected() {
     if (!is_tcp()) return true;
 
@@ -45,6 +49,133 @@ std::string HdcWrapper::build_hdc_cmd(const std::string &subcmd) {
 bool HdcWrapper::is_tcp() const {
     return serial_.find(':') != std::string::npos;
 }
+
+#ifdef _WIN32
+bool HdcWrapper::ensure_persistent_shell() {
+    if (shell_process_) return true;
+
+    SECURITY_ATTRIBUTES sa = {sizeof(SECURITY_ATTRIBUTES), NULL, TRUE};
+    HANDLE stdin_read, stdin_write;
+    if (!CreatePipe(&stdin_read, &stdin_write, &sa, 0)) return false;
+    SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0);
+
+    HANDLE stdout_read, stdout_write;
+    if (!CreatePipe(&stdout_read, &stdout_write, &sa, 0)) { CloseHandle(stdin_read); CloseHandle(stdin_write); return false; }
+    SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.hStdInput = stdin_read;
+    si.hStdOutput = stdout_write;
+    si.hStdError = stdout_write;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+
+    std::string hdc_cmd = build_hdc_cmd("shell");
+    char exe_path[MAX_PATH];
+    GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+    std::string exe_dir(exe_path);
+    auto last_sep = exe_dir.find_last_of("\\/");
+    if (last_sep != std::string::npos) exe_dir = exe_dir.substr(0, last_sep + 1);
+
+    std::string full_cmd = "cmd.exe /C " + hdc_cmd;
+    if (!CreateProcessA(NULL, const_cast<char *>(full_cmd.c_str()),
+                        NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                        NULL, exe_dir.c_str(), &si, &pi)) {
+        LOGE("ensure_persistent_shell: CreateProcess failed (err=%lu)", GetLastError());
+        CloseHandle(stdin_read); CloseHandle(stdin_write);
+        CloseHandle(stdout_read); CloseHandle(stdout_write);
+        return false;
+    }
+
+    CloseHandle(stdin_read);
+    CloseHandle(stdout_write);
+    shell_stdin_ = stdin_write;
+    shell_stdout_ = stdout_read;
+    shell_process_ = pi.hProcess;
+    CloseHandle(pi.hThread);
+    LOGI("Persistent hdc shell started (pid=%lu)", pi.dwProcessId);
+    return true;
+}
+
+void HdcWrapper::close_persistent_shell() {
+    if (shell_process_) {
+        TerminateProcess(shell_process_, 1);
+        WaitForSingleObject(shell_process_, 3000);
+        CloseHandle(shell_process_);
+        shell_process_ = nullptr;
+    }
+    if (shell_stdin_) { CloseHandle(shell_stdin_); shell_stdin_ = nullptr; }
+    if (shell_stdout_) { CloseHandle(shell_stdout_); shell_stdout_ = nullptr; }
+}
+
+bool HdcWrapper::shell_via_persistent(const std::string &cmd, std::string *output, int timeout_sec) {
+    if (!ensure_persistent_shell()) return false;
+
+    std::string full_input = cmd + "\necho __SHELL_DONE__\n";
+    DWORD written = 0;
+    if (!WriteFile(shell_stdin_, full_input.c_str(), static_cast<DWORD>(full_input.size()), &written, NULL)) {
+        close_persistent_shell();
+        return false;
+    }
+
+    std::string result;
+    char buf[4096];
+    DWORD start = GetTickCount();
+    DWORD timeout_ms = static_cast<DWORD>(timeout_sec) * 1000;
+    bool found_marker = false;
+    size_t marker_pos = std::string::npos;
+
+    while (true) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(shell_stdout_, NULL, 0, NULL, &avail, NULL)) {
+            close_persistent_shell();
+            break;
+        }
+        if (avail > 0) {
+            DWORD read = 0;
+            if (!ReadFile(shell_stdout_, buf, (std::min)(sizeof(buf) - 1, static_cast<size_t>(avail)), &read, NULL)) {
+                close_persistent_shell();
+                break;
+            }
+            if (read > 0) {
+                result.append(buf, read);
+                marker_pos = result.find("__SHELL_DONE__");
+                if (marker_pos != std::string::npos) {
+                    found_marker = true;
+                    break;
+                }
+            }
+        } else if (GetTickCount() - start >= timeout_ms) {
+            LOGW("shell_via_persistent timeout (%d sec) for: %s", timeout_sec, cmd.c_str());
+            close_persistent_shell();
+            break;
+        } else {
+            Sleep(1);
+        }
+    }
+
+    if (found_marker) {
+        result.erase(marker_pos);
+        // Trim trailing whitespace/newlines
+        while (!result.empty() && (result.back() == '\r' || result.back() == '\n' || result.back() == ' '))
+            result.pop_back();
+        if (output) *output = std::move(result);
+        return true;
+    }
+
+    if (output) *output = std::move(result);
+    return false;
+}
+#else
+bool HdcWrapper::ensure_persistent_shell() { return false; }
+void HdcWrapper::close_persistent_shell() {}
+bool HdcWrapper::shell_via_persistent(const std::string &cmd, std::string *output, int timeout_sec) {
+    (void)cmd; (void)output; (void)timeout_sec;
+    return false;
+}
+#endif
 
 bool HdcWrapper::get_screen_resolution(uint32_t &width, uint32_t &height) {
     std::string output;
@@ -342,6 +473,7 @@ bool HdcWrapper::cleanup_stale_forwards() {
 }
 
 bool HdcWrapper::shell_command(const std::string &cmd, std::string *output, int timeout_sec) {
+    if (shell_via_persistent(cmd, output, timeout_sec)) return true;
     return run_process(build_hdc_cmd("shell " + cmd), output, timeout_sec * 1000) == 0;
 }
 

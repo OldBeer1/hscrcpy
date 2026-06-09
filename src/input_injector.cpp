@@ -229,12 +229,6 @@ bool InputInjector::send_to_socket(const std::string &json) {
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(socket_mutex_);
-    sock = control_sock_.load();
-    if (sock < 0) {
-        return false;
-    }
-
     int n = ::send(static_cast<socket_t>(sock),
                    json.c_str(), static_cast<int>(json.size()), 0);
     if (n <= 0) {

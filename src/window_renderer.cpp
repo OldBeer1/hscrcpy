@@ -75,7 +75,7 @@ bool WindowRenderer::render(const DecodedImage &img) {
     bih.biBitCount    = 24;
     bih.biCompression = BI_RGB;
 
-    SetStretchBltMode(hdc, HALFTONE);
+    SetStretchBltMode(hdc, COLORONCOLOR);
     StretchDIBits(hdc, 0, 0, cw, ch,
                   0, 0, img.width, img.height,
                   img.data.data(),
