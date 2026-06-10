@@ -31,6 +31,9 @@ public:
     bool inject_touch_down(uint32_t x, uint32_t y);
     bool inject_touch_move(uint32_t x, uint32_t y);
     bool inject_touch_up(uint32_t x, uint32_t y);
+    void queue_touch_down(uint32_t x, uint32_t y);
+    void queue_touch_move(uint32_t x, uint32_t y);
+    void queue_touch_up(uint32_t x, uint32_t y);
     bool inject_mouse_down(const std::string &button, uint32_t x, uint32_t y);
     bool inject_mouse_move(const std::string &button, uint32_t x, uint32_t y);
     bool inject_mouse_up(const std::string &button, uint32_t x, uint32_t y);

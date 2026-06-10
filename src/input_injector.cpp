@@ -205,7 +205,7 @@ bool InputInjector::setup_control_port() {
         inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
         if (::connect(static_cast<socket_t>(sock),
-                      reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0) {
+                       reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0) {
             LOGW("Forward OK but connect to control port %u failed (abstract=%s)",
                  port, use_abstract_control_ ? "true" : "false");
             CLOSE_SOCKET(static_cast<socket_t>(sock));
@@ -213,6 +213,15 @@ bool InputInjector::setup_control_port() {
                                 use_abstract_control_ ? kUitestSocketName : "");
             continue;
         }
+
+        // TCP_NODELAY: disable Nagle for low-latency touch event delivery
+        int nodelay = 1;
+        setsockopt(static_cast<socket_t>(sock), IPPROTO_TCP, TCP_NODELAY,
+                   reinterpret_cast<const char *>(&nodelay), sizeof(nodelay));
+
+        // Non-blocking mode: never block UI thread on send buffer full
+        u_long nonblock = 1;
+        ioctlsocket(static_cast<socket_t>(sock), FIONBIO, &nonblock);
 
         local_control_port_ = port;
         control_sock_.store(sock);
@@ -239,13 +248,23 @@ bool InputInjector::send_to_socket(const std::string &json) {
 
     int n = ::send(static_cast<socket_t>(sock),
                    json.c_str(), static_cast<int>(json.size()), 0);
-    if (n <= 0) {
-        LOGW("send to socket failed (n=%d)", n);
+    if (n > 0) return true;
+
+    if (n == 0) {
+        LOGW("send to socket: connection closed");
         CLOSE_SOCKET(static_cast<socket_t>(sock));
         control_sock_.store(-1);
         return false;
     }
-    return true;
+
+    int err = WSAGetLastError();
+    if (err == WSAEWOULDBLOCK) {
+        return false; // Non-blocking: transient buffer full, drop event
+    }
+    LOGW("send to socket failed (err=%d)", err);
+    CLOSE_SOCKET(static_cast<socket_t>(sock));
+    control_sock_.store(-1);
+    return false;
 }
 
 bool InputInjector::inject_click(uint32_t x, uint32_t y) {
@@ -296,7 +315,9 @@ bool InputInjector::inject_touch_down(uint32_t x, uint32_t y) {
                  "\"params\":{\"api\":\"touchDown\",\"args\":{\"x\":%u,\"y\":%u}}}",
                  x, y);
         if (send_to_socket(json)) return true;
-        LOGW("touch_down socket failed, fallback to shell");
+        // Only fall back if socket is dead (real failure, not transient buffer full)
+        if (control_sock_.load() >= 0) return false;
+        LOGW("touch_down socket dead, fallback to shell");
     }
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "uitest uiInput click %u %u", x, y);
@@ -325,6 +346,45 @@ bool InputInjector::inject_touch_up(uint32_t x, uint32_t y) {
         if (send_to_socket(json)) return true;
     }
     return true;
+}
+
+void InputInjector::queue_touch_down(uint32_t x, uint32_t y) {
+    if (!use_socket_mode_) { inject_touch_down(x, y); return; }
+    char json[512];
+    snprintf(json, sizeof(json),
+             "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
+             "\"params\":{\"api\":\"touchDown\",\"args\":{\"x\":%u,\"y\":%u}}}",
+             x, y);
+    std::string msg(json);
+    std::lock_guard<std::mutex> lock(task_mutex_);
+    task_queue_.push([this, msg]() { send_to_socket(msg); });
+    task_cv_.notify_one();
+}
+
+void InputInjector::queue_touch_move(uint32_t x, uint32_t y) {
+    if (!use_socket_mode_) { inject_touch_move(x, y); return; }
+    char json[512];
+    snprintf(json, sizeof(json),
+             "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
+             "\"params\":{\"api\":\"touchMove\",\"args\":{\"x\":%u,\"y\":%u}}}",
+             x, y);
+    std::string msg(json);
+    std::lock_guard<std::mutex> lock(task_mutex_);
+    task_queue_.push([this, msg]() { send_to_socket(msg); });
+    task_cv_.notify_one();
+}
+
+void InputInjector::queue_touch_up(uint32_t x, uint32_t y) {
+    if (!use_socket_mode_) { inject_touch_up(x, y); return; }
+    char json[512];
+    snprintf(json, sizeof(json),
+             "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
+             "\"params\":{\"api\":\"touchUp\",\"args\":{\"x\":%u,\"y\":%u}}}",
+             x, y);
+    std::string msg(json);
+    std::lock_guard<std::mutex> lock(task_mutex_);
+    task_queue_.push([this, msg]() { send_to_socket(msg); });
+    task_cv_.notify_one();
 }
 
 bool InputInjector::inject_mouse_down(const std::string &button, uint32_t x, uint32_t y) {

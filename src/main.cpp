@@ -691,7 +691,7 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_drag_start_x = x; g_drag_start_y = y;
             g_last_touch_x = x; g_last_touch_y = y;
             g_last_click_time = std::chrono::steady_clock::now();
-            g_input->inject_touch_down(x, y);
+            g_input->queue_touch_down(x, y);
             SetCapture(hwnd);
         }
         return 0;
@@ -705,7 +705,7 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (dx * dx + dy * dy >= 16) {
                 g_last_touch_x = x;
                 g_last_touch_y = y;
-                g_input->inject_touch_move(x, y);
+                g_input->queue_touch_move(x, y);
             }
         }
         return 0;
@@ -721,12 +721,12 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             int dx = static_cast<int>(x) - static_cast<int>(g_drag_start_x);
             int dy = static_cast<int>(y) - static_cast<int>(g_drag_start_y);
             if (dx * dx + dy * dy >= 100) {
-                g_input->inject_touch_up(x, y);
+                g_input->queue_touch_up(x, y);
             } else if (ms > 500) {
-                g_input->inject_touch_up(x, y);
+                g_input->queue_touch_up(x, y);
                 g_input->inject_long_click(x, y);
             } else {
-                g_input->inject_touch_up(x, y);
+                g_input->queue_touch_up(x, y);
             }
         }
         return 0;
