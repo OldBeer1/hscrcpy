@@ -508,12 +508,14 @@ void GrpcClient::streaming_loop() {
         int sel = select(static_cast<int>(sock_) + 1, &readfds, nullptr, nullptr, &tv);
         if (sel < 0) {
             LOGI("select returned %d, wsa=%d, exiting streaming loop", sel, WSAGetLastError());
+            connected_ = false;
             break;
         }
         if (sel == 0) {
             idle_count++;
             if (idle_count >= 1200) {
                 LOGI("No data for 600s, stream dead");
+                connected_ = false;
                 break;
             }
             continue;
@@ -526,6 +528,7 @@ void GrpcClient::streaming_loop() {
         if (n <= 0) {
             int err = WSAGetLastError();
             LOGI("recv returned %d, wsa=%d, buf_used=%zu, exiting streaming loop", n, err, buf_used);
+            connected_ = false;
             break;
         }
         buf_used += n;

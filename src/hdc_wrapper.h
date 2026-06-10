@@ -49,17 +49,6 @@ private:
     int run_process(const std::string &cmd, std::string *output = nullptr, int timeout_ms = 30000);
     std::string build_hdc_cmd(const std::string &subcmd);
 
-    // Persistent hdc shell session
-    bool ensure_persistent_shell();
-    void close_persistent_shell();
-    bool shell_via_persistent(const std::string &cmd, std::string *output, int timeout_sec);
-
-#ifdef _WIN32
-    HANDLE shell_process_ = nullptr;
-    HANDLE shell_stdin_ = nullptr;
-    HANDLE shell_stdout_ = nullptr;
-#endif
-
     std::string serial_;
     std::string ip_;
     std::string port_;

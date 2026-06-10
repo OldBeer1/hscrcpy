@@ -2,8 +2,10 @@
 #include "log.h"
 #include "protocol.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
+#include <algorithm>
 
 #ifdef _WIN32
 using socket_t = SOCKET;
@@ -229,6 +231,12 @@ bool InputInjector::send_to_socket(const std::string &json) {
         return false;
     }
 
+    std::lock_guard<std::mutex> lock(socket_mutex_);
+    sock = control_sock_.load();
+    if (sock < 0) {
+        return false;
+    }
+
     int n = ::send(static_cast<socket_t>(sock),
                    json.c_str(), static_cast<int>(json.size()), 0);
     if (n <= 0) {
@@ -381,53 +389,27 @@ bool InputInjector::inject_swipe(uint32_t from_x, uint32_t from_y, uint32_t to_x
     return hdc_.shell_command(cmd, nullptr, 5);
 }
 
-bool InputInjector::inject_key_via_socket(int key_code, bool shift) {
-    if (!use_socket_mode_) return false;
-    char json[384];
-    if (shift) {
-        snprintf(json, sizeof(json),
-                 "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"KeyEvent\","
-                 "\"params\":{\"api\":\"keyCode\",\"args\":{\"code\":%d,\"shift\":true}}}",
-                 key_code);
-    } else {
-        snprintf(json, sizeof(json),
-                 "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"KeyEvent\","
-                 "\"params\":{\"api\":\"keyCode\",\"args\":{\"code\":%d}}}",
-                 key_code);
-    }
-    if (send_to_socket(json)) return true;
-    LOGW("key_event socket failed (%d), fallback to shell", key_code);
-    return false;
-}
-
 bool InputInjector::inject_back() {
-    if (inject_key_via_socket(2)) return true;
     return hdc_.shell_command("uinput -K -d 2 -u 2", nullptr, 3);
 }
 
 bool InputInjector::inject_home() {
-    if (inject_key_via_socket(1)) return true;
     return hdc_.shell_command("uinput -K -d 1 -u 1", nullptr, 3);
 }
 
 bool InputInjector::inject_recent() {
-    if (inject_key_via_socket(10011)) return true;
     return hdc_.shell_command("uitest uiInput keyEvent 10011", nullptr, 3);
 }
 
 bool InputInjector::inject_power() {
-    if (inject_key_via_socket(18)) return true;
     return hdc_.shell_command("uinput -K -d 18 -u 18", nullptr, 3);
 }
 
 bool InputInjector::inject_key_event(const std::string &key) {
-    int code = std::atoi(key.c_str());
-    if (code > 0 && inject_key_via_socket(code)) return true;
     return hdc_.shell_command("uinput -K -d " + key + " -u " + key, nullptr, 3);
 }
 
 bool InputInjector::inject_key_code(int key_code, bool shift) {
-    if (inject_key_via_socket(key_code, shift)) return true;
     char cmd[256];
     if (shift) {
         snprintf(cmd, sizeof(cmd), "uinput -K -d 2047 -d %d -u %d -u 2047", key_code, key_code);
@@ -445,33 +427,16 @@ bool InputInjector::inject_key_code(int key_code, bool shift) {
 
 bool InputInjector::inject_text(const std::string &text, uint32_t x, uint32_t y) {
     LOGI("inject_text: '%s' at (%u, %u)", text.c_str(), x, y);
-    if (use_socket_mode_) {
-        char json[1024];
-        char escaped[512];
-        size_t j = 0;
-        for (size_t i = 0; i < text.size() && j < sizeof(escaped) - 6; i++) {
-            char c = text[i];
-            if (c == '\\' || c == '"') { escaped[j++] = '\\'; }
-            escaped[j++] = c;
-        }
-        escaped[j] = '\0';
-        snprintf(json, sizeof(json),
-                 "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"InputText\","
-                 "\"params\":{\"api\":\"inputText\",\"args\":{\"x\":%u,\"y\":%u,\"text\":\"%s\"}}}",
-                 x, y, escaped);
-        if (send_to_socket(json)) return true;
-        LOGW("inject_text socket failed, fallback to shell");
-    }
-    std::string escaped2;
+    std::string escaped;
     for (char c : text) {
-        if (c == '\'') escaped2 += "'\\''";
-        else escaped2 += c;
+        if (c == '\'') escaped += "'\\''";
+        else escaped += c;
     }
     char cmd[512];
     if (x > 0 || y > 0) {
-        snprintf(cmd, sizeof(cmd), "uitest uiInput inputText %u %u '%s'", x, y, escaped2.c_str());
+        snprintf(cmd, sizeof(cmd), "uitest uiInput inputText %u %u '%s'", x, y, escaped.c_str());
     } else {
-        snprintf(cmd, sizeof(cmd), "uitest uiInput inputText 0 0 '%s'", escaped2.c_str());
+        snprintf(cmd, sizeof(cmd), "uitest uiInput inputText 0 0 '%s'", escaped.c_str());
     }
     std::lock_guard<std::mutex> lock(task_mutex_);
     task_queue_.push([this, cmd]() {
@@ -486,37 +451,41 @@ bool InputInjector::inject_reboot() {
 }
 
 bool InputInjector::inject_wheel(uint32_t x, uint32_t y, int32_t delta) {
+    int notches = std::abs(delta) / 120;
+    if (notches < 1) notches = 1;
+    int pixels_per_notch = 200;
+    int scroll_amount = notches * pixels_per_notch;
+    if (scroll_amount > 800) scroll_amount = 800;
+
+    int from_y = static_cast<int>(y);
+    int to_y;
+    if (delta > 0) {
+        to_y = from_y + scroll_amount;
+    } else {
+        to_y = from_y - scroll_amount;
+    }
+    if (to_y < 0) to_y = 0;
+
+    int steps = (std::max)(8, scroll_amount / 30);
+
     if (use_socket_mode_) {
         std::lock_guard<std::mutex> lock(task_mutex_);
-        task_queue_.push([this, x, y, delta]() {
-            int distance = 150;
-            uint32_t from_y, to_y;
-            if (delta > 0) {
-                from_y = y + distance;
-                to_y = y - distance;
-            } else {
-                from_y = y - distance;
-                to_y = y + distance;
-            }
-            inject_touch_down(x, from_y);
-            int steps = 5;
+        task_queue_.push([this, x, from_y, to_y, steps]() {
+            inject_touch_down(x, static_cast<uint32_t>(from_y));
             for (int i = 1; i <= steps; i++) {
-                uint32_t cy = from_y + (to_y - from_y) * i / steps;
+                uint32_t cy = static_cast<uint32_t>(
+                    from_y + (to_y - from_y) * i / steps);
                 inject_touch_move(x, cy);
-                Sleep(8);
+                Sleep(10);
             }
-            inject_touch_up(x, to_y);
+            inject_touch_up(x, static_cast<uint32_t>(to_y));
         });
         task_cv_.notify_one();
         return true;
     }
-    uint32_t distance = 200;
-    uint32_t velocity = 600;
-    if (delta > 0) {
-        return inject_swipe(x, y + distance, x, y - distance, velocity);
-    } else {
-        return inject_swipe(x, y - distance, x, y + distance, velocity);
-    }
+    int velocity = 800;
+    return inject_swipe(x, static_cast<uint32_t>(from_y),
+                        x, static_cast<uint32_t>(to_y), velocity);
 }
 
 void InputInjector::reconnect_loop() {

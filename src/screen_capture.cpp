@@ -221,11 +221,11 @@ std::string ScreenCapture::build_extension_cmd() const {
 bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
     hdc_.ensure_connected();
 
-    for (int precheck = 0; precheck < 10; precheck++) {
+    for (int precheck = 0; precheck < 3; precheck++) {
         std::string check;
         hdc_.shell_command("echo ok", &check, 3);
         if (check.find("ok") != std::string::npos) break;
-        LOGW("hdc not ready (attempt %d/10): '%s'", precheck + 1, check.c_str());
+        LOGW("hdc not ready (attempt %d/3): '%s'", precheck + 1, check.c_str());
         Sleep(2000);
     }
 

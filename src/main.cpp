@@ -1,22 +1,23 @@
-#include "cli.h"
-#include "hdc_wrapper.h"
-#include "screen_capture.h"
-#include "input_injector.h"
-#include "h264_decoder.h"
-#include <cmath>
-#include <objidl.h>
-#include <gdiplus.h>
-#pragma comment(lib, "gdiplus.lib")
-#include <chrono>
-#include "log.h"
-#include "version.h"
-#include <cstdio>
-#include <memory>
-#include <algorithm>
-
+#include <winsock2.h>
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
+#include <objidl.h>
+#include <gdiplus.h>
+#pragma comment(lib, "gdiplus.lib")
+
+#include "cli.h"
+#include "screen_capture.h"
+#include "hdc_wrapper.h"
+#include "input_injector.h"
+#include "h264_decoder.h"
+#include "log.h"
+#include "version.h"
+#include <cmath>
+#include <chrono>
+#include <cstdio>
+#include <memory>
+#include <algorithm>
 
 using namespace hscrcpy;
 
@@ -150,7 +151,7 @@ static HICON load_png_icon(const char *relative_path, int size) {
 static HHOOK g_msgbox_hook = NULL;
 
 static LRESULT CALLBACK MsgBoxCBTProc(int nCode, WPARAM wp, LPARAM lp) {
-    if (nCode == HCBT_CREATEWND) {
+    if (nCode == HCBT_ACTIVATE) {
         HWND hMsg = (HWND)wp;
         if (g_hwnd) {
             RECT pr, mr;
@@ -158,7 +159,7 @@ static LRESULT CALLBACK MsgBoxCBTProc(int nCode, WPARAM wp, LPARAM lp) {
             GetWindowRect(hMsg, &mr);
             int x = pr.left + (pr.right - pr.left - (mr.right - mr.left)) / 2;
             int y = pr.top + (pr.bottom - pr.top - (mr.bottom - mr.top)) / 2;
-            SetWindowPos(hMsg, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            SetWindowPos(hMsg, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
         }
         UnhookWindowsHookEx(g_msgbox_hook);
         g_msgbox_hook = NULL;
@@ -168,7 +169,12 @@ static LRESULT CALLBACK MsgBoxCBTProc(int nCode, WPARAM wp, LPARAM lp) {
 
 static int center_msgbox(const char *text, const char *title, UINT type) {
     g_msgbox_hook = SetWindowsHookExA(WH_CBT, MsgBoxCBTProc, NULL, GetCurrentThreadId());
-    return MessageBoxA(g_hwnd, text, title, type);
+    int ret = MessageBoxA(g_hwnd, text, title, type);
+    if (g_msgbox_hook) {
+        UnhookWindowsHookEx(g_msgbox_hook);
+        g_msgbox_hook = NULL;
+    }
+    return ret;
 }
 
 static void show_error(const char *msg) {
@@ -746,6 +752,7 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 static uint64_t g_last_drawn_frame = 0;
 static uint64_t g_fps_counter = 0;
 static DWORD g_fps_start_tick = 0;
+static DWORD g_last_frame_tick = 0;
 
 // Track background threads to avoid detach
 static std::thread g_cleanup_thread;
@@ -758,9 +765,22 @@ static void join_startup_thread() {
     if (g_startup_thread.joinable()) g_startup_thread.join();
 }
 
+static void stop_mirroring();
+
 static void try_update_frame() {
     if (!g_capture) return;
+
     auto fc = g_capture->frame_count();
+    if (g_mirroring && fc != g_last_rendered_seq) {
+        g_last_frame_tick = GetTickCount();
+    }
+    if (g_mirroring && g_last_frame_tick > 0 && GetTickCount() - g_last_frame_tick > 5000) {
+        LOGW("No frame for 5s, device disconnected");
+        set_status("HDC disconnected");
+        stop_mirroring();
+        return;
+    }
+
     if (fc != g_last_rendered_seq) {
         std::shared_ptr<DecodedImage> img;
         if (g_capture->get_latest_frame(img) && img && !img->data.empty()) {
@@ -861,6 +881,26 @@ static void start_mirroring(const std::string &serial, const std::string &ip = "
 
     join_startup_thread();
     g_startup_thread = std::thread([serial, ip, port]() {
+        // Quick connectivity check: verify device is actually in hdc device list
+        {
+            std::vector<HdcDevice> devs = g_hdc->list_devices();
+            bool found = false;
+            for (const auto &d : devs) {
+                if (d.serial == serial) { found = true; break; }
+            }
+            if (!found) {
+                LOGE("Device %s not in hdc device list", serial.c_str());
+                PostMessageA(g_hwnd, WM_USER + 1, 0, 0);
+                return;
+            }
+        }
+        // Secondary: quick echo to verify shell access
+        if (!g_hdc->shell_command("echo ok", nullptr, 3)) {
+            LOGE("Device %s not reachable", serial.c_str());
+            PostMessageA(g_hwnd, WM_USER + 1, 0, 0);
+            return;
+        }
+
         if (!g_config_initialized) {
             auto_select_config();
             g_config_initialized = true;
@@ -1123,6 +1163,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_screen_w = g_capture->width();
         g_screen_h = g_capture->height();
 
+        g_last_frame_tick = GetTickCount();
         g_input = new InputInjector(*g_hdc, g_capture->local_base_port());
         join_startup_thread();
         g_startup_thread = std::thread([]() {

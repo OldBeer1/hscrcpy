@@ -43,6 +43,7 @@ public:
     uint32_t width()  const { return width_; }
     uint32_t height() const { return height_; }
     bool running() const { return running_; }
+    bool grpc_connected() const { return running_ && grpc_client_.is_connected(); }
     CaptureMode mode() const { return mode_; }
     uint64_t frame_count() const { return frame_count_; }
     const std::string &uitest_version() const { return uitest_version_; }

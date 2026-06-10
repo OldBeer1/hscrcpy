@@ -49,7 +49,6 @@ private:
     bool send_json_command(const std::string &json);
     bool send_to_socket(const std::string &json);
     bool setup_control_port();
-    bool inject_key_via_socket(int key_code, bool shift = false);
     bool push_agent_so();
     bool ensure_uitest_agent();
     void reconnect_loop();

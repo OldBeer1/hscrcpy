@@ -3,6 +3,7 @@
 #include <cstring>
 #include <cstdio>
 #include <thread>
+#include <algorithm>
 
 #ifdef _WIN32
 #include <windows.h>
