@@ -492,6 +492,7 @@ void GrpcClient::streaming_loop() {
     int idle_count = 0;
     uint32_t bytes_received_on_stream = 0;
     uint32_t window_update_threshold = 262144;
+    int consecutive_rst_on_idr = 0;
 
     std::vector<uint8_t> grpc_msg_buf;
     grpc_msg_buf.reserve(512 * 1024);
@@ -513,8 +514,8 @@ void GrpcClient::streaming_loop() {
         }
         if (sel == 0) {
             idle_count++;
-            if (idle_count >= 1200) {
-                LOGI("No data for 600s, stream dead");
+            if (idle_count >= 60) {
+                LOGI("No data for 30s, stream dead");
                 connected_ = false;
                 break;
             }
@@ -564,8 +565,11 @@ void GrpcClient::streaming_loop() {
                         }
                     }
                     grpc_consumed = 0;
-                    if (grpc_buf_size + frame_len > grpc_msg_buf.size()) {
-                        grpc_msg_buf.resize(grpc_buf_size + frame_len);
+                    size_t needed_size = grpc_buf_size + frame_len;
+                    if (needed_size > grpc_msg_buf.size()) {
+                        grpc_msg_buf.resize(needed_size);
+                    } else if (grpc_msg_buf.size() > 512 * 1024 && needed_size < grpc_msg_buf.size() / 2) {
+                        grpc_msg_buf.resize(needed_size);
                     }
                     memcpy(grpc_msg_buf.data() + grpc_buf_size, payload, frame_len);
                     grpc_buf_size += frame_len;
@@ -591,6 +595,7 @@ void GrpcClient::streaming_loop() {
                             if (!h264_scratch_.empty() && on_frame_) {
                                 on_frame_(h264_scratch_);
                                 got_first_data = true;
+                                consecutive_rst_on_idr = 0;
                             }
                         }
 
@@ -633,6 +638,18 @@ void GrpcClient::streaming_loop() {
                 LOGW("Received RST_STREAM on stream %u", stream_id);
                 if (stream_id == 1) {
                     streaming_ = false;
+                } else if (stream_id > 1 && (stream_id & 1)) {
+                    consecutive_rst_on_idr++;
+                    if (consecutive_rst_on_idr <= 2) {
+                        LOGI("RST_STREAM on client stream %u, retrying IDR (%d/2)", stream_id, consecutive_rst_on_idr);
+                        idr_requested_ = false;
+                        if (streaming_ && connected_) {
+                            request_idr_frame();
+                        }
+                    } else {
+                        LOGW("RST_STREAM on client stream %u, %d consecutive failures, stopping IDR retries",
+                             stream_id, consecutive_rst_on_idr);
+                    }
                 }
             } else if (frame_type == 0x08) {
             }

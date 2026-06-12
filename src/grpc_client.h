@@ -30,6 +30,7 @@ public:
     bool connect(const std::string &host, uint16_t port);
     void disconnect();
     bool is_connected() const { return connected_; }
+    bool is_streaming_active() const { return streaming_; }
 
     bool start_streaming(const std::function<void(const std::vector<uint8_t> &)> &on_h264_frame);
     void stop_streaming();

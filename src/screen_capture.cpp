@@ -647,6 +647,8 @@ void ScreenCapture::stop() {
         local_control_port_ = 0;
     }
 
+    hdc_.cleanup_stale_forwards();
+
     kill_uitest_extension();
 }
 
@@ -673,6 +675,53 @@ void ScreenCapture::kill_uitest_extension() {
     Sleep(300);
 }
 
+bool ScreenCapture::reconnect_grpc_stream() {
+    LOGI("Attempting gRPC reconnection...");
+
+    grpc_client_.disconnect();
+    Sleep(500);
+
+    if (local_video_port_ > 0) {
+        hdc_.forward_remove(local_video_port_, use_abstract_socket_,
+                            use_abstract_socket_ ? kGrpcSocketName : "");
+        local_video_port_ = 0;
+    }
+    if (local_control_port_ > 0) {
+        hdc_.forward_remove(local_control_port_, use_abstract_socket_,
+                            use_abstract_socket_ ? kUitestSocketName : "");
+        local_control_port_ = 0;
+    }
+
+    hdc_.cleanup_stale_forwards();
+    Sleep(300);
+
+    hdc_.shell_command(build_extension_cmd(), nullptr, 5);
+    Sleep(500);
+
+    if (!setup_port_forward()) {
+        LOGE("Reconnect: failed to setup port forward");
+        return false;
+    }
+
+    bool connected = false;
+    for (int retry = 0; retry < 3; retry++) {
+        LOGI("Reconnect gRPC attempt %d to 127.0.0.1:%u", retry + 1, local_video_port_);
+        if (grpc_client_.connect("127.0.0.1", local_video_port_)) {
+            connected = true;
+            break;
+        }
+        Sleep(500);
+    }
+
+    if (!connected) {
+        LOGE("Reconnect: failed to connect gRPC server");
+        return false;
+    }
+
+    LOGI("gRPC reconnected successfully");
+    return true;
+}
+
 void ScreenCapture::grpc_stream_loop() {
     LOGI("gRPC stream loop started");
 
@@ -696,11 +745,66 @@ void ScreenCapture::grpc_stream_loop() {
 
     LOGI("gRPC streaming started (IDR already requested)");
 
-    while (running_ && grpc_client_.is_connected()) {
-        Sleep(100);
+    int reconnect_attempts = 0;
+    uint64_t last_frame_count = frame_count_.load();
+
+    while (running_) {
+        while (running_ && grpc_client_.is_connected() && grpc_client_.is_streaming_active()) {
+            Sleep(100);
+        }
+
+        if (!running_) break;
+
+        reconnecting_ = true;
+
+        if (!grpc_client_.is_connected() || !grpc_client_.is_streaming_active()) {
+            LOGW("gRPC stream disconnected (connected=%d, streaming=%d), attempting reconnect (%d/%d)",
+                 grpc_client_.is_connected(), grpc_client_.is_streaming_active(),
+                 reconnect_attempts + 1, kMaxGrpcReconnectAttempts);
+        }
+
+        grpc_client_.stop_streaming();
+
+        if (reconnect_attempts >= kMaxGrpcReconnectAttempts) {
+            LOGE("Max reconnect attempts reached, giving up");
+            break;
+        }
+
+        reconnect_attempts++;
+
+        if (!reconnect_grpc_stream()) {
+            LOGE("Reconnect failed (attempt %d/%d)", reconnect_attempts, kMaxGrpcReconnectAttempts);
+            if (reconnect_attempts >= kMaxGrpcReconnectAttempts) break;
+            Sleep(1000);
+            continue;
+        }
+
+        if (!grpc_client_.start_streaming(on_frame)) {
+            LOGE("Failed to restart streaming after reconnect");
+            Sleep(1000);
+            continue;
+        }
+
+        LOGI("gRPC streaming restarted after reconnect (attempt %d)", reconnect_attempts);
+
+        uint64_t frames_before = frame_count_.load();
+        grpc_client_.request_idr_frame();
+
+        for (int i = 0; i < 30 && running_ && frame_count_.load() == frames_before; i++) {
+            Sleep(100);
+        }
+
+        if (frame_count_.load() > frames_before) {
+            LOGI("Reconnect successful, frames flowing again");
+            reconnect_attempts = 0;
+            reconnecting_ = false;
+        } else {
+            LOGW("Reconnect: no frames after 3s, will retry");
+        }
     }
 
     grpc_client_.stop_streaming();
+    reconnecting_ = false;
     h264_queue_cv_.notify_all();
     LOGI("gRPC stream loop ended, frames: %llu", (unsigned long long)frame_count_.load());
 }

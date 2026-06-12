@@ -44,6 +44,7 @@ public:
     uint32_t height() const { return height_; }
     bool running() const { return running_; }
     bool grpc_connected() const { return running_ && grpc_client_.is_connected(); }
+    bool is_reconnecting() const { return reconnecting_; }
     CaptureMode mode() const { return mode_; }
     uint64_t frame_count() const { return frame_count_; }
     const std::string &uitest_version() const { return uitest_version_; }
@@ -56,6 +57,7 @@ private:
     bool setup_snapshot_fallback();
     bool start_uitest_with_extension(bool force_restart = false);
     bool setup_port_forward();
+    bool reconnect_grpc_stream();
     std::string get_local_so_md5(const std::string &filepath);
     std::string find_matching_so_with_md5(const std::string &device_md5);
     std::string find_matching_agent_so();
@@ -96,6 +98,8 @@ private:
     uint16_t uitest_port_ = 5000;
     std::string uitest_version_;
     std::string server_dir_;
+    static constexpr int kMaxGrpcReconnectAttempts = 3;
+    std::atomic<bool> reconnecting_{false};
 };
 
 } // namespace hscrcpy

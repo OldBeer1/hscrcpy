@@ -235,13 +235,8 @@ bool InputInjector::setup_control_port() {
 }
 
 bool InputInjector::send_to_socket(const std::string &json) {
-    int sock = control_sock_.load();
-    if (sock < 0) {
-        return false;
-    }
-
     std::lock_guard<std::mutex> lock(socket_mutex_);
-    sock = control_sock_.load();
+    int sock = control_sock_.load();
     if (sock < 0) {
         return false;
     }

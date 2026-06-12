@@ -774,11 +774,16 @@ static void try_update_frame() {
     if (g_mirroring && fc != g_last_rendered_seq) {
         g_last_frame_tick = GetTickCount();
     }
-    if (g_mirroring && g_last_frame_tick > 0 && GetTickCount() - g_last_frame_tick > 5000) {
-        LOGW("No frame for 5s, device disconnected");
-        set_status("HDC disconnected");
-        stop_mirroring();
-        return;
+    if (g_mirroring && g_capture && !g_capture->grpc_connected() && g_last_frame_tick > 0 && GetTickCount() - g_last_frame_tick > 10000) {
+        if (g_capture->is_reconnecting()) {
+            g_last_frame_tick = GetTickCount();
+            set_status("Reconnecting...");
+        } else {
+            LOGW("gRPC disconnected and no frame for 10s");
+            set_status("Stream disconnected");
+            stop_mirroring();
+            return;
+        }
     }
 
     if (fc != g_last_rendered_seq) {
@@ -911,6 +916,26 @@ static void start_mirroring(const std::string &serial, const std::string &ip = "
         if (g_cli_args.scale > 0) {
             g_capture_config.scale = g_cli_args.scale;
             LOGI("CLI override: scale=%d", g_cli_args.scale);
+        }
+        if (g_cli_args.bitrate > 0) {
+            g_capture_config.bit_rate = g_cli_args.bitrate;
+            LOGI("CLI override: bitrate=%d", g_cli_args.bitrate);
+        }
+        if (g_cli_args.fps != kDefaultFps) {
+            g_capture_config.frame_rate = g_cli_args.fps;
+            LOGI("CLI override: fps=%u", g_cli_args.fps);
+        }
+
+        bool is_tcp_device = serial.find(':') != std::string::npos;
+        if (is_tcp_device) {
+            if (g_cli_args.bitrate == 0 && g_capture_config.bit_rate > 2000000) {
+                LOGI("TCP device: lowering bitrate %d -> 2000000", g_capture_config.bit_rate);
+                g_capture_config.bit_rate = 2000000;
+            }
+            if (g_cli_args.fps == kDefaultFps && g_capture_config.frame_rate > 15) {
+                LOGI("TCP device: lowering fps %u -> 15", g_capture_config.frame_rate);
+                g_capture_config.frame_rate = 15;
+            }
         }
         if (g_cli_args.bitrate > 0) {
             g_capture_config.bit_rate = g_cli_args.bitrate;
@@ -1274,9 +1299,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             std::string port = g_hdc->port();
             EnableWindow(g_btn_start_hwnd, FALSE);
             stop_mirroring();
-            g_pending_start_serial = serial;
-            g_pending_start_ip = ip;
-            g_pending_start_port = port;
+            if (!g_cleanup_serial.empty() && serial == g_cleanup_serial) {
+                g_pending_start_serial = serial;
+                g_pending_start_ip = ip;
+                g_pending_start_port = port;
+            }
         }
         break;
     }
