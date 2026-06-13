@@ -469,6 +469,8 @@ static std::pair<uint32_t, uint32_t> canvas_to_screen(int wx, int wy) {
         draw_w = cw;
         draw_h = (int)(cw / aspect);
     }
+    if (abs(cw - draw_w) <= 1) { draw_w = cw; draw_h = ch; }
+    if (abs(ch - draw_h) <= 1) { draw_w = cw; draw_h = ch; }
     int off_x = (cw - draw_w) / 2;
     int off_y = (ch - draw_h) / 2;
 
@@ -651,6 +653,8 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                         draw_w = cw;
                         draw_h = (int)(cw / aspect);
                     }
+                    if (abs(cw - draw_w) <= 1) { draw_w = cw; draw_h = ch; }
+                    if (abs(ch - draw_h) <= 1) { draw_w = cw; draw_h = ch; }
                     off_x = (cw - draw_w) / 2;
                     off_y = (ch - draw_h) / 2;
 
@@ -1037,7 +1041,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         g_status_hwnd = CreateWindowA("STATIC", "",
                                        WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                       402, 38, 400, 18, hwnd, NULL, g_hInst, NULL);
+                                       405, 9, 30, 16, hwnd, NULL, g_hInst, NULL);
 
         g_canvas_hwnd = CreateWindowA(CANVAS_CLASS, "",
                                        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_TABSTOP,
@@ -1113,6 +1117,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RECT rc;
         GetClientRect(hwnd, &rc);
         MoveWindow(g_canvas_hwnd, 0, TOOLBAR_H, rc.right, rc.bottom - TOOLBAR_H, FALSE);
+        if (g_status_hwnd && rc.right > 410) {
+            MoveWindow(g_status_hwnd, 405, 9, rc.right - 410, 16, TRUE);
+        }
         destroy_backbuffer();
         InvalidateRect(g_canvas_hwnd, NULL, FALSE);
         break;
