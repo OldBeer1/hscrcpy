@@ -62,7 +62,6 @@ static uint32_t g_drag_start_x = 0, g_drag_start_y = 0;
 static auto g_last_click_time = std::chrono::steady_clock::now();
 
 static CaptureConfig g_capture_config;
-static bool g_config_initialized = false;
 static uint32_t g_device_screen_w = 0, g_device_screen_h = 0;
 
 #define ID_COMBO       1001
@@ -79,7 +78,6 @@ static uint32_t g_device_screen_w = 0, g_device_screen_h = 0;
 
 static ULONG_PTR g_gdiplus_token = 0;
 
-// Persistent backbuffer for GDI rendering
 static HDC g_backbuffer_dc = nullptr;
 static HBITMAP g_backbuffer_bmp = nullptr;
 static HBITMAP g_backbuffer_old = nullptr;
@@ -99,13 +97,11 @@ static void destroy_backbuffer() {
     g_backbuffer_h = 0;
 }
 
-static bool ensure_backbuffer(int w, int h) {
+static bool ensure_backbuffer(HDC ref_dc, int w, int h) {
     if (g_backbuffer_dc && g_backbuffer_w >= w && g_backbuffer_h >= h) return true;
     destroy_backbuffer();
-    HDC screen_dc = GetDC(nullptr);
-    g_backbuffer_dc = CreateCompatibleDC(screen_dc);
-    g_backbuffer_bmp = CreateCompatibleBitmap(screen_dc, w, h);
-    ReleaseDC(nullptr, screen_dc);
+    g_backbuffer_dc = CreateCompatibleDC(ref_dc);
+    g_backbuffer_bmp = CreateCompatibleBitmap(ref_dc, w, h);
     if (!g_backbuffer_dc || !g_backbuffer_bmp) {
         destroy_backbuffer();
         return false;
@@ -228,13 +224,13 @@ static void auto_select_config() {
     }
 
     if (is_tcp) {
-        g_capture_config.bit_rate = 4194304;
-        g_capture_config.frame_rate = 24;
-        LOGI("Auto TCP: %ux%u -> scale=%d, 4M, 24fps", eff_w, g_device_screen_h, g_capture_config.scale);
-    } else {
         g_capture_config.bit_rate = 8388608;
+        g_capture_config.frame_rate = 24;
+        LOGI("Auto TCP: %ux%u -> scale=%d, 8M, 24fps", eff_w, g_device_screen_h, g_capture_config.scale);
+    } else {
+        g_capture_config.bit_rate = 20971520;
         g_capture_config.frame_rate = 30;
-        LOGI("Auto USB: %ux%u -> scale=%d, 8M, 30fps", eff_w, g_device_screen_h, g_capture_config.scale);
+        LOGI("Auto USB: %ux%u -> scale=%d, 20M, 30fps", eff_w, g_device_screen_h, g_capture_config.scale);
     }
 }
 
@@ -469,8 +465,8 @@ static std::pair<uint32_t, uint32_t> canvas_to_screen(int wx, int wy) {
         draw_w = cw;
         draw_h = (int)(cw / aspect);
     }
-    if (abs(cw - draw_w) <= 1) { draw_w = cw; draw_h = ch; }
-    if (abs(ch - draw_h) <= 1) { draw_w = cw; draw_h = ch; }
+    if (draw_w == cw - 1) draw_w = cw;
+    if (draw_h == ch - 1) draw_h = ch;
     int off_x = (cw - draw_w) / 2;
     int off_y = (ch - draw_h) / 2;
 
@@ -636,7 +632,7 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         GetClientRect(hwnd, &rc);
         int cw = rc.right, ch = rc.bottom;
 
-        if (ensure_backbuffer(cw, ch)) {
+        if (ensure_backbuffer(hdc, cw, ch)) {
             HBRUSH bg = CreateSolidBrush(RGB(30, 30, 30));
             FillRect(g_backbuffer_dc, &rc, bg);
             DeleteObject(bg);
@@ -653,14 +649,14 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                         draw_w = cw;
                         draw_h = (int)(cw / aspect);
                     }
-                    if (abs(cw - draw_w) <= 1) { draw_w = cw; draw_h = ch; }
-                    if (abs(ch - draw_h) <= 1) { draw_w = cw; draw_h = ch; }
+                    if (draw_w == cw - 1) draw_w = cw;
+                    if (draw_h == ch - 1) draw_h = ch;
                     off_x = (cw - draw_w) / 2;
                     off_y = (ch - draw_h) / 2;
 
                     BITMAPINFOHEADER bih = {};
                     bih.biSize     = sizeof(bih);
-                    bih.biWidth    = static_cast<LONG>(g_cur_frame->width);
+                    bih.biWidth    = static_cast<LONG>(g_cur_frame->stride / 3);
                     bih.biHeight   = -static_cast<LONG>(g_cur_frame->height);
                     bih.biPlanes   = 1;
                     bih.biBitCount = 24;
@@ -756,7 +752,6 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 static uint64_t g_last_drawn_frame = 0;
 static uint64_t g_fps_counter = 0;
 static DWORD g_fps_start_tick = 0;
-static DWORD g_last_frame_tick = 0;
 
 // Track background threads to avoid detach
 static std::thread g_cleanup_thread;
@@ -775,20 +770,6 @@ static void try_update_frame() {
     if (!g_capture) return;
 
     auto fc = g_capture->frame_count();
-    if (g_mirroring && fc != g_last_rendered_seq) {
-        g_last_frame_tick = GetTickCount();
-    }
-    if (g_mirroring && g_capture && !g_capture->grpc_connected() && g_last_frame_tick > 0 && GetTickCount() - g_last_frame_tick > 10000) {
-        if (g_capture->is_reconnecting()) {
-            g_last_frame_tick = GetTickCount();
-            set_status("Reconnecting...");
-        } else {
-            LOGW("gRPC disconnected and no frame for 10s");
-            set_status("Stream disconnected");
-            stop_mirroring();
-            return;
-        }
-    }
 
     if (fc != g_last_rendered_seq) {
         std::shared_ptr<DecodedImage> img;
@@ -910,36 +891,11 @@ static void start_mirroring(const std::string &serial, const std::string &ip = "
             return;
         }
 
-        if (!g_config_initialized) {
-            auto_select_config();
-            g_config_initialized = true;
-        } else {
-            query_device_resolution();
-        }
+        auto_select_config();
 
         if (g_cli_args.scale > 0) {
             g_capture_config.scale = g_cli_args.scale;
             LOGI("CLI override: scale=%d", g_cli_args.scale);
-        }
-        if (g_cli_args.bitrate > 0) {
-            g_capture_config.bit_rate = g_cli_args.bitrate;
-            LOGI("CLI override: bitrate=%d", g_cli_args.bitrate);
-        }
-        if (g_cli_args.fps != kDefaultFps) {
-            g_capture_config.frame_rate = g_cli_args.fps;
-            LOGI("CLI override: fps=%u", g_cli_args.fps);
-        }
-
-        bool is_tcp_device = serial.find(':') != std::string::npos;
-        if (is_tcp_device) {
-            if (g_cli_args.bitrate == 0 && g_capture_config.bit_rate > 2000000) {
-                LOGI("TCP device: lowering bitrate %d -> 2000000", g_capture_config.bit_rate);
-                g_capture_config.bit_rate = 2000000;
-            }
-            if (g_cli_args.fps == kDefaultFps && g_capture_config.frame_rate > 15) {
-                LOGI("TCP device: lowering fps %u -> 15", g_capture_config.frame_rate);
-                g_capture_config.frame_rate = 15;
-            }
         }
         if (g_cli_args.bitrate > 0) {
             g_capture_config.bit_rate = g_cli_args.bitrate;
@@ -1041,7 +997,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         g_status_hwnd = CreateWindowA("STATIC", "",
                                        WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                       405, 9, 30, 16, hwnd, NULL, g_hInst, NULL);
+                                       402, 38, 400, 18, hwnd, NULL, g_hInst, NULL);
 
         g_canvas_hwnd = CreateWindowA(CANVAS_CLASS, "",
                                        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_TABSTOP,
@@ -1062,7 +1018,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (g_mirroring) {
                         auto dev = get_selected_device();
                         if (!dev.serial.empty() && dev.serial != g_hdc->serial()) {
-                            g_config_initialized = false;
                             start_mirroring(dev.serial, dev.ip, dev.port);
                         }
                     } else {
@@ -1117,9 +1072,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RECT rc;
         GetClientRect(hwnd, &rc);
         MoveWindow(g_canvas_hwnd, 0, TOOLBAR_H, rc.right, rc.bottom - TOOLBAR_H, FALSE);
-        if (g_status_hwnd && rc.right > 410) {
-            MoveWindow(g_status_hwnd, 405, 9, rc.right - 410, 16, TRUE);
-        }
         destroy_backbuffer();
         InvalidateRect(g_canvas_hwnd, NULL, FALSE);
         break;
@@ -1195,7 +1147,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_screen_w = g_capture->width();
         g_screen_h = g_capture->height();
 
-        g_last_frame_tick = GetTickCount();
         g_input = new InputInjector(*g_hdc, g_capture->local_base_port());
         join_startup_thread();
         g_startup_thread = std::thread([]() {

@@ -366,7 +366,7 @@ int HdcWrapper::forward_count() {
     return count;
 }
 
-bool HdcWrapper::cleanup_stale_forwards() {
+bool HdcWrapper::cleanup_stale_forwards(const std::vector<uint16_t> &our_ports) {
     std::string output;
     run_process(build_hdc_cmd("fport ls"), &output, 10000);
     std::istringstream iss(output);
@@ -379,11 +379,23 @@ bool HdcWrapper::cleanup_stale_forwards() {
         while (!entry.empty() && (entry.back() == '\r' || entry.back() == '\n' || entry.back() == ' '))
             entry.pop_back();
 
-        bool is_our_forward = entry.find("scrcpy_grpc_socket") != std::string::npos ||
-                              entry.find("tcp:5000") != std::string::npos ||
-                              entry.find("uitest_socket") != std::string::npos ||
-                              entry.find("tcp:8012") != std::string::npos;
-        if (!is_our_forward) continue;
+        bool should_remove = false;
+        if (!our_ports.empty()) {
+            for (uint16_t p : our_ports) {
+                char port_prefix[32];
+                snprintf(port_prefix, sizeof(port_prefix), "tcp:%u ", p);
+                if (entry.find(port_prefix) == 0) {
+                    should_remove = true;
+                    break;
+                }
+            }
+        } else {
+            should_remove = entry.find("scrcpy_grpc_socket") != std::string::npos ||
+                            entry.find("tcp:5000") != std::string::npos ||
+                            entry.find("uitest_socket") != std::string::npos ||
+                            entry.find("tcp:8012") != std::string::npos;
+        }
+        if (!should_remove) continue;
 
         std::string rm_cmd = "fport rm " + entry;
         if (run_process(build_hdc_cmd(rm_cmd), nullptr, 5000) == 0) {

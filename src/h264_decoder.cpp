@@ -153,9 +153,12 @@ bool H264Decoder::decode(const uint8_t *h264_data, size_t h264_size) {
                 break;
             }
 
-            int w = codec_ctx_->width;
-            int h = codec_ctx_->height;
+            int w = codec_ctx_->coded_width;
+            int h = codec_ctx_->coded_height;
             int fmt = codec_ctx_->pix_fmt;
+            int display_w = frame_->width;
+            int display_h = frame_->height;
+            LOGI("Decoder: coded=%dx%d display=%dx%d fmt=%d", w, h, display_w, display_h, fmt);
 
             if (w <= 0 || h <= 0) continue;
 
@@ -202,8 +205,8 @@ bool H264Decoder::decode(const uint8_t *h264_data, size_t h264_size) {
                       frame_->data, frame_->linesize, 0, h,
                       frame_rgb_->data, frame_rgb_->linesize);
 
-            image_.width = static_cast<uint32_t>(w);
-            image_.height = static_cast<uint32_t>(h);
+            image_.width = static_cast<uint32_t>(display_w);
+            image_.height = static_cast<uint32_t>(display_h);
             image_.stride = frame_rgb_->linesize[0];
             decode_buffer_.resize(rgb_buf_size_);
             memcpy(decode_buffer_.data(), frame_rgb_->data[0], rgb_buf_size_);

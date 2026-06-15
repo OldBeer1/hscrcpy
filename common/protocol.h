@@ -8,6 +8,7 @@ namespace hscrcpy {
 constexpr uint16_t kDefaultVideoPort  = 5000;
 constexpr uint16_t kDefaultControlPort = 8012;
 constexpr uint16_t kDefaultLocalBasePort = 9900;
+constexpr uint16_t kLocalPortRange = 500;
 
 constexpr uint32_t kDefaultWidth   = 1260;
 constexpr uint32_t kDefaultHeight  = 2720;

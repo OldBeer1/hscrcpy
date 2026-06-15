@@ -445,7 +445,7 @@ static bool is_local_port_free(uint16_t port) {
 bool ScreenCapture::setup_port_forward() {
     hdc_.cleanup_stale_forwards();
 
-    for (uint16_t base = kDefaultLocalBasePort; base < kDefaultLocalBasePort + 100; base += 2) {
+    for (uint16_t base = kDefaultLocalBasePort; base < kDefaultLocalBasePort + kLocalPortRange; base += 2) {
         if (!is_local_port_free(base) || !is_local_port_free(base + 1)) continue;
 
         local_video_port_ = base;
@@ -571,6 +571,16 @@ bool ScreenCapture::start() {
     if (!grpc_ok) {
         LOGW("gRPC stream failed, falling back to snapshot_display mode");
         grpc_client_.disconnect();
+        if (local_video_port_ > 0) {
+            hdc_.forward_remove(local_video_port_, use_abstract_socket_,
+                                use_abstract_socket_ ? kGrpcSocketName : "");
+            local_video_port_ = 0;
+        }
+        if (local_control_port_ > 0) {
+            hdc_.forward_remove(local_control_port_, use_abstract_socket_,
+                                use_abstract_socket_ ? kUitestSocketName : "");
+            local_control_port_ = 0;
+        }
         if (!setup_snapshot_fallback()) {
             LOGE("Snapshot fallback also failed");
             return false;
@@ -647,7 +657,7 @@ void ScreenCapture::stop() {
         local_control_port_ = 0;
     }
 
-    hdc_.cleanup_stale_forwards();
+    hdc_.cleanup_stale_forwards({local_video_port_, local_control_port_});
 
     kill_uitest_extension();
 }
@@ -692,7 +702,7 @@ bool ScreenCapture::reconnect_grpc_stream() {
         local_control_port_ = 0;
     }
 
-    hdc_.cleanup_stale_forwards();
+    hdc_.cleanup_stale_forwards({local_video_port_, local_control_port_});
     Sleep(300);
 
     hdc_.shell_command(build_extension_cmd(), nullptr, 5);
