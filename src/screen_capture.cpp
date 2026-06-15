@@ -1,4 +1,5 @@
 #include "screen_capture.h"
+#include "config.h"
 #include "log.h"
 #include "protocol.h"
 #include <cstdio>
@@ -11,6 +12,9 @@ namespace hscrcpy {
 
 ScreenCapture::ScreenCapture(HdcWrapper &hdc, const CaptureConfig &config)
     : hdc_(hdc), config_(config) {
+    auto &ac = AppConfig::instance();
+    max_h264_queue_size_ = ac.max_h264_queue;
+    max_grpc_reconnect_ = ac.max_grpc_reconnect;
     char exe_path[MAX_PATH];
     GetModuleFileNameA(NULL, exe_path, MAX_PATH);
     std::string exe_dir(exe_path);
@@ -445,7 +449,7 @@ static bool is_local_port_free(uint16_t port) {
 bool ScreenCapture::setup_port_forward() {
     hdc_.cleanup_stale_forwards();
 
-    for (uint16_t base = kDefaultLocalBasePort; base < kDefaultLocalBasePort + kLocalPortRange; base += 2) {
+    for (uint16_t base = AppConfig::instance().local_base_port; base < AppConfig::instance().local_base_port + AppConfig::instance().local_port_range; base += 2) {
         if (!is_local_port_free(base) || !is_local_port_free(base + 1)) continue;
 
         local_video_port_ = base;
@@ -502,6 +506,7 @@ bool ScreenCapture::setup_grpc_stream(bool force_restart) {
     }
 
     bool connected = false;
+    grpc_client_.set_idle_timeout_sec(AppConfig::instance().idle_timeout_sec);
     for (int retry = 0; retry < 5; retry++) {
         LOGI("gRPC connect attempt %d to 127.0.0.1:%u", retry + 1, local_video_port_);
         if (grpc_client_.connect("127.0.0.1", local_video_port_)) {
@@ -739,7 +744,7 @@ void ScreenCapture::grpc_stream_loop() {
         got_stream_data_ = true;
         {
             std::lock_guard<std::mutex> lock(h264_queue_mutex_);
-            if (h264_queue_.size() >= kMaxH264QueueSize) {
+            if (h264_queue_.size() >= max_h264_queue_size_) {
                 h264_queue_.pop_front();
             }
             h264_queue_.push_back(std::make_shared<std::vector<uint8_t>>(h264_data));
@@ -770,12 +775,12 @@ void ScreenCapture::grpc_stream_loop() {
         if (!grpc_client_.is_connected() || !grpc_client_.is_streaming_active()) {
             LOGW("gRPC stream disconnected (connected=%d, streaming=%d), attempting reconnect (%d/%d)",
                  grpc_client_.is_connected(), grpc_client_.is_streaming_active(),
-                 reconnect_attempts + 1, kMaxGrpcReconnectAttempts);
+                 reconnect_attempts + 1, max_grpc_reconnect_);
         }
 
         grpc_client_.stop_streaming();
 
-        if (reconnect_attempts >= kMaxGrpcReconnectAttempts) {
+        if (reconnect_attempts >= max_grpc_reconnect_) {
             LOGE("Max reconnect attempts reached, giving up");
             break;
         }
@@ -783,8 +788,8 @@ void ScreenCapture::grpc_stream_loop() {
         reconnect_attempts++;
 
         if (!reconnect_grpc_stream()) {
-            LOGE("Reconnect failed (attempt %d/%d)", reconnect_attempts, kMaxGrpcReconnectAttempts);
-            if (reconnect_attempts >= kMaxGrpcReconnectAttempts) break;
+            LOGE("Reconnect failed (attempt %d/%d)", reconnect_attempts, max_grpc_reconnect_);
+            if (reconnect_attempts >= max_grpc_reconnect_) break;
             Sleep(1000);
             continue;
         }

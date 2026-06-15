@@ -7,6 +7,7 @@
 #pragma comment(lib, "gdiplus.lib")
 
 #include "cli.h"
+#include "config.h"
 #include "screen_capture.h"
 #include "hdc_wrapper.h"
 #include "input_injector.h"
@@ -215,26 +216,29 @@ static void auto_select_config() {
 
     g_capture_config = CaptureConfig{};
     bool is_tcp = g_hdc && g_hdc->is_tcp();
+    auto &cfg = AppConfig::instance();
 
     uint32_t eff_w = g_device_screen_w > 0 ? g_device_screen_w : 1260;
-    if (eff_w > 720) {
-        g_capture_config.scale = 2;
-    } else {
-        g_capture_config.scale = 1;
-    }
 
     if (is_tcp) {
-        g_capture_config.bit_rate = 8388608;
-        g_capture_config.frame_rate = 24;
-        LOGI("Auto TCP: %ux%u -> scale=%d, 8M, 24fps", eff_w, g_device_screen_h, g_capture_config.scale);
+        g_capture_config.scale = (eff_w > 720) ? cfg.tcp_scale : 1;
+        g_capture_config.bit_rate = cfg.tcp_bitrate;
+        g_capture_config.frame_rate = cfg.tcp_frame_rate;
+        g_capture_config.iframe_interval = cfg.iframe_interval;
+        LOGI("Auto TCP: %ux%u -> scale=%d, %s, %dfps", eff_w, g_device_screen_h,
+             g_capture_config.scale, bitrate_label(g_capture_config.bit_rate), g_capture_config.frame_rate);
     } else {
-        g_capture_config.bit_rate = 20971520;
-        g_capture_config.frame_rate = 30;
-        LOGI("Auto USB: %ux%u -> scale=%d, 20M, 30fps", eff_w, g_device_screen_h, g_capture_config.scale);
+        g_capture_config.scale = (eff_w > 720) ? cfg.usb_scale : 1;
+        g_capture_config.bit_rate = cfg.usb_bitrate;
+        g_capture_config.frame_rate = cfg.usb_frame_rate;
+        g_capture_config.iframe_interval = cfg.iframe_interval;
+        LOGI("Auto USB: %ux%u -> scale=%d, %s, %dfps", eff_w, g_device_screen_h,
+             g_capture_config.scale, bitrate_label(g_capture_config.bit_rate), g_capture_config.frame_rate);
     }
 }
 
 static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM lp) {
+    static AppConfig *pending = nullptr;
     switch (msg) {
     case WM_INITDIALOG: {
         RECT pr, dr;
@@ -244,87 +248,112 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         int y = pr.top + (pr.bottom - pr.top - (dr.bottom - dr.top)) / 2;
         SetWindowPos(hDlg, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
 
-        HWND hScale = GetDlgItem(hDlg, 100);
-        HWND hBitrate = GetDlgItem(hDlg, 101);
-        HWND hFps = GetDlgItem(hDlg, 102);
+        pending = new AppConfig(AppConfig::instance());
 
-        uint32_t dw = g_device_screen_w > 0 ? g_device_screen_w : 1260;
-        uint32_t dh = g_device_screen_h > 0 ? g_device_screen_h : 2720;
-
-        char label[64];
-        for (int s = 1; s <= 5; s++) {
-            snprintf(label, sizeof(label), "%d  (%ux%u)", s, dw / s, dh / s);
-            int idx = (int)SendMessageA(hScale, CB_ADDSTRING, 0, (LPARAM)label);
-            SendMessageA(hScale, CB_SETITEMDATA, idx, s);
-        }
-        int sel_scale = g_capture_config.scale - 1;
-        SendMessageA(hScale, CB_SETCURSEL, sel_scale, 0);
-
-        struct BitrateEntry { const char *label; int value; };
-        BitrateEntry bitrates[] = {
-            {"30 Mbps (USB Original)", 31457280},
-            {"20 Mbps (USB 2K Scaled)", 20971520},
-            {"8 Mbps (WiFi Balanced)", 8388608},
-            {"4 Mbps (WiFi Low BW)", 4194304},
-            {"2 Mbps (Remote TCP)", 2097152},
+        auto init_combo = [&](int id, const auto &entries, int cur_val) {
+            HWND h = GetDlgItem(hDlg, id);
+            int sel = 0;
+            for (int i = 0; i < (int)entries.size(); i++) {
+                int idx = (int)SendMessageA(h, CB_ADDSTRING, 0, (LPARAM)entries[i].first);
+                SendMessageA(h, CB_SETITEMDATA, idx, entries[i].second);
+                if (entries[i].second == cur_val) sel = i;
+            }
+            SendMessageA(h, CB_SETCURSEL, sel, 0);
         };
-        int sel_br = 0;
-        for (int i = 0; i < 5; i++) {
-            int idx = (int)SendMessageA(hBitrate, CB_ADDSTRING, 0, (LPARAM)bitrates[i].label);
-            SendMessageA(hBitrate, CB_SETITEMDATA, idx, bitrates[i].value);
-            if (bitrates[i].value == g_capture_config.bit_rate) sel_br = i;
-        }
-        SendMessageA(hBitrate, CB_SETCURSEL, sel_br, 0);
 
-        struct FpsEntry { const char *label; int value; };
-        FpsEntry fpses[] = {
-            {"60 fps", 60},
-            {"30 fps", 30},
-            {"24 fps", 24},
-            {"15 fps", 15},
-            {"10 fps", 10},
+        struct SE { const char *first; int second; };
+        SE scale_entries[] = {{"1",1},{"2",2},{"3",3},{"4",4},{"5",5}};
+        SE bitrate_entries[] = {
+            {"30 Mbps",31457280},{"20 Mbps",20971520},
+            {"8 Mbps",8388608},{"4 Mbps",4194304},{"2 Mbps",2097152}
         };
-        int sel_fps = 1;
-        for (int i = 0; i < 5; i++) {
-            int idx = (int)SendMessageA(hFps, CB_ADDSTRING, 0, (LPARAM)fpses[i].label);
-            SendMessageA(hFps, CB_SETITEMDATA, idx, fpses[i].value);
-            if (fpses[i].value == g_capture_config.frame_rate) sel_fps = i;
-        }
-        SendMessageA(hFps, CB_SETCURSEL, sel_fps, 0);
+        SE fps_entries[] = {
+            {"60 fps",60},{"30 fps",30},{"24 fps",24},{"15 fps",15},{"10 fps",10}
+        };
+        SE timeout_entries[] = {
+            {"60s",60},{"120s",120},{"180s",180},{"300s",300},{"600s",600}
+        };
+        SE iframe_entries[] = {
+            {"500ms",500},{"1000ms",1000},{"2000ms",2000},{"3000ms",3000},{"5000ms",5000}
+        };
 
-        char info[128];
-        snprintf(info, sizeof(info), "Device: %ux%u  |  Current: scale=%d, %s, %dfps",
-                 dw, dh, g_capture_config.scale,
-                 bitrate_label(g_capture_config.bit_rate), g_capture_config.frame_rate);
-        SetWindowTextA(GetDlgItem(hDlg, 103), info);
+        std::vector<SE> sc(scale_entries, scale_entries + 5);
+        std::vector<SE> br(bitrate_entries, bitrate_entries + 5);
+        std::vector<SE> fp(fps_entries, fps_entries + 5);
+        std::vector<SE> to(timeout_entries, timeout_entries + 5);
+        std::vector<SE> ifr(iframe_entries, iframe_entries + 5);
+
+        init_combo(110, sc, pending->usb_scale);
+        init_combo(111, br, pending->usb_bitrate);
+        init_combo(112, fp, pending->usb_frame_rate);
+
+        init_combo(120, sc, pending->tcp_scale);
+        init_combo(121, br, pending->tcp_bitrate);
+        init_combo(122, fp, pending->tcp_frame_rate);
+
+        init_combo(130, to, pending->idle_timeout_sec);
+        init_combo(131, ifr, pending->iframe_interval);
+
+        char port_buf[64];
+        snprintf(port_buf, sizeof(port_buf), "%d", pending->local_base_port);
+        SetWindowTextA(GetDlgItem(hDlg, 132), port_buf);
+        snprintf(port_buf, sizeof(port_buf), "%d", pending->local_port_range);
+        SetWindowTextA(GetDlgItem(hDlg, 133), port_buf);
 
         return TRUE;
     }
     case WM_COMMAND:
         if (LOWORD(wp) == IDOK) {
-            HWND hScale = GetDlgItem(hDlg, 100);
-            HWND hBitrate = GetDlgItem(hDlg, 101);
-            HWND hFps = GetDlgItem(hDlg, 102);
+            auto read_combo = [&](int id) -> int {
+                HWND h = GetDlgItem(hDlg, id);
+                int s = (int)SendMessageA(h, CB_GETCURSEL, 0, 0);
+                return (int)SendMessageA(h, CB_GETITEMDATA, s, 0);
+            };
 
-            int s = (int)SendMessageA(hScale, CB_GETCURSEL, 0, 0);
-            int scale_val = (int)SendMessageA(hScale, CB_GETITEMDATA, s, 0);
-            int b = (int)SendMessageA(hBitrate, CB_GETCURSEL, 0, 0);
-            int br_val = (int)SendMessageA(hBitrate, CB_GETITEMDATA, b, 0);
-            int f = (int)SendMessageA(hFps, CB_GETCURSEL, 0, 0);
-            int fps_val = (int)SendMessageA(hFps, CB_GETITEMDATA, f, 0);
+            pending->usb_scale = read_combo(110);
+            pending->usb_bitrate = read_combo(111);
+            pending->usb_frame_rate = read_combo(112);
+
+            pending->tcp_scale = read_combo(120);
+            pending->tcp_bitrate = read_combo(121);
+            pending->tcp_frame_rate = read_combo(122);
+
+            pending->idle_timeout_sec = read_combo(130);
+            pending->iframe_interval = read_combo(131);
+
+            char buf[32];
+            GetWindowTextA(GetDlgItem(hDlg, 132), buf, sizeof(buf));
+            pending->local_base_port = atoi(buf);
+            if (pending->local_base_port < 1024) pending->local_base_port = 9900;
+            GetWindowTextA(GetDlgItem(hDlg, 133), buf, sizeof(buf));
+            pending->local_port_range = atoi(buf);
+            if (pending->local_port_range < 10) pending->local_port_range = 500;
+
+            AppConfig::instance() = *pending;
+            config_save();
 
             CaptureConfig old_config = g_capture_config;
-            g_capture_config.scale = scale_val;
-            g_capture_config.bit_rate = br_val;
-            g_capture_config.frame_rate = fps_val;
+            bool is_tcp = g_hdc && g_hdc->is_tcp();
+            g_capture_config.scale = is_tcp ? pending->tcp_scale : pending->usb_scale;
+            g_capture_config.bit_rate = is_tcp ? pending->tcp_bitrate : pending->usb_bitrate;
+            g_capture_config.frame_rate = is_tcp ? pending->tcp_frame_rate : pending->usb_frame_rate;
+            g_capture_config.iframe_interval = pending->iframe_interval;
 
-            LOGI("User set: scale=%d, bitrate=%d, fps=%d", scale_val, br_val, fps_val);
+            LOGI("Config updated: usb=%d/%s/%dfps tcp=%d/%s/%dfps idle=%ds iframe=%dms port=%d+%d",
+                 pending->usb_scale, bitrate_label(pending->usb_bitrate), pending->usb_frame_rate,
+                 pending->tcp_scale, bitrate_label(pending->tcp_bitrate), pending->tcp_frame_rate,
+                 pending->idle_timeout_sec, pending->iframe_interval,
+                 pending->local_base_port, pending->local_port_range);
+
+            delete pending;
+            pending = nullptr;
             EndDialog(hDlg, IDOK);
 
             if (g_mirroring && (old_config.scale != g_capture_config.scale ||
                                 old_config.bit_rate != g_capture_config.bit_rate ||
-                                old_config.frame_rate != g_capture_config.frame_rate)) {
-                if (center_msgbox("Quality settings changed. Restart mirroring to apply?",
+                                old_config.frame_rate != g_capture_config.frame_rate ||
+                                old_config.iframe_interval != g_capture_config.iframe_interval)) {
+                if (center_msgbox("Settings changed. Restart mirroring to apply?",
                                   "HScrcpy", MB_YESNO | MB_ICONQUESTION) == IDYES) {
                     PostMessageA(g_hwnd, WM_USER + 7, 0, 0);
                 }
@@ -332,9 +361,15 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             return TRUE;
         }
         if (LOWORD(wp) == IDCANCEL) {
+            delete pending;
+            pending = nullptr;
             EndDialog(hDlg, IDCANCEL);
             return TRUE;
         }
+        break;
+    case WM_DESTROY:
+        delete pending;
+        pending = nullptr;
         break;
     }
     return FALSE;
@@ -346,23 +381,15 @@ static void show_settings_dialog() {
         WORD menu, cls, title;
     } tmpl = {};
     tmpl.dlg.style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_CENTER | DS_MODALFRAME;
-    tmpl.dlg.cx = 240;
-    tmpl.dlg.cy = 140;
-    tmpl.dlg.cdit = 8;
+    tmpl.dlg.cx = 280;
+    tmpl.dlg.cy = 230;
+    tmpl.dlg.cdit = 25;
     tmpl.menu = 0;
     tmpl.cls = 0;
     tmpl.title = 0;
 
-    struct Item {
-        DLGITEMTEMPLATE item;
-        WORD cls;
-        WORD id_lo;
-        WORD id_hi;
-        WORD text;
-    };
-
     static std::vector<BYTE> data;
-    data.resize(4096);
+    data.resize(8192);
     BYTE *p = data.data();
     auto align = [&]() { p += (4 - ((ULONG_PTR)p % 4)) % 4; };
     auto write = [&](const void *src, size_t len) { memcpy(p, src, len); p += len; };
@@ -384,17 +411,40 @@ static void show_settings_dialog() {
         p += sizeof(WORD);
     };
 
-    writeItem(WS_CHILD | WS_VISIBLE | SS_LEFT, 7, 7, 60, 8, 10, L"STATIC", L"Scale:");
-    writeItem(WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 70, 5, 150, 200, 100, L"COMBOBOX", L"");
-    writeItem(WS_CHILD | WS_VISIBLE | SS_LEFT, 7, 27, 60, 8, 11, L"STATIC", L"Bitrate:");
-    writeItem(WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 70, 25, 150, 200, 101, L"COMBOBOX", L"");
-    writeItem(WS_CHILD | WS_VISIBLE | SS_LEFT, 7, 47, 60, 8, 12, L"STATIC", L"Frame Rate:");
-    writeItem(WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 70, 45, 150, 200, 102, L"COMBOBOX", L"");
-    writeItem(WS_CHILD | WS_VISIBLE | SS_LEFT, 7, 70, 213, 10, 103, L"STATIC", L"");
-    writeItem(WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP, 120, 90, 50, 14, IDOK, L"BUTTON", L"OK");
-    writeItem(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP, 175, 90, 50, 14, IDCANCEL, L"BUTTON", L"Cancel");
+    auto L = WS_CHILD | WS_VISIBLE | SS_LEFT;
+    auto CB = WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP;
+    auto ED = WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER | WS_TABSTOP;
+    auto GRP = WS_CHILD | WS_VISIBLE | BS_GROUPBOX;
 
-    tmpl.dlg.cdit = 8;
+    writeItem(GRP, 4, 2, 268, 52, (WORD)-1, L"BUTTON", L"USB Stream");
+    writeItem(L, 10, 16, 35, 8, (WORD)-1, L"STATIC", L"Scale:");
+    writeItem(CB, 48, 14, 45, 200, 110, L"COMBOBOX", L"");
+    writeItem(L, 100, 16, 35, 8, (WORD)-1, L"STATIC", L"Bitrate:");
+    writeItem(CB, 140, 14, 60, 200, 111, L"COMBOBOX", L"");
+    writeItem(L, 208, 16, 20, 8, (WORD)-1, L"STATIC", L"FPS:");
+    writeItem(CB, 232, 14, 35, 200, 112, L"COMBOBOX", L"");
+
+    writeItem(GRP, 4, 58, 268, 52, (WORD)-1, L"BUTTON", L"TCP Stream");
+    writeItem(L, 10, 72, 35, 8, (WORD)-1, L"STATIC", L"Scale:");
+    writeItem(CB, 48, 70, 45, 200, 120, L"COMBOBOX", L"");
+    writeItem(L, 100, 72, 35, 8, (WORD)-1, L"STATIC", L"Bitrate:");
+    writeItem(CB, 140, 70, 60, 200, 121, L"COMBOBOX", L"");
+    writeItem(L, 208, 72, 20, 8, (WORD)-1, L"STATIC", L"FPS:");
+    writeItem(CB, 232, 70, 35, 200, 122, L"COMBOBOX", L"");
+
+    writeItem(GRP, 4, 114, 268, 68, (WORD)-1, L"BUTTON", L"Advanced");
+    writeItem(L, 10, 128, 55, 8, (WORD)-1, L"STATIC", L"Idle Timeout:");
+    writeItem(CB, 68, 126, 50, 200, 130, L"COMBOBOX", L"");
+    writeItem(L, 125, 128, 25, 8, (WORD)-1, L"STATIC", L"IDR:");
+    writeItem(CB, 153, 126, 55, 200, 131, L"COMBOBOX", L"");
+    writeItem(L, 10, 148, 55, 8, (WORD)-1, L"STATIC", L"Port Base:");
+    writeItem(ED, 68, 146, 45, 12, 132, L"EDIT", L"");
+    writeItem(L, 120, 148, 55, 8, (WORD)-1, L"STATIC", L"Port Range:");
+    writeItem(ED, 178, 146, 45, 12, 133, L"EDIT", L"");
+
+    writeItem(WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP, 155, 192, 50, 14, IDOK, L"BUTTON", L"OK");
+    writeItem(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP, 215, 192, 50, 14, IDCANCEL, L"BUTTON", L"Cancel");
+
     memcpy(data.data(), &tmpl.dlg, sizeof(tmpl.dlg));
 
     DialogBoxIndirectParamA(g_hInst, (DLGTEMPLATE *)data.data(), g_hwnd, SettingsDlgProc, 0);
@@ -1294,6 +1344,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     Gdiplus::GdiplusStartupInput gdi_si;
     Gdiplus::GdiplusStartup(&g_gdiplus_token, &gdi_si, NULL);
+
+    hscrcpy::config_load();
 
     {
         std::string cmd_line(GetCommandLineA());

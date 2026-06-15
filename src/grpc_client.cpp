@@ -514,8 +514,8 @@ void GrpcClient::streaming_loop() {
         }
         if (sel == 0) {
             idle_count++;
-            if (idle_count >= 600) {
-                LOGI("No data for 300s, stream dead");
+            if (idle_count >= idle_timeout_sec_ * 2) {
+                LOGI("No data for %ds, stream dead", idle_timeout_sec_);
                 connected_ = false;
                 break;
             }

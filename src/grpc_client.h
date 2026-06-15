@@ -36,6 +36,8 @@ public:
     void stop_streaming();
     bool request_idr_frame();
 
+    void set_idle_timeout_sec(int sec) { idle_timeout_sec_ = sec; }
+
 private:
     bool send_grpc_request(const std::string &path, const std::vector<uint8_t> &payload);
     bool recv_grpc_response();
@@ -56,6 +58,7 @@ private:
     uint32_t server_window_size_ = 65535;
     bool idr_requested_ = false;
     uint32_t next_stream_id_ = 3;
+    int idle_timeout_sec_ = 300;
 };
 
 } // namespace hscrcpy

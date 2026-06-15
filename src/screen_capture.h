@@ -12,6 +12,7 @@
 #include "h264_decoder.h"
 #include "jpeg_decoder.h"
 #include "protocol.h"
+#include "config.h"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -86,7 +87,7 @@ private:
     std::mutex h264_queue_mutex_;
     std::condition_variable h264_queue_cv_;
     std::deque<std::shared_ptr<std::vector<uint8_t>>> h264_queue_;
-    static constexpr size_t kMaxH264QueueSize = 10;
+    size_t max_h264_queue_size_ = 10;
 
     GrpcClient grpc_client_;
     H264Decoder decoder_;
@@ -98,7 +99,7 @@ private:
     uint16_t uitest_port_ = 5000;
     std::string uitest_version_;
     std::string server_dir_;
-    static constexpr int kMaxGrpcReconnectAttempts = 3;
+    int max_grpc_reconnect_ = 3;
     std::atomic<bool> reconnecting_{false};
 };
 

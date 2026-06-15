@@ -17,6 +17,7 @@ add_executable(hscrcpy WIN32
     src/grpc_client.cpp
     src/window_renderer.cpp
     src/cli.cpp
+    src/config.cpp
 )
 
 # ============================================

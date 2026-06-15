@@ -1,4 +1,5 @@
 #include "input_injector.h"
+#include "config.h"
 #include "log.h"
 #include "protocol.h"
 #include <cstdio>
@@ -177,7 +178,7 @@ bool InputInjector::push_agent_so() {
 }
 
 bool InputInjector::setup_control_port() {
-    uint16_t start_port = base_port_ > 0 ? base_port_ + 1 : 9950;
+    uint16_t start_port = base_port_ > 0 ? base_port_ + 1 : AppConfig::instance().local_base_port + 1;
     uint16_t end_port = start_port + 5;
 
     for (uint16_t port = start_port; port < end_port; port++) {
@@ -508,9 +509,9 @@ bool InputInjector::inject_reboot() {
 bool InputInjector::inject_wheel(uint32_t x, uint32_t y, int32_t delta) {
     int notches = std::abs(delta) / 120;
     if (notches < 1) notches = 1;
-    int pixels_per_notch = 200;
+    int pixels_per_notch = AppConfig::instance().scroll_pixels_per_notch;
     int scroll_amount = notches * pixels_per_notch;
-    if (scroll_amount > 800) scroll_amount = 800;
+    if (scroll_amount > AppConfig::instance().scroll_max) scroll_amount = AppConfig::instance().scroll_max;
 
     int from_y = static_cast<int>(y);
     int to_y;
