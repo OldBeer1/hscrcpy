@@ -33,7 +33,6 @@ public:
 
 private:
     DecodedImage image_;
-    std::vector<uint8_t> decode_buffer_;  // persistent buffer to avoid per-frame reallocation
     bool initialized_ = false;
 
     AVCodecContext *codec_ctx_  = nullptr;

@@ -4,6 +4,7 @@
 #include <commctrl.h>
 #include <objidl.h>
 #include <gdiplus.h>
+#include <d2d1.h>
 #pragma comment(lib, "gdiplus.lib")
 
 #include "cli.h"
@@ -78,6 +79,81 @@ static uint32_t g_device_screen_w = 0, g_device_screen_h = 0;
 #define ID_BTN_QUALITY 1011
 
 static ULONG_PTR g_gdiplus_token = 0;
+
+// Direct2D rendering state
+static ID2D1Factory *g_d2d_factory = nullptr;
+static ID2D1HwndRenderTarget *g_d2d_rt = nullptr;
+static ID2D1Bitmap *g_d2d_bitmap = nullptr;
+static bool g_d2d_available = false;
+static uint32_t g_d2d_bmp_w = 0, g_d2d_bmp_h = 0;
+
+static bool init_d2d() {
+    HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g_d2d_factory);
+    if (FAILED(hr)) {
+        LOGW("D2D1CreateFactory failed (hr=0x%08X), using GDI fallback", (unsigned)hr);
+        return false;
+    }
+    g_d2d_available = true;
+    LOGI("Direct2D initialized");
+    return true;
+}
+
+static void cleanup_d2d() {
+    if (g_d2d_bitmap) { g_d2d_bitmap->Release(); g_d2d_bitmap = nullptr; }
+    if (g_d2d_rt) { g_d2d_rt->Release(); g_d2d_rt = nullptr; }
+    if (g_d2d_factory) { g_d2d_factory->Release(); g_d2d_factory = nullptr; }
+    g_d2d_available = false;
+    g_d2d_bmp_w = 0;
+    g_d2d_bmp_h = 0;
+}
+
+static bool ensure_d2d_render_target() {
+    if (!g_d2d_factory || !g_canvas_hwnd) return false;
+    RECT rc;
+    GetClientRect(g_canvas_hwnd, &rc);
+    D2D1_SIZE_U size = D2D1::SizeU(rc.right, rc.bottom);
+    if (!g_d2d_rt) {
+        HRESULT hr = g_d2d_factory->CreateHwndRenderTarget(
+            D2D1::RenderTargetProperties(),
+            D2D1::HwndRenderTargetProperties(g_canvas_hwnd, size),
+            &g_d2d_rt);
+        if (FAILED(hr)) {
+            LOGW("CreateHwndRenderTarget failed (hr=0x%08X)", (unsigned)hr);
+            cleanup_d2d();
+            return false;
+        }
+        g_d2d_rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+    } else {
+        g_d2d_rt->Resize(size);
+    }
+    return true;
+}
+
+static void upload_frame_to_d2d(const DecodedImage &img) {
+    if (!g_d2d_rt) return;
+
+    // Recreate bitmap if size changed
+    if (!g_d2d_bitmap || g_d2d_bmp_w != img.width || g_d2d_bmp_h != img.height) {
+        if (g_d2d_bitmap) { g_d2d_bitmap->Release(); g_d2d_bitmap = nullptr; }
+        D2D1_SIZE_U sz = D2D1::SizeU(img.width, img.height);
+        D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+        HRESULT hr = g_d2d_rt->CreateBitmap(sz, props, &g_d2d_bitmap);
+        if (FAILED(hr)) {
+            LOGW("CreateBitmap failed (hr=0x%08X)", (unsigned)hr);
+            return;
+        }
+        g_d2d_bmp_w = img.width;
+        g_d2d_bmp_h = img.height;
+        LOGI("D2D bitmap created: %ux%u stride=%d data_size=%zu", img.width, img.height, img.stride, img.data.size());
+    }
+
+    D2D1_RECT_U rc = D2D1::RectU(0, 0, img.width, img.height);
+    HRESULT hr = g_d2d_bitmap->CopyFromMemory(&rc, img.data.data(), img.stride);
+    if (FAILED(hr)) {
+        LOGW("CopyFromMemory failed (hr=0x%08X)", (unsigned)hr);
+    }
+}
 
 static HDC g_backbuffer_dc = nullptr;
 static HBITMAP g_backbuffer_bmp = nullptr;
@@ -682,47 +758,93 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         GetClientRect(hwnd, &rc);
         int cw = rc.right, ch = rc.bottom;
 
-        if (ensure_backbuffer(hdc, cw, ch)) {
-            HBRUSH bg = CreateSolidBrush(RGB(30, 30, 30));
-            FillRect(g_backbuffer_dc, &rc, bg);
-            DeleteObject(bg);
-
-            {
-                std::lock_guard<std::mutex> lock(g_frame_mutex);
-                if (g_cur_frame && !g_cur_frame->data.empty() && g_cur_frame->width > 0) {
-                    double aspect = (double)g_cur_frame->width / g_cur_frame->height;
-                    int draw_w, draw_h, off_x, off_y;
-                    if ((double)cw / ch > aspect) {
-                        draw_h = ch;
-                        draw_w = (int)(ch * aspect);
-                    } else {
-                        draw_w = cw;
-                        draw_h = (int)(cw / aspect);
-                    }
-                    if (draw_w == cw - 1) draw_w = cw;
-                    if (draw_h == ch - 1) draw_h = ch;
-                    off_x = (cw - draw_w) / 2;
-                    off_y = (ch - draw_h) / 2;
-
-                    BITMAPINFOHEADER bih = {};
-                    bih.biSize     = sizeof(bih);
-                    bih.biWidth    = static_cast<LONG>(g_cur_frame->stride / 3);
-                    bih.biHeight   = -static_cast<LONG>(g_cur_frame->height);
-                    bih.biPlanes   = 1;
-                    bih.biBitCount = 24;
-                    bih.biCompression = BI_RGB;
-                    bih.biSizeImage = g_cur_frame->data.size();
-
-                    SetStretchBltMode(g_backbuffer_dc, COLORONCOLOR);
-                    StretchDIBits(g_backbuffer_dc, off_x, off_y, draw_w, draw_h,
-                                  0, 0, g_cur_frame->width, g_cur_frame->height,
-                                  g_cur_frame->data.data(),
-                                  reinterpret_cast<BITMAPINFO *>(&bih),
-                                  DIB_RGB_COLORS, SRCCOPY);
-                }
+        // Try Direct2D rendering path
+        if (g_d2d_available && ensure_d2d_render_target()) {
+            std::lock_guard<std::mutex> lock(g_frame_mutex);
+            if (g_cur_frame && !g_cur_frame->data.empty() && g_cur_frame->width > 0) {
+                upload_frame_to_d2d(*g_cur_frame);
+            } else if (g_d2d_bitmap) {
+                // No frame: release bitmap so DrawBitmap won't paint stale data
+                g_d2d_bitmap->Release();
+                g_d2d_bitmap = nullptr;
+                g_d2d_bmp_w = 0;
+                g_d2d_bmp_h = 0;
             }
 
-            BitBlt(hdc, 0, 0, cw, ch, g_backbuffer_dc, 0, 0, SRCCOPY);
+            g_d2d_rt->BeginDraw();
+            g_d2d_rt->Clear(D2D1::ColorF(0.12f, 0.12f, 0.12f));
+            if (g_d2d_bitmap) {
+                double aspect = (double)g_d2d_bmp_w / g_d2d_bmp_h;
+                int draw_w, draw_h, off_x, off_y;
+                if ((double)cw / ch > aspect) {
+                    draw_h = ch;
+                    draw_w = (int)(ch * aspect);
+                } else {
+                    draw_w = cw;
+                    draw_h = (int)(cw / aspect);
+                }
+                if (draw_w == cw - 1) draw_w = cw;
+                if (draw_h == ch - 1) draw_h = ch;
+                off_x = (cw - draw_w) / 2;
+                off_y = (ch - draw_h) / 2;
+
+                D2D1_RECT_F drawRect = D2D1::RectF(
+                    static_cast<FLOAT>(off_x), static_cast<FLOAT>(off_y),
+                    static_cast<FLOAT>(off_x + draw_w), static_cast<FLOAT>(off_y + draw_h));
+                g_d2d_rt->DrawBitmap(g_d2d_bitmap, drawRect, 1.0f,
+                                      D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            }
+            HRESULT hr = g_d2d_rt->EndDraw();
+            if (FAILED(hr)) {
+                LOGW("D2D EndDraw failed (hr=0x%08X)", (unsigned)hr);
+                if (g_d2d_bitmap) { g_d2d_bitmap->Release(); g_d2d_bitmap = nullptr; g_d2d_bmp_w = 0; g_d2d_bmp_h = 0; }
+                g_d2d_rt->Release();
+                g_d2d_rt = nullptr;
+            }
+        } else {
+            // GDI fallback
+            if (ensure_backbuffer(hdc, cw, ch)) {
+                HBRUSH bg = CreateSolidBrush(RGB(30, 30, 30));
+                FillRect(g_backbuffer_dc, &rc, bg);
+                DeleteObject(bg);
+
+                {
+                    std::lock_guard<std::mutex> lock(g_frame_mutex);
+                    if (g_cur_frame && !g_cur_frame->data.empty() && g_cur_frame->width > 0) {
+                        double aspect = (double)g_cur_frame->width / g_cur_frame->height;
+                        int draw_w, draw_h, off_x, off_y;
+                        if ((double)cw / ch > aspect) {
+                            draw_h = ch;
+                            draw_w = (int)(ch * aspect);
+                        } else {
+                            draw_w = cw;
+                            draw_h = (int)(cw / aspect);
+                        }
+                        if (draw_w == cw - 1) draw_w = cw;
+                        if (draw_h == ch - 1) draw_h = ch;
+                        off_x = (cw - draw_w) / 2;
+                        off_y = (ch - draw_h) / 2;
+
+                        BITMAPINFOHEADER bih = {};
+                        bih.biSize     = sizeof(bih);
+                        bih.biWidth    = static_cast<LONG>(g_cur_frame->stride / 4);
+                        bih.biHeight   = -static_cast<LONG>(g_cur_frame->height);
+                        bih.biPlanes   = 1;
+                        bih.biBitCount = 32;
+                        bih.biCompression = BI_RGB;
+                        bih.biSizeImage = g_cur_frame->data.size();
+
+                        SetStretchBltMode(g_backbuffer_dc, COLORONCOLOR);
+                        StretchDIBits(g_backbuffer_dc, off_x, off_y, draw_w, draw_h,
+                                      0, 0, g_cur_frame->width, g_cur_frame->height,
+                                      g_cur_frame->data.data(),
+                                      reinterpret_cast<BITMAPINFO *>(&bih),
+                                      DIB_RGB_COLORS, SRCCOPY);
+                    }
+                }
+
+                BitBlt(hdc, 0, 0, cw, ch, g_backbuffer_dc, 0, 0, SRCCOPY);
+            }
         }
 
         EndPaint(hwnd, &ps);
@@ -1013,31 +1135,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
                                            301, 5, 100, 22, hwnd, (HMENU)ID_BTN_START, g_hInst, NULL);
 
-        g_btn_back_hwnd = CreateWindowA("BUTTON", "Back",
-                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                         8, 34, 48, 22, hwnd, (HMENU)ID_BTN_BACK, g_hInst, NULL);
-        g_btn_home_hwnd = CreateWindowA("BUTTON", "Home",
-                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                         64, 34, 48, 22, hwnd, (HMENU)ID_BTN_HOME, g_hInst, NULL);
-        g_btn_recent_hwnd = CreateWindowA("BUTTON", "Recent",
-                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                           116, 34, 50, 22, hwnd, (HMENU)ID_BTN_RECENT, g_hInst, NULL);
-        g_btn_volup_hwnd = CreateWindowA("BUTTON", "Vol+",
-                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                          170, 34, 42, 22, hwnd, (HMENU)ID_BTN_VOLUP, g_hInst, NULL);
-        g_btn_voldown_hwnd = CreateWindowA("BUTTON", "Vol-",
-                                            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                            216, 34, 42, 22, hwnd, (HMENU)ID_BTN_VOLDOWN, g_hInst, NULL);
-        g_btn_power_hwnd = CreateWindowA("BUTTON", "Power",
-                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                          262, 34, 48, 22, hwnd, (HMENU)ID_BTN_POWER, g_hInst, NULL);
-        g_btn_reboot_hwnd = CreateWindowA("BUTTON", "Reboot",
-                                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                             314, 34, 50, 22, hwnd, (HMENU)ID_BTN_REBOOT, g_hInst, NULL);
-
         g_btn_quality_hwnd = CreateWindowA("BUTTON", "",
                                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_ICON,
-                                            370, 34, 26, 22, hwnd, (HMENU)ID_BTN_QUALITY, g_hInst, NULL);
+                                            8, 34, 26, 22, hwnd, (HMENU)ID_BTN_QUALITY, g_hInst, NULL);
         HICON hGear = load_png_icon("res\\settings_icon.png", 20);
         if (hGear) {
             SendMessageA(g_btn_quality_hwnd, BM_SETIMAGE, IMAGE_ICON, (LPARAM)hGear);
@@ -1045,9 +1145,31 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetWindowTextA(g_btn_quality_hwnd, "\xE2\x9A\x99");
         }
 
+        g_btn_back_hwnd = CreateWindowA("BUTTON", "Back",
+                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                         38, 34, 48, 22, hwnd, (HMENU)ID_BTN_BACK, g_hInst, NULL);
+        g_btn_home_hwnd = CreateWindowA("BUTTON", "Home",
+                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                         90, 34, 48, 22, hwnd, (HMENU)ID_BTN_HOME, g_hInst, NULL);
+        g_btn_recent_hwnd = CreateWindowA("BUTTON", "Recent",
+                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                           142, 34, 50, 22, hwnd, (HMENU)ID_BTN_RECENT, g_hInst, NULL);
+        g_btn_volup_hwnd = CreateWindowA("BUTTON", "Vol+",
+                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                          196, 34, 42, 22, hwnd, (HMENU)ID_BTN_VOLUP, g_hInst, NULL);
+        g_btn_voldown_hwnd = CreateWindowA("BUTTON", "Vol-",
+                                            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                            242, 34, 42, 22, hwnd, (HMENU)ID_BTN_VOLDOWN, g_hInst, NULL);
+        g_btn_power_hwnd = CreateWindowA("BUTTON", "Power",
+                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                          288, 34, 48, 22, hwnd, (HMENU)ID_BTN_POWER, g_hInst, NULL);
+        g_btn_reboot_hwnd = CreateWindowA("BUTTON", "Reboot",
+                                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                             340, 34, 50, 22, hwnd, (HMENU)ID_BTN_REBOOT, g_hInst, NULL);
+
         g_status_hwnd = CreateWindowA("STATIC", "",
                                        WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                       402, 38, 400, 18, hwnd, NULL, g_hInst, NULL);
+                                       396, 38, 400, 18, hwnd, NULL, g_hInst, NULL);
 
         g_canvas_hwnd = CreateWindowA(CANVAS_CLASS, "",
                                        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_TABSTOP,
@@ -1123,6 +1245,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         GetClientRect(hwnd, &rc);
         MoveWindow(g_canvas_hwnd, 0, TOOLBAR_H, rc.right, rc.bottom - TOOLBAR_H, FALSE);
         destroy_backbuffer();
+        if (g_d2d_rt) g_d2d_rt->Resize(D2D1::SizeU(rc.right, rc.bottom - TOOLBAR_H));
         InvalidateRect(g_canvas_hwnd, NULL, FALSE);
         break;
     }
@@ -1204,6 +1327,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         });
 
         g_mirroring = true;
+        g_capture->set_notify_hwnd(g_hwnd);
         SetWindowTextA(g_btn_start_hwnd, "Stop Mirroring");
         EnableWindow(g_btn_start_hwnd, TRUE);
 
@@ -1315,6 +1439,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     }
+    case WM_USER + 10: {
+        // Event-driven frame rendering: decode thread notifies UI immediately
+        if (g_mirroring) try_update_frame();
+        break;
+    }
     case WM_DESTROY:
         destroy_backbuffer();
         join_cleanup_thread();
@@ -1344,6 +1473,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     Gdiplus::GdiplusStartupInput gdi_si;
     Gdiplus::GdiplusStartup(&g_gdiplus_token, &gdi_si, NULL);
+
+    init_d2d();
 
     hscrcpy::config_load();
 
@@ -1398,7 +1529,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
                               NULL, NULL, hInst, NULL);
     if (!g_hwnd) return 1;
 
-    SetTimer(g_hwnd, 1, 16, NULL);
+    SetTimer(g_hwnd, 1, 100, NULL);
 
     ShowWindow(g_hwnd, SW_SHOW);
     UpdateWindow(g_hwnd);
@@ -1414,5 +1545,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     }
 
     Gdiplus::GdiplusShutdown(g_gdiplus_token);
+    cleanup_d2d();
     return 0;
 }

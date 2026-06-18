@@ -239,27 +239,51 @@ bool InputInjector::send_to_socket(const std::string &json) {
     std::lock_guard<std::mutex> lock(socket_mutex_);
     int sock = control_sock_.load();
     if (sock < 0) {
+        consecutive_send_failures_++;
         return false;
     }
 
-    int n = ::send(static_cast<socket_t>(sock),
-                   json.c_str(), static_cast<int>(json.size()), 0);
-    if (n > 0) return true;
+    const char *data = json.c_str();
+    int remaining = static_cast<int>(json.size());
+    int total_sent = 0;
+    int retries = 0;
 
-    if (n == 0) {
-        LOGW("send to socket: connection closed");
+    while (remaining > 0 && retries < 3) {
+        int n = ::send(static_cast<socket_t>(sock),
+                       data + total_sent, remaining, 0);
+        if (n > 0) {
+            total_sent += n;
+            remaining -= n;
+            retries = 0;
+            continue;
+        }
+
+        if (n == 0) {
+            LOGW("send to socket: connection closed");
+            CLOSE_SOCKET(static_cast<socket_t>(sock));
+            control_sock_.store(-1);
+            consecutive_send_failures_++;
+            return false;
+        }
+
+        int err = WSAGetLastError();
+        if (err == WSAEWOULDBLOCK) {
+            retries++;
+            Sleep(1);
+            continue;
+        }
+        LOGW("send to socket failed (err=%d)", err);
         CLOSE_SOCKET(static_cast<socket_t>(sock));
         control_sock_.store(-1);
+        consecutive_send_failures_++;
         return false;
     }
 
-    int err = WSAGetLastError();
-    if (err == WSAEWOULDBLOCK) {
-        return false; // Non-blocking: transient buffer full, drop event
+    if (remaining == 0) {
+        consecutive_send_failures_ = 0;
+        return true;
     }
-    LOGW("send to socket failed (err=%d)", err);
-    CLOSE_SOCKET(static_cast<socket_t>(sock));
-    control_sock_.store(-1);
+    consecutive_send_failures_++;
     return false;
 }
 
@@ -550,14 +574,38 @@ void InputInjector::reconnect_loop() {
     while (reconnect_running_) {
         Sleep(2000);
         if (!reconnect_running_) break;
+
+        // Check if uitest daemon is stuck: socket connects but sends keep failing
+        int send_fails = consecutive_send_failures_.load();
+        if (send_fails >= 5 && control_sock_.load() >= 0) {
+            LOGW("uitest daemon appears stuck (%d consecutive send failures), killing and restarting", send_fails);
+            int old_sock = control_sock_.exchange(-1);
+            if (old_sock >= 0) CLOSE_SOCKET(static_cast<socket_t>(old_sock));
+            if (local_control_port_ > 0) {
+                hdc_.forward_remove(local_control_port_, use_abstract_control_,
+                                    use_abstract_control_ ? kUitestSocketName : "");
+                local_control_port_ = 0;
+            }
+            hdc_.shell_command("pkill -9 -f uitest", nullptr, 3);
+            Sleep(1000);
+            hdc_.shell_command("uitest start-daemon singleness", nullptr, 5);
+            Sleep(500);
+            consecutive_send_failures_ = 0;
+            consecutive_failures = 0;
+            continue;
+        }
+
         if (control_sock_.load() >= 0) {
             consecutive_failures = 0;
             continue;
         }
 
         if (consecutive_failures >= 5) {
-            LOGW("Control socket reconnect failed %d times, backing off for 30s", consecutive_failures);
-            for (int i = 0; i < 30 && reconnect_running_; i++) Sleep(1000);
+            LOGW("Control socket reconnect failed %d times, killing uitest and restarting", consecutive_failures);
+            hdc_.shell_command("pkill -9 -f uitest", nullptr, 3);
+            Sleep(1000);
+            hdc_.shell_command("uitest start-daemon singleness", nullptr, 5);
+            Sleep(500);
             consecutive_failures = 0;
             continue;
         }

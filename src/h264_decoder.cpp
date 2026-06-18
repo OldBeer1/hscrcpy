@@ -101,8 +101,8 @@ void H264Decoder::cleanup() {
         sws_ctx_ = nullptr;
     }
     if (frame_rgb_) {
-        if (frame_rgb_->data[0])
-            av_freep(&frame_rgb_->data[0]);
+        // frame_rgb_->data[0] points into image_.data (owned by vector), not av_malloc
+        frame_rgb_->data[0] = nullptr;
         av_frame_free(&frame_rgb_);
     }
     if (frame_) {
@@ -158,14 +158,28 @@ bool H264Decoder::decode(const uint8_t *h264_data, size_t h264_size) {
             int fmt = codec_ctx_->pix_fmt;
             int display_w = frame_->width;
             int display_h = frame_->height;
-            LOGI("Decoder: coded=%dx%d display=%dx%d fmt=%d", w, h, display_w, display_h, fmt);
 
             if (w <= 0 || h <= 0) continue;
 
             bool need_realloc = !sws_initialized_ ||
                 (last_width_ != w || last_height_ != h || last_pix_fmt_ != fmt);
 
+            // After swap with frame pool, frame_rgb_->data[0] may point to stale buffer.
+            // Re-fill arrays to point to current image_.data if pointer mismatch.
+            bool pointer_stale = sws_initialized_ &&
+                (frame_rgb_->data[0] != image_.data.data() ||
+                 image_.data.size() < static_cast<size_t>(rgb_buf_size_));
+
+            if (pointer_stale && !need_realloc) {
+                image_.data.resize(rgb_buf_size_);
+                av_image_fill_arrays(frame_rgb_->data, frame_rgb_->linesize,
+                                     image_.data.data(), AV_PIX_FMT_BGRA,
+                                     last_width_, last_height_, 1);
+            }
+
             if (need_realloc) {
+                LOGI("Decoder: coded=%dx%d display=%dx%d fmt=%d", w, h, display_w, display_h, fmt);
+
                 if (sws_ctx_) {
                     sws_freeContext(sws_ctx_);
                     sws_ctx_ = nullptr;
@@ -173,20 +187,28 @@ bool H264Decoder::decode(const uint8_t *h264_data, size_t h264_size) {
 
                 frame_rgb_->width = w;
                 frame_rgb_->height = h;
-                frame_rgb_->format = AV_PIX_FMT_BGR24;
+                frame_rgb_->format = AV_PIX_FMT_BGRA;
 
-                if (frame_rgb_->data[0])
-                    av_freep(&frame_rgb_->data[0]);
+                // Allocate BGRA buffer in image_.data and point frame_rgb_ to it
+                // This eliminates the per-frame memcpy: sws_scale writes directly into image_.data
+                int buf_size = av_image_get_buffer_size(AV_PIX_FMT_BGRA, w, h, 1);
+                if (buf_size < 0) {
+                    LOGE("av_image_get_buffer_size failed for %dx%d", w, h);
+                    break;
+                }
+                size_t needed = static_cast<size_t>(buf_size);
+                if (image_.data.capacity() < needed) image_.data.reserve(needed);
+                image_.data.resize(needed);
 
-                int img_ret = av_image_alloc(frame_rgb_->data, frame_rgb_->linesize,
-                                              w, h, AV_PIX_FMT_BGR24, 4);
-                if (img_ret < 0) {
-                    LOGE("av_image_alloc failed for %dx%d ret=%d", w, h, img_ret);
+                int fill_ret = av_image_fill_arrays(frame_rgb_->data, frame_rgb_->linesize,
+                                                     image_.data.data(), AV_PIX_FMT_BGRA, w, h, 1);
+                if (fill_ret < 0) {
+                    LOGE("av_image_fill_arrays failed for %dx%d ret=%d", w, h, fill_ret);
                     break;
                 }
 
                 sws_ctx_ = sws_getContext(w, h, static_cast<AVPixelFormat>(fmt),
-                                          w, h, AV_PIX_FMT_BGR24,
+                                          w, h, AV_PIX_FMT_BGRA,
                                           SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
                 if (!sws_ctx_) {
                     LOGE("sws_getContext failed for %dx%d fmt=%d", w, h, fmt);
@@ -197,10 +219,11 @@ bool H264Decoder::decode(const uint8_t *h264_data, size_t h264_size) {
                 last_width_ = w;
                 last_height_ = h;
                 last_pix_fmt_ = fmt;
-                rgb_buf_size_ = static_cast<size_t>(frame_rgb_->linesize[0]) * h;
+                rgb_buf_size_ = needed;
                 LOGI("Decoder: %dx%d pix_fmt=%d rgb_buf=%zu", w, h, fmt, rgb_buf_size_);
             }
 
+            // sws_scale writes directly into image_.data via frame_rgb_->data[0]
             sws_scale(sws_ctx_,
                       frame_->data, frame_->linesize, 0, h,
                       frame_rgb_->data, frame_rgb_->linesize);
@@ -208,9 +231,7 @@ bool H264Decoder::decode(const uint8_t *h264_data, size_t h264_size) {
             image_.width = static_cast<uint32_t>(display_w);
             image_.height = static_cast<uint32_t>(display_h);
             image_.stride = frame_rgb_->linesize[0];
-            decode_buffer_.resize(rgb_buf_size_);
-            memcpy(decode_buffer_.data(), frame_rgb_->data[0], rgb_buf_size_);
-            image_.data.swap(decode_buffer_);
+            // No memcpy needed - data is already in image_.data
             got_frame = true;
         }
     }

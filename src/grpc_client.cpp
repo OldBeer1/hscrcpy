@@ -177,7 +177,10 @@ static Http2Settings parse_settings(const uint8_t *payload, size_t len) {
     return s;
 }
 
-static bool extract_h264_from_payload_map(const uint8_t *map_data, size_t map_len, std::vector<uint8_t> &out_h264) {
+// Zero-copy H264 extraction: returns pointer+length into the source buffer
+struct H264Ref { const uint8_t *data; size_t size; };
+
+static bool extract_h264_ref_from_payload_map(const uint8_t *map_data, size_t map_len, H264Ref &out) {
     size_t pos = 0;
     while (pos < map_len) {
         uint8_t tag = map_data[pos++];
@@ -196,32 +199,27 @@ static bool extract_h264_from_payload_map(const uint8_t *map_data, size_t map_le
             return val;
         };
 
-        auto read_bytes_into = [&](std::vector<uint8_t> &out) {
-            uint64_t len = read_varint();
-            out.assign(map_data + pos, map_data + pos + len);
-            pos += len;
-        };
-
         if (wtype == 2) {
-            std::vector<uint8_t> data;
-            read_bytes_into(data);
-            if (fnum == 1) {
-                // skip field 1 (ParamKey)
-                
-            } else if (fnum == 2) {
+            uint64_t len = read_varint();
+            const uint8_t *field_data = map_data + pos;
+            pos += len;
+
+            if (fnum == 2) {
+                // Parse ParamValue sub-message for field 5 (H264 data)
                 size_t vp = 0;
-                while (vp < data.size()) {
-                    uint8_t vtag = data[vp++];
+                while (vp < len) {
+                    uint8_t vtag = field_data[vp++];
                     uint8_t vfnum = vtag >> 3;
                     uint8_t vwtype = vtag & 0x07;
                     if (vwtype == 0) {
                         uint64_t vval = 0; uint32_t shift = 0;
-                        while (vp < data.size()) { uint8_t b = data[vp++]; vval |= (uint64_t)(b & 0x7F) << shift; shift += 7; if (!(b & 0x80)) break; }
+                        while (vp < len) { uint8_t b = field_data[vp++]; vval |= (uint64_t)(b & 0x7F) << shift; shift += 7; if (!(b & 0x80)) break; }
                     } else if (vwtype == 2) {
                         uint64_t vlen = 0; uint32_t shift = 0;
-                        while (vp < data.size()) { uint8_t b = data[vp++]; vlen |= (uint64_t)(b & 0x7F) << shift; shift += 7; if (!(b & 0x80)) break; }
-                        if (vfnum == 5 && vp + vlen <= data.size()) {
-                            out_h264.assign(data.begin() + vp, data.begin() + vp + vlen);
+                        while (vp < len) { uint8_t b = field_data[vp++]; vlen |= (uint64_t)(b & 0x7F) << shift; shift += 7; if (!(b & 0x80)) break; }
+                        if (vfnum == 5 && vp + vlen <= len) {
+                            out.data = field_data + vp;
+                            out.size = static_cast<size_t>(vlen);
                             return true;
                         }
                         vp += vlen;
@@ -230,6 +228,7 @@ static bool extract_h264_from_payload_map(const uint8_t *map_data, size_t map_le
                     else break;
                 }
             }
+            // fnum == 1 (ParamKey): skip
         } else if (wtype == 0) {
             read_varint();
         } else if (wtype == 1) { pos += 8; }
@@ -239,7 +238,7 @@ static bool extract_h264_from_payload_map(const uint8_t *map_data, size_t map_le
     return false;
 }
 
-static bool extract_h264_from_reply(const uint8_t *pb, size_t pb_len, std::vector<uint8_t> &out_h264) {
+static bool extract_h264_ref_from_reply(const uint8_t *pb, size_t pb_len, H264Ref &out) {
     size_t pos = 0;
     while (pos < pb_len) {
         uint8_t tag = pb[pos++];
@@ -258,17 +257,13 @@ static bool extract_h264_from_reply(const uint8_t *pb, size_t pb_len, std::vecto
             return val;
         };
 
-        auto read_bytes_into = [&](std::vector<uint8_t> &out) {
-            uint64_t len = read_varint();
-            out.assign(pb + pos, pb + pos + len);
-            pos += len;
-        };
-
         if (wire_type == 2) {
-            std::vector<uint8_t> data;
-            read_bytes_into(data);
+            uint64_t len = read_varint();
+            const uint8_t *field_data = pb + pos;
+            pos += len;
+
             if (field_num == 3) {
-                if (extract_h264_from_payload_map(data.data(), data.size(), out_h264)) {
+                if (extract_h264_ref_from_payload_map(field_data, static_cast<size_t>(len), out)) {
                     return true;
                 }
             }
@@ -406,7 +401,7 @@ void GrpcClient::disconnect() {
     connected_ = false;
 }
 
-bool GrpcClient::start_streaming(const std::function<void(const std::vector<uint8_t> &)> &on_h264_frame) {
+bool GrpcClient::start_streaming(const std::function<void(const uint8_t *, size_t)> &on_h264_frame) {
     if (streaming_) return true;
     if (!connected_) return false;
 
@@ -476,8 +471,8 @@ bool GrpcClient::request_idr_frame() {
 void GrpcClient::streaming_loop() {
     LOGI("Streaming loop started, sock=%d, streaming=%d, connected=%d", sock_, (int)streaming_.load(), (int)connected_.load());
 
-    if (recv_buffer_.size() < 4 * 1024 * 1024)
-        recv_buffer_.resize(4 * 1024 * 1024);
+    if (recv_buffer_.size() < 256 * 1024)
+        recv_buffer_.resize(256 * 1024);
     size_t buf_used = 0;
 
     if (!leftover_buf_.empty()) {
@@ -590,10 +585,10 @@ void GrpcClient::streaming_loop() {
                         size_t needed = 5 + grpc_expected_len;
                         if (avail < needed) break;
 
-                        h264_scratch_.clear();
-                        if (extract_h264_from_reply(grpc_msg_buf.data() + grpc_consumed + 5, grpc_expected_len, h264_scratch_)) {
-                            if (!h264_scratch_.empty() && on_frame_) {
-                                on_frame_(h264_scratch_);
+                        H264Ref h264_ref;
+                        if (extract_h264_ref_from_reply(grpc_msg_buf.data() + grpc_consumed + 5, grpc_expected_len, h264_ref)) {
+                            if (h264_ref.size > 0 && on_frame_) {
+                                on_frame_(h264_ref.data, h264_ref.size);
                                 got_first_data = true;
                                 consecutive_rst_on_idr = 0;
                             }
@@ -662,6 +657,15 @@ void GrpcClient::streaming_loop() {
                 memmove(recv_buffer_.data(), recv_buffer_.data() + pos, buf_used - pos);
             }
             buf_used -= pos;
+        }
+
+        // Grow recv buffer if nearly full (allow at least 64KB for next recv)
+        if (recv_buffer_.size() - buf_used < 64 * 1024) {
+            size_t new_size = recv_buffer_.size() * 2;
+            if (new_size > 4 * 1024 * 1024) new_size = 4 * 1024 * 1024;
+            if (new_size > recv_buffer_.size()) {
+                recv_buffer_.resize(new_size);
+            }
         }
     }
 

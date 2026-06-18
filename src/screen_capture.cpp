@@ -122,17 +122,29 @@ std::string ScreenCapture::find_matching_so_with_md5(const std::string &device_m
             "libscrcpy_server3.z.so",
         };
     } else {
+        // For uitest >= 6.0.2.1, always prefer the latest SO version first.
+        // MD5 match is unreliable because the device may have an old incompatible SO
+        // from a previous session (e.g. 6.3.1 SO cannot start extension on uitest 6.0.2.x).
         candidates = {
-            "libscrcpy_server_unix_6.3.1-20260113.z.so",
+            "libscrcpy_server_unix_6.6-20260418.z.so",
+            "libscrcpy_server_unix_6.5-20260313.z.so",
             "libscrcpy_server_unix_6.4-20260113.z.so",
+            "libscrcpy_server_unix_6.3.1-20260113.z.so",
             "libscrcpy_server_5.10-20260114.z.so",
         };
     }
 
+    // Select by version priority (highest first).
+    // Use MD5 only to skip re-pushing if the device already has the exact same file.
     for (auto &name : candidates) {
         std::string path = server_dir_ + "\\" + name;
         if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            LOGI("Selected server SO: %s (by version priority)", name.c_str());
+            std::string local_md5 = get_local_so_md5(path);
+            if (!device_md5.empty() && local_md5 == device_md5) {
+                LOGI("Selected server SO: %s (device already has this version, skip push)", name.c_str());
+            } else {
+                LOGI("Selected server SO: %s (by version priority)", name.c_str());
+            }
             return path;
         }
     }
@@ -202,10 +214,12 @@ std::string ScreenCapture::find_matching_agent_so() {
 
 std::string ScreenCapture::build_extension_cmd() const {
     char cmd[512];
+    // Always include -p 5000: some devices (API 24+) require it for the extension to start,
+    // even when using abstract socket. HOScrcpy also uses both simultaneously.
     if (use_abstract_socket_) {
         snprintf(cmd, sizeof(cmd),
                  "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so "
-                 "-scale %d -frameRate %d -bitRate %d %s -screenId 0 -encodeType 0 "
+                 "-scale %d -frameRate %d -bitRate %d -p 5000 %s -screenId 0 -encodeType 0 "
                  "-iFrameInterval %d -repeatInterval %d",
                  config_.scale, config_.frame_rate, config_.bit_rate,
                  kGrpcSocketName, config_.iframe_interval,
@@ -595,6 +609,12 @@ bool ScreenCapture::start() {
     if (mode_ == CaptureMode::kGrpcStream && grpc_ok) {
         running_ = true;
         got_stream_data_ = false;
+        // Initialize frame pool (3-buffer) - lazy allocation:
+        // actual memory is allocated on first decode via swap with decoder's image_
+        for (auto &f : frame_pool_) {
+            f = std::make_shared<DecodedImage>();
+        }
+        pool_idx_ = 0;
         if (!frame_event_) frame_event_ = CreateEventA(NULL, FALSE, FALSE, NULL);
         decode_thread_ = std::thread(&ScreenCapture::decode_loop, this);
         thread_ = std::thread(&ScreenCapture::grpc_stream_loop, this);
@@ -630,6 +650,11 @@ bool ScreenCapture::start() {
     }
 
     running_ = true;
+    // Initialize frame pool (3-buffer) - lazy allocation
+    for (auto &f : frame_pool_) {
+        f = std::make_shared<DecodedImage>();
+    }
+    pool_idx_ = 0;
     if (!frame_event_) frame_event_ = CreateEventA(NULL, FALSE, FALSE, NULL);
     if (mode_ == CaptureMode::kGrpcStream) {
         thread_ = std::thread(&ScreenCapture::grpc_stream_loop, this);
@@ -740,14 +765,14 @@ bool ScreenCapture::reconnect_grpc_stream() {
 void ScreenCapture::grpc_stream_loop() {
     LOGI("gRPC stream loop started");
 
-    auto on_frame = [this](const std::vector<uint8_t> &h264_data) {
+    auto on_frame = [this](const uint8_t *data, size_t size) {
         got_stream_data_ = true;
         {
             std::lock_guard<std::mutex> lock(h264_queue_mutex_);
             if (h264_queue_.size() >= max_h264_queue_size_) {
                 h264_queue_.pop_front();
             }
-            h264_queue_.push_back(std::make_shared<std::vector<uint8_t>>(h264_data));
+            h264_queue_.push_back(std::make_shared<std::vector<uint8_t>>(data, data + size));
         }
         h264_queue_cv_.notify_one();
     };
@@ -824,6 +849,35 @@ void ScreenCapture::grpc_stream_loop() {
     LOGI("gRPC stream loop ended, frames: %llu", (unsigned long long)frame_count_.load());
 }
 
+static bool is_idr_frame(const uint8_t *data, size_t size) {
+    // Scan for H264 NAL start codes and check for IDR (type 5)
+    size_t pos = 0;
+    while (pos + 3 < size) {
+        if (data[pos] == 0 && data[pos + 1] == 0) {
+            if (data[pos + 2] == 1) {
+                // 3-byte start code: 0x00 0x00 0x01
+                if (pos + 3 < size) {
+                    uint8_t nal_type = data[pos + 3] & 0x1F;
+                    if (nal_type == 5) return true;  // IDR
+                    if (nal_type == 1) return false;  // Non-IDR slice (P/B frame)
+                }
+                pos += 4;
+                continue;
+            }
+            if (pos + 4 < size && data[pos + 2] == 0 && data[pos + 3] == 1) {
+                // 4-byte start code: 0x00 0x00 0x00 0x01
+                uint8_t nal_type = data[pos + 4] & 0x1F;
+                if (nal_type == 5) return true;  // IDR
+                if (nal_type == 1) return false;  // Non-IDR slice (P/B frame)
+                pos += 5;
+                continue;
+            }
+        }
+        pos++;
+    }
+    return false;
+}
+
 void ScreenCapture::decode_loop() {
     LOGI("Decode loop started");
 
@@ -836,6 +890,28 @@ void ScreenCapture::decode_loop() {
             });
             if (!running_ && h264_queue_.empty()) break;
             if (h264_queue_.empty()) continue;
+
+            // Frame skip: when queue is backlogged, skip to the latest IDR frame
+            if (h264_queue_.size() > 3) {
+                ssize_t target = -1;
+                for (ssize_t i = static_cast<ssize_t>(h264_queue_.size()) - 1; i >= 0; i--) {
+                    if (is_idr_frame(h264_queue_[i]->data(), h264_queue_[i]->size())) {
+                        target = i;
+                        break;
+                    }
+                }
+                if (target > 0) {
+                    LOGI("Frame skip: dropping %zu queued frames, jumping to IDR at index %zd",
+                         static_cast<size_t>(target), target);
+                    h264_queue_.erase(h264_queue_.begin(), h264_queue_.begin() + target);
+                } else if (h264_queue_.size() > 5) {
+                    // No IDR found but queue is very backlogged - keep last frame only
+                    LOGI("Frame skip: no IDR found, dropping %zu queued frames",
+                         h264_queue_.size() - 1);
+                    h264_queue_.erase(h264_queue_.begin(), h264_queue_.end() - 1);
+                }
+            }
+
             h264_data = std::move(h264_queue_.front());
             h264_queue_.pop_front();
         }
@@ -845,12 +921,19 @@ void ScreenCapture::decode_loop() {
             auto &img = decoder_.image();
             if (img.width > 0 && img.height > 0) {
                 uint32_t w = img.width, h = img.height;
-                auto frame = std::make_shared<DecodedImage>();
+
+                // Use pre-allocated frame pool to avoid per-frame make_shared
+                auto &frame = frame_pool_[pool_idx_];
+                // If the pool slot is still held by the UI thread, fall back to make_shared
+                if (frame.use_count() > 1) {
+                    frame = std::make_shared<DecodedImage>();
+                }
                 std::swap(*frame, decoder_.image_ref());
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     latest_frame_ = frame;
                 }
+                pool_idx_ = (pool_idx_ + 1) % 3;
                 if (w != width_.load() || h != height_.load()) {
                     width_ = w;
                     height_ = h;
@@ -858,6 +941,7 @@ void ScreenCapture::decode_loop() {
                 }
                 frame_count_++;
                 if (frame_event_) SetEvent(frame_event_);
+                if (notify_hwnd_) PostMessageA(notify_hwnd_, WM_USER + 10, 0, 0);
             }
         } else {
             static int decode_fail_count = 0;

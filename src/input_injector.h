@@ -67,6 +67,7 @@ private:
     std::mutex socket_mutex_;
     std::atomic<bool> reconnect_running_{false};
     std::thread reconnect_thread_;
+    std::atomic<int> consecutive_send_failures_{0};
 
     std::queue<std::function<void()>> task_queue_;
     std::mutex task_mutex_;

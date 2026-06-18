@@ -48,13 +48,13 @@ bool JpegDecoder::decode(const uint8_t *jpeg_data, size_t jpeg_size) {
     if (image_.width != w || image_.height != h) {
         image_.width  = w;
         image_.height = h;
-        image_.stride = ((w * 3 + 3) / 4) * 4;
+        image_.stride = w * 4;  // BGRA = 4 bytes/pixel
         image_.data.resize(image_.stride * h);
     }
 
     Gdiplus::BitmapData bd;
     Gdiplus::Rect rect(0, 0, w, h);
-    if (bitmap->LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat24bppRGB, &bd) != Gdiplus::Ok) {
+    if (bitmap->LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppRGB, &bd) != Gdiplus::Ok) {
         delete bitmap;
         return false;
     }
@@ -62,7 +62,7 @@ bool JpegDecoder::decode(const uint8_t *jpeg_data, size_t jpeg_size) {
     for (UINT y = 0; y < h; y++) {
         auto *src = static_cast<uint8_t *>(bd.Scan0) + y * bd.Stride;
         auto *dst = image_.data.data() + y * image_.stride;
-        memcpy(dst, src, w * 3);
+        memcpy(dst, src, w * 4);
     }
 
     bitmap->UnlockBits(&bd);

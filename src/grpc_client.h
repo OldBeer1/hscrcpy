@@ -32,7 +32,7 @@ public:
     bool is_connected() const { return connected_; }
     bool is_streaming_active() const { return streaming_; }
 
-    bool start_streaming(const std::function<void(const std::vector<uint8_t> &)> &on_h264_frame);
+    bool start_streaming(const std::function<void(const uint8_t *, size_t)> &on_h264_frame);
     void stop_streaming();
     bool request_idr_frame();
 
@@ -50,11 +50,10 @@ private:
     std::atomic<bool> connected_{false};
     std::atomic<bool> streaming_{false};
     std::thread stream_thread_;
-    std::function<void(const std::vector<uint8_t> &)> on_frame_;
+    std::function<void(const uint8_t *, size_t)> on_frame_;
     std::mutex mutex_;
     std::vector<uint8_t> recv_buffer_;
     std::vector<uint8_t> leftover_buf_;
-    std::vector<uint8_t> h264_scratch_;  // pre-allocated to avoid per-frame allocation
     uint32_t server_window_size_ = 65535;
     bool idr_requested_ = false;
     uint32_t next_stream_id_ = 3;

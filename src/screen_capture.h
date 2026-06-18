@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <array>
 #include <mutex>
 #include <atomic>
 #include <thread>
@@ -52,6 +53,7 @@ public:
     uint16_t local_base_port() const { return local_base_port_; }
     HANDLE frame_event() const { return frame_event_; }
     const CaptureConfig &config() const { return config_; }
+    void set_notify_hwnd(HWND h) { notify_hwnd_ = h; }
 
 private:
     bool setup_grpc_stream(bool force_restart = false);
@@ -100,7 +102,12 @@ private:
     std::string uitest_version_;
     std::string server_dir_;
     int max_grpc_reconnect_ = 3;
+    HWND notify_hwnd_ = nullptr;
     std::atomic<bool> reconnecting_{false};
+
+    // Pre-allocated frame pool (3-buffer) to avoid per-frame make_shared
+    std::array<std::shared_ptr<DecodedImage>, 3> frame_pool_;
+    int pool_idx_ = 0;
 };
 
 } // namespace hscrcpy

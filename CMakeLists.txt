@@ -87,7 +87,7 @@ message(STATUS "FFmpeg: OK (${AVCODEC_LIB})")
 # Windows libraries
 # ============================================
 target_link_libraries(hscrcpy
-    gdi32 gdiplus ws2_32 shell32 user32 kernel32 ole32
+    gdi32 gdiplus ws2_32 shell32 user32 kernel32 ole32 d2d1
 )
 
 target_compile_definitions(hscrcpy PRIVATE _CRT_SECURE_NO_WARNINGS)

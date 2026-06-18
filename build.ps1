@@ -144,7 +144,7 @@ if (-not (Test-Path "build")) { New-Item -ItemType Directory -Path "build" | Out
 $env:Path = "$mingwDir\bin;$toolchainPath\usr\bin;$env:Path"
 $env:MSYSTEM = if ($mingwSys -eq "ucrt64") { "UCRT64" } else { "MINGW64" }
 
-& $cmake -B build -S . -G "MSYS Makefiles" -DCMAKE_C_COMPILER="$gcc" -DCMAKE_CXX_COMPILER="$gxx"
+& $cmake -B build -S . -G "MSYS Makefiles" -DCMAKE_CXX_COMPILER="$gxx"
 if ($LASTEXITCODE -ne 0) { Write-Err "CMake configuration failed!" }
 Write-Ok "CMake configured"
 
