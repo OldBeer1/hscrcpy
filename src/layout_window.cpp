@@ -2,7 +2,6 @@
 #include "log.h"
 #include <windowsx.h>
 #include <nlohmann/json.hpp>
-#include <commctrl.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -11,7 +10,8 @@ namespace hscrcpy {
 
 using json = nlohmann::json;
 
-// Helper: UTF-8 string to wide string
+// ── Helpers ──────────────────────────────────────────────
+
 static std::wstring utf8_to_wide(const std::string &s) {
     if (s.empty()) return L"";
     int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, NULL, 0);
@@ -21,7 +21,6 @@ static std::wstring utf8_to_wide(const std::string &s) {
     return ws;
 }
 
-// Helper: wide string to UTF-8
 static std::string wide_to_utf8(const std::wstring &ws) {
     if (ws.empty()) return "";
     int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, NULL, 0, NULL, NULL);
@@ -30,6 +29,12 @@ static std::string wide_to_utf8(const std::wstring &ws) {
     WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, &s[0], len, NULL, NULL);
     return s;
 }
+
+static void parse_bounds(const std::string &s, int &l, int &t, int &r, int &b) {
+    if (!s.empty()) sscanf(s.c_str(), "[%d,%d][%d,%d]", &l, &t, &r, &b);
+}
+
+// ── Statics ──────────────────────────────────────────────
 
 HWND LayoutWindow::g_hwnd = nullptr;
 HWND LayoutWindow::g_tree = nullptr;
@@ -46,13 +51,13 @@ LayoutWindow::OnNodeSelected LayoutWindow::g_on_select;
 LayoutWindow::OnRefresh LayoutWindow::g_on_refresh;
 std::string LayoutWindow::g_json;
 int LayoutWindow::g_layout_w = 420;
-
 int LayoutWindow::g_hl_left = 0, LayoutWindow::g_hl_top = 0;
 int LayoutWindow::g_hl_right = 0, LayoutWindow::g_hl_bottom = 0;
 bool LayoutWindow::g_has_hl = false;
 
-
 static const wchar_t *LAYOUT_CLASS_W = L"HScrcpyLayoutClass";
+
+// ── Public API ───────────────────────────────────────────
 
 void LayoutWindow::create(HINSTANCE inst, HWND parent, int width) {
     g_inst = inst;
@@ -66,7 +71,6 @@ void LayoutWindow::create(HINSTANCE inst, HWND parent, int width) {
 
         WNDCLASSEXW wc = {};
         wc.cbSize = sizeof(wc);
-        wc.style = CS_HREDRAW | CS_VREDRAW;
         wc.lpfnWndProc = WndProc;
         wc.hInstance = inst;
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -75,37 +79,6 @@ void LayoutWindow::create(HINSTANCE inst, HWND parent, int width) {
         RegisterClassExW(&wc);
         registered = true;
     }
-}
-
-void LayoutWindow::show(const std::string &json_str, OnNodeSelected on_select, OnRefresh on_refresh) {
-    g_json = json_str;
-    g_on_select = on_select;
-    g_on_refresh = on_refresh;
-
-    if (!g_hwnd) {
-        g_hwnd = CreateWindowExW(0, LAYOUT_CLASS_W, L"",
-                                  WS_CHILD | WS_BORDER | WS_CLIPCHILDREN,
-                                  0, 0, g_layout_w, 100, g_parent, NULL, g_inst, NULL);
-    }
-
-    try {
-        json j = json::parse(g_json);
-        g_root = parse_json_to_node(j);
-    } catch (const std::exception &e) {
-        LOGE("Failed to parse layout JSON: %s", e.what());
-        if (g_status_label) SetWindowTextW(g_status_label, L"Parse error");
-        return;
-    }
-
-    TreeView_DeleteAllItems(g_tree);
-    ListView_DeleteAllItems(g_list);
-
-    if (!g_root.type.empty()) {
-        build_tree(TVI_ROOT, g_root);
-    }
-
-    if (g_status_label) SetWindowTextW(g_status_label, L"UI Layout");
-    ShowWindow(g_hwnd, SW_SHOW);
 }
 
 void LayoutWindow::show(OnNodeSelected on_select, OnRefresh on_refresh) {
@@ -141,60 +114,41 @@ bool LayoutWindow::is_visible() {
     return g_hwnd && IsWindowVisible(g_hwnd);
 }
 
-HWND LayoutWindow::hwnd() {
-    return g_hwnd;
-}
-
-int LayoutWindow::panel_width() {
-    return g_layout_w;
-}
-
-void LayoutWindow::set_panel_width(int w) {
-    g_layout_w = w;
-}
+HWND LayoutWindow::hwnd() { return g_hwnd; }
+int LayoutWindow::panel_width() { return g_layout_w; }
+void LayoutWindow::set_panel_width(int w) { g_layout_w = w; }
 
 void LayoutWindow::reposition(int x, int y, int w, int h) {
-    if (g_hwnd) {
-        MoveWindow(g_hwnd, x, y, w, h, TRUE);
-    }
+    if (g_hwnd) MoveWindow(g_hwnd, x, y, w, h, TRUE);
 }
 
 bool LayoutWindow::get_highlight_bounds(int &left, int &top, int &right, int &bottom) {
     if (!g_has_hl) return false;
-    left = g_hl_left;
-    top = g_hl_top;
-    right = g_hl_right;
-    bottom = g_hl_bottom;
+    left = g_hl_left; top = g_hl_top;
+    right = g_hl_right; bottom = g_hl_bottom;
     return true;
 }
 
-void LayoutWindow::clear_highlight() {
-    g_has_hl = false;
-}
+void LayoutWindow::clear_highlight() { g_has_hl = false; }
+
+// ── Data model ───────────────────────────────────────────
 
 LayoutNode LayoutWindow::parse_json_to_node(const nlohmann::json &j) {
     LayoutNode node;
 
     if (j.contains("attributes") && j["attributes"].is_object()) {
-        auto &attr = j["attributes"];
-        if (attr.contains("type") && attr["type"].is_string()) node.type = attr["type"].get<std::string>();
-        if (attr.contains("text") && attr["text"].is_string()) node.text = attr["text"].get<std::string>();
-        if (attr.contains("id") && attr["id"].is_string()) node.id = attr["id"].get<std::string>();
-        if (attr.contains("key") && attr["key"].is_string()) node.key = attr["key"].get<std::string>();
-        if (attr.contains("description") && attr["description"].is_string()) node.desc = attr["description"].get<std::string>();
-        if (attr.contains("bounds") && attr["bounds"].is_string()) {
-            node.bounds = attr["bounds"].get<std::string>();
-            sscanf(node.bounds.c_str(), "[%d,%d][%d,%d]",
-                   &node.bounds_left, &node.bounds_top, &node.bounds_right, &node.bounds_bottom);
-        }
-        if (attr.contains("origBounds") && attr["origBounds"].is_string()) {
-            node.orig_bounds = attr["origBounds"].get<std::string>();
-            sscanf(node.orig_bounds.c_str(), "[%d,%d][%d,%d]",
-                   &node.orig_left, &node.orig_top, &node.orig_right, &node.orig_bottom);
+        for (auto it = j["attributes"].begin(); it != j["attributes"].end(); ++it) {
+            if (it.value().is_string()) {
+                node.attrs[it.key()] = it.value().get<std::string>();
+            }
         }
     }
 
-    if (node.type.empty()) node.type = "Root";
+    // Parse bounds coordinates for highlight
+    parse_bounds(node.attr("bounds"), node.bounds_left, node.bounds_top, node.bounds_right, node.bounds_bottom);
+    parse_bounds(node.attr("origBounds"), node.orig_left, node.orig_top, node.orig_right, node.orig_bottom);
+
+    if (node.attr("type").empty()) node.attrs["type"] = "Root";
 
     if (j.contains("children") && j["children"].is_array()) {
         for (auto &child : j["children"]) {
@@ -205,6 +159,8 @@ LayoutNode LayoutWindow::parse_json_to_node(const nlohmann::json &j) {
     return node;
 }
 
+// ── Tree building ────────────────────────────────────────
+
 void LayoutWindow::build_tree(HTREEITEM parent, LayoutNode &node) {
     TVINSERTSTRUCTW ins = {};
     ins.hParent = parent;
@@ -212,12 +168,10 @@ void LayoutWindow::build_tree(HTREEITEM parent, LayoutNode &node) {
     ins.item.mask = TVIF_TEXT | TVIF_PARAM | TVIF_CHILDREN;
     ins.item.cChildren = node.children.empty() ? 0 : 1;
 
-    std::wstring wlabel;
-    if (!node.text.empty()) {
-        wlabel = utf8_to_wide(node.type) + L" \"" + utf8_to_wide(node.text) + L"\"";
-    } else {
-        wlabel = utf8_to_wide(node.type);
-    }
+    const auto &type = node.attr("type");
+    const auto &text = node.attr("text");
+    std::wstring wlabel = text.empty() ? utf8_to_wide(type)
+                                       : utf8_to_wide(type) + L" \"" + utf8_to_wide(text) + L"\"";
     ins.item.pszText = const_cast<LPWSTR>(wlabel.c_str());
     ins.item.lParam = reinterpret_cast<LPARAM>(&node);
 
@@ -238,6 +192,8 @@ LayoutNode *LayoutWindow::find_node_by_tree_item(HTREEITEM item, LayoutNode *roo
     return nullptr;
 }
 
+// ── Node selection ───────────────────────────────────────
+
 void LayoutWindow::on_tree_select() {
     HTREEITEM sel = TreeView_GetSelection(g_tree);
     if (!sel) return;
@@ -247,7 +203,6 @@ void LayoutWindow::on_tree_select() {
 
     show_node_props(node);
 
-    // Use bounds (not origBounds) for highlight — bounds matches the visible screen area
     int left = node->bounds_left, top = node->bounds_top;
     int right = node->bounds_right, bottom = node->bounds_bottom;
 
@@ -262,15 +217,17 @@ void LayoutWindow::on_tree_select() {
     }
 }
 
+// ── Property display ─────────────────────────────────────
+
 void LayoutWindow::show_node_props(const LayoutNode *node) {
     ListView_DeleteAllItems(g_list);
 
     auto add_prop = [&](const wchar_t *name, const std::string &val) {
+        if (val.empty()) return;
         std::wstring wval = utf8_to_wide(val);
         LVITEMW lvi = {};
         lvi.mask = LVIF_TEXT;
         lvi.iItem = ListView_GetItemCount(g_list);
-        lvi.iSubItem = 0;
         lvi.pszText = const_cast<LPWSTR>(name);
         int idx = (int)SendMessageW(g_list, LVM_INSERTITEMW, 0, (LPARAM)&lvi);
         LVITEMW lvi2 = {};
@@ -279,13 +236,15 @@ void LayoutWindow::show_node_props(const LayoutNode *node) {
         SendMessageW(g_list, LVM_SETITEMTEXTW, idx, (LPARAM)&lvi2);
     };
 
-    add_prop(L"type", node->type);
-    add_prop(L"text", node->text);
-    add_prop(L"id", node->id);
-    add_prop(L"key", node->key);
-    add_prop(L"description", node->desc);
-    add_prop(L"bounds", node->bounds);
-    if (!node->orig_bounds.empty()) add_prop(L"origBounds", node->orig_bounds);
+    // Fixed-order priority attributes
+    static const char *priority[] = {
+        "type", "text", "id", "key", "description", "bounds", "origBounds", nullptr
+    };
+    for (int i = 0; priority[i]; i++) {
+        add_prop(utf8_to_wide(priority[i]).c_str(), node->attr(priority[i]));
+    }
+
+    // Computed: center
     if (node->bounds_right > node->bounds_left) {
         char pos[64];
         snprintf(pos, sizeof(pos), "%d, %d",
@@ -293,8 +252,65 @@ void LayoutWindow::show_node_props(const LayoutNode *node) {
                  (node->bounds_top + node->bounds_bottom) / 2);
         add_prop(L"center", std::string(pos));
     }
+
+    // Computed: children count
     add_prop(L"children", std::to_string(node->children.size()));
+
+    // Remaining attributes not shown above
+    for (auto &kv : node->attrs) {
+        bool is_priority = false;
+        for (int i = 0; priority[i]; i++) {
+            if (kv.first == priority[i]) { is_priority = true; break; }
+        }
+        if (!is_priority) {
+            add_prop(utf8_to_wide(kv.first).c_str(), kv.second);
+        }
+    }
 }
+
+// ── Clipboard helpers ────────────────────────────────────
+
+void LayoutWindow::copy_to_clipboard(HWND hwnd, const std::wstring &text) {
+    if (text.empty()) return;
+    if (!OpenClipboard(hwnd)) return;
+    EmptyClipboard();
+    size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (h) {
+        memcpy(GlobalLock(h), text.c_str(), bytes);
+        GlobalUnlock(h);
+        SetClipboardData(CF_UNICODETEXT, h);
+    }
+    CloseClipboard();
+}
+
+int LayoutWindow::get_selected_list_item() {
+    return ListView_GetNextItem(g_list, -1, LVNI_SELECTED);
+}
+
+void LayoutWindow::copy_list_value(HWND hwnd, int item_idx) {
+    if (item_idx < 0) return;
+    wchar_t wval[512] = {};
+    LVITEMW lvi = {};
+    lvi.iSubItem = 1;
+    lvi.pszText = wval;
+    lvi.cchTextMax = 512;
+    SendMessageW(g_list, LVM_GETITEMTEXTW, item_idx, (LPARAM)&lvi);
+    copy_to_clipboard(hwnd, wval);
+}
+
+void LayoutWindow::copy_list_property(HWND hwnd, int item_idx) {
+    if (item_idx < 0) return;
+    wchar_t wname[256] = {}, wval[512] = {};
+    LVITEMW lvi = {};
+    lvi.iSubItem = 0; lvi.pszText = wname; lvi.cchTextMax = 256;
+    SendMessageW(g_list, LVM_GETITEMTEXTW, item_idx, (LPARAM)&lvi);
+    lvi.iSubItem = 1; lvi.pszText = wval; lvi.cchTextMax = 512;
+    SendMessageW(g_list, LVM_GETITEMTEXTW, item_idx, (LPARAM)&lvi);
+    copy_to_clipboard(hwnd, std::wstring(wname) + L": " + wval);
+}
+
+// ── Refresh / search ─────────────────────────────────────
 
 void LayoutWindow::refresh_layout() {
     if (!g_on_refresh) return;
@@ -310,18 +326,23 @@ DWORD WINAPI LayoutWindow::DumpThreadProc(LPVOID) {
         PostMessageW(g_hwnd, WM_USER + 100, 0, 1);
         return 0;
     }
-
     g_json = json_str;
     PostMessageW(g_hwnd, WM_USER + 100, 0, 0);
     return 0;
 }
 
-// Flatten tree nodes in depth-first order for search
 static void flatten_nodes(LayoutNode &root, std::vector<LayoutNode*> &out) {
     out.push_back(&root);
-    for (auto &child : root.children) {
-        flatten_nodes(child, out);
+    for (auto &child : root.children) flatten_nodes(child, out);
+}
+
+static bool node_matches(const LayoutNode &node, const std::string &query) {
+    for (auto &kv : node.attrs) {
+        if (kv.first.find(query) != std::string::npos ||
+            kv.second.find(query) != std::string::npos)
+            return true;
     }
+    return false;
 }
 
 void LayoutWindow::search_tree() {
@@ -330,12 +351,11 @@ void LayoutWindow::search_tree() {
     std::string query = wide_to_utf8(wbuf);
     if (query.empty()) return;
 
-    // Flatten all nodes
     std::vector<LayoutNode*> all;
     flatten_nodes(g_root, all);
     if (all.empty()) return;
 
-    // Find current selection index
+    // Find start index from current selection
     HTREEITEM sel = TreeView_GetSelection(g_tree);
     LayoutNode *start_node = sel ? find_node_by_tree_item(sel, &g_root) : nullptr;
     int start_idx = 0;
@@ -345,34 +365,31 @@ void LayoutWindow::search_tree() {
         }
     }
 
-    // Search from next node, wrapping around
+    // Wrap-around search
     for (int i = 1; i <= (int)all.size(); i++) {
         int idx = (start_idx + i) % (int)all.size();
-        LayoutNode *node = all[idx];
-        if (node->type.find(query) != std::string::npos ||
-            node->text.find(query) != std::string::npos ||
-            node->id.find(query) != std::string::npos ||
-            node->key.find(query) != std::string::npos ||
-            node->desc.find(query) != std::string::npos) {
-            if (node->tree_item) {
-                TreeView_SelectItem(g_tree, node->tree_item);
-                TreeView_EnsureVisible(g_tree, node->tree_item);
+        if (node_matches(*all[idx], query)) {
+            if (all[idx]->tree_item) {
+                TreeView_SelectItem(g_tree, all[idx]->tree_item);
+                TreeView_EnsureVisible(g_tree, all[idx]->tree_item);
             }
             break;
         }
     }
 }
 
+// ── WndProc ──────────────────────────────────────────────
+
 LRESULT CALLBACK LayoutWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
         g_status_label = CreateWindowW(L"STATIC", L"UI Layout",
                                         WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                        4, 4, 200, 18, hwnd, (HMENU)20, g_inst, NULL);
+                                        MARGIN, MARGIN, 200, 18, hwnd, NULL, g_inst, NULL);
 
         g_search_edit = CreateWindowExW(0, L"EDIT", L"",
                                          WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-                                         4, 26, 200, 22, hwnd, (HMENU)10, g_inst, NULL);
+                                         MARGIN, 26, 200, 22, hwnd, (HMENU)10, g_inst, NULL);
 
         g_search_btn = CreateWindowW(L"BUTTON", L"Search",
                                       WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
@@ -388,11 +405,13 @@ LRESULT CALLBACK LayoutWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
 
         g_tree = CreateWindowExW(0, WC_TREEVIEWW, L"",
                                   WS_CHILD | WS_VISIBLE | WS_BORDER | TVS_HASLINES | TVS_HASBUTTONS | TVS_LINESATROOT,
-                                  4, 52, 100, 100, hwnd, (HMENU)1, g_inst, NULL);
+                                  MARGIN, TOOLBAR_H, 100, 100, hwnd, (HMENU)1, g_inst, NULL);
 
         g_list = CreateWindowExW(0, WC_LISTVIEWW, L"",
                                   WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL,
-                                  4, 160, 100, 100, hwnd, (HMENU)2, g_inst, NULL);
+                                  MARGIN, 160, 100, 100, hwnd, (HMENU)2, g_inst, NULL);
+        SendMessageW(g_list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0,
+                     LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
 
         LVCOLUMNW col = {};
         col.mask = LVCF_TEXT | LVCF_WIDTH;
@@ -403,30 +422,64 @@ LRESULT CALLBACK LayoutWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         col.pszText = const_cast<LPWSTR>(L"Value");
         SendMessageW(g_list, LVM_INSERTCOLUMNW, 1, (LPARAM)&col);
 
-        HFONT hf = CreateFontW(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+        HFONT hf = CreateFontW(16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
         SendMessageW(g_tree, WM_SETFONT, (WPARAM)hf, TRUE);
         SendMessageW(g_list, WM_SETFONT, (WPARAM)hf, TRUE);
         SendMessageW(g_search_edit, WM_SETFONT, (WPARAM)hf, TRUE);
         SendMessageW(g_status_label, WM_SETFONT, (WPARAM)hf, TRUE);
-
         break;
     }
     case WM_SIZE: {
         RECT rc;
         GetClientRect(hwnd, &rc);
         int w = rc.right, h = rc.bottom;
-        int toolbar_h = 52;  // status label + search row
-        int tree_h = (h - toolbar_h) * 3 / 5;
-        int list_h = h - toolbar_h - tree_h - 4;
+        int content_w = w - MARGIN * 2;
+        int tree_h = (h - TOOLBAR_H) * 3 / 5;
+        int list_h = h - TOOLBAR_H - tree_h - MARGIN;
         if (list_h < 20) list_h = 20;
-        MoveWindow(g_tree, 4, toolbar_h, w - 8, tree_h, TRUE);
-        MoveWindow(g_list, 4, toolbar_h + tree_h + 4, w - 8, list_h, TRUE);
+
+        MoveWindow(g_tree, MARGIN, TOOLBAR_H, content_w, tree_h, FALSE);
+        MoveWindow(g_list, MARGIN, TOOLBAR_H + tree_h + MARGIN, content_w, list_h, FALSE);
+        if (g_list && content_w > 0) {
+            SendMessageW(g_list, LVM_SETCOLUMNWIDTH, 0, content_w / 4);
+            SendMessageW(g_list, LVM_SETCOLUMNWIDTH, 1, (LPARAM)-2);
+        }
+        RedrawWindow(hwnd, NULL, NULL, RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
         break;
+    }
+    case WM_ERASEBKGND: {
+        HDC hdc = (HDC)wp;
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        RECT toolbar_rc = {0, 0, rc.right, TOOLBAR_H};
+        FillRect(hdc, &toolbar_rc, (HBRUSH)(COLOR_BTNFACE + 1));
+        return 1;
     }
     case WM_NOTIFY: {
         NMHDR *nm = reinterpret_cast<NMHDR *>(lp);
         if (nm->idFrom == 1 && nm->code == TVN_SELCHANGEDW) {
             on_tree_select();
+        } else if (nm->idFrom == 2) {
+            if (nm->code == LVN_KEYDOWN) {
+                auto *lvkd = reinterpret_cast<NMLVKEYDOWN *>(lp);
+                if (lvkd->wVKey == 'C' && (GetKeyState(VK_CONTROL) & 0x8000))
+                    copy_list_value(hwnd, get_selected_list_item());
+            } else if (nm->code == NM_RCLICK) {
+                int sel = get_selected_list_item();
+                if (sel >= 0) {
+                    POINT pt;
+                    GetCursorPos(&pt);
+                    HMENU hMenu = CreatePopupMenu();
+                    AppendMenuW(hMenu, MF_STRING, 22, L"Copy Property");
+                    AppendMenuW(hMenu, MF_STRING, 21, L"Copy Value");
+                    TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+                    DestroyMenu(hMenu);
+                }
+            } else if (nm->code == NM_DBLCLK) {
+                auto *nmitem = reinterpret_cast<NMITEMACTIVATE *>(lp);
+                if (nmitem && nmitem->iItem >= 0)
+                    copy_list_value(hwnd, nmitem->iItem);
+            }
         }
         break;
     }
@@ -434,23 +487,16 @@ LRESULT CALLBACK LayoutWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         switch (LOWORD(wp)) {
         case 11: search_tree(); break;
         case 12: refresh_layout(); break;
+        case 21: copy_list_value(hwnd, get_selected_list_item()); break;
+        case 22: copy_list_property(hwnd, get_selected_list_item()); break;
         case 13: {
             static bool expanded = false;
-            if (expanded) {
-                HTREEITEM root = TreeView_GetRoot(g_tree);
-                while (root) {
-                    TreeView_Expand(g_tree, root, TVE_COLLAPSE);
-                    root = TreeView_GetNextSibling(g_tree, root);
-                }
-                SetWindowTextW(g_expand_btn, L"Expand");
-            } else {
-                HTREEITEM root = TreeView_GetRoot(g_tree);
-                while (root) {
-                    TreeView_Expand(g_tree, root, TVE_EXPAND);
-                    root = TreeView_GetNextSibling(g_tree, root);
-                }
-                SetWindowTextW(g_expand_btn, L"Collapse");
+            HTREEITEM root = TreeView_GetRoot(g_tree);
+            while (root) {
+                TreeView_Expand(g_tree, root, expanded ? TVE_COLLAPSE : TVE_EXPAND);
+                root = TreeView_GetNextSibling(g_tree, root);
             }
+            SetWindowTextW(g_expand_btn, expanded ? L"Expand" : L"Collapse");
             expanded = !expanded;
             break;
         }
@@ -459,8 +505,7 @@ LRESULT CALLBACK LayoutWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     case WM_USER + 100:
         if (wp == 0 && lp == 0) {
             try {
-                json j = json::parse(g_json);
-                g_root = parse_json_to_node(j);
+                g_root = parse_json_to_node(json::parse(g_json));
             } catch (...) {
                 if (g_status_label) SetWindowTextW(g_status_label, L"Parse error");
                 return 0;
@@ -468,7 +513,7 @@ LRESULT CALLBACK LayoutWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             TreeView_DeleteAllItems(g_tree);
             ListView_DeleteAllItems(g_list);
             g_has_hl = false;
-            if (!g_root.type.empty()) build_tree(TVI_ROOT, g_root);
+            if (!g_root.attr("type").empty()) build_tree(TVI_ROOT, g_root);
             if (g_status_label) SetWindowTextW(g_status_label, L"UI Layout");
         } else {
             if (g_status_label) SetWindowTextW(g_status_label, L"Failed to load layout");

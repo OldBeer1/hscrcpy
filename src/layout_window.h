@@ -7,22 +7,23 @@
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
+#include <map>
 #include <functional>
 
 namespace hscrcpy {
 
 struct LayoutNode {
-    std::string type;
-    std::string text;
-    std::string id;
-    std::string key;
-    std::string desc;
-    std::string bounds;
-    std::string orig_bounds;
+    std::map<std::string, std::string> attrs;  // all attributes from JSON
     int bounds_left = 0, bounds_top = 0, bounds_right = 0, bounds_bottom = 0;
     int orig_left = 0, orig_top = 0, orig_right = 0, orig_bottom = 0;
     std::vector<LayoutNode> children;
     HTREEITEM tree_item = nullptr;
+
+    const std::string &attr(const char *key) const {
+        static const std::string empty;
+        auto it = attrs.find(key);
+        return it != attrs.end() ? it->second : empty;
+    }
 };
 
 class LayoutWindow {
@@ -31,7 +32,6 @@ public:
     using OnRefresh = std::function<std::string()>;
 
     static void create(HINSTANCE inst, HWND parent, int width = 420);
-    static void show(const std::string &json, OnNodeSelected on_select, OnRefresh on_refresh);
     static void show(OnNodeSelected on_select, OnRefresh on_refresh);
     static void hide();
     static void destroy();
@@ -44,6 +44,9 @@ public:
     static void clear_highlight();
 
 private:
+    static constexpr int TOOLBAR_H = 52;
+    static constexpr int MARGIN = 4;
+
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
     static LayoutNode parse_json_to_node(const nlohmann::json &j);
     static void build_tree(HTREEITEM parent, LayoutNode &node);
@@ -52,6 +55,10 @@ private:
     static LayoutNode *find_node_by_tree_item(HTREEITEM item, LayoutNode *root);
     static void refresh_layout();
     static void search_tree();
+    static void copy_to_clipboard(HWND hwnd, const std::wstring &text);
+    static void copy_list_value(HWND hwnd, int item_idx);
+    static void copy_list_property(HWND hwnd, int item_idx);
+    static int get_selected_list_item();
     static DWORD WINAPI DumpThreadProc(LPVOID param);
 
     static HWND g_hwnd;
@@ -70,7 +77,6 @@ private:
     static std::string g_json;
     static int g_layout_w;
 
-    // Highlight bounds (device coordinates from selected node)
     static int g_hl_left, g_hl_top, g_hl_right, g_hl_bottom;
     static bool g_has_hl;
 };
