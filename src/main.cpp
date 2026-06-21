@@ -13,6 +13,7 @@
 #include "hdc_wrapper.h"
 #include "input_injector.h"
 #include "h264_decoder.h"
+#include "layout_window.h"
 #include "log.h"
 #include "version.h"
 #include <cmath>
@@ -45,8 +46,17 @@ static HWND g_btn_voldown_hwnd = nullptr;
 static HWND g_btn_power_hwnd = nullptr;
 static HWND g_btn_reboot_hwnd = nullptr;
 static HWND g_btn_quality_hwnd = nullptr;
+static HWND g_btn_layout_hwnd = nullptr;
 static HWND g_status_hwnd = nullptr;
 static HWND g_canvas_hwnd = nullptr;
+static bool g_layout_visible = false;
+
+// Splitter bar child window
+static HWND g_splitter_hwnd = nullptr;
+static bool g_splitter_dragging = false;
+static int g_splitter_drag_offset = 0;
+
+static LRESULT CALLBACK SplitterWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 
 static std::vector<HdcDevice> g_devices;
 static hscrcpy::CliArgs g_cli_args;
@@ -77,6 +87,7 @@ static uint32_t g_device_screen_w = 0, g_device_screen_h = 0;
 #define ID_BTN_REBOOT  1009
 #define ID_BTN_RECENT  1010
 #define ID_BTN_QUALITY 1011
+#define ID_BTN_LAYOUT  1012
 
 static ULONG_PTR g_gdiplus_token = 0;
 
@@ -86,6 +97,10 @@ static ID2D1HwndRenderTarget *g_d2d_rt = nullptr;
 static ID2D1Bitmap *g_d2d_bitmap = nullptr;
 static bool g_d2d_available = false;
 static uint32_t g_d2d_bmp_w = 0, g_d2d_bmp_h = 0;
+
+// Cached D2D brushes for layout highlight overlay
+static ID2D1SolidColorBrush *g_d2d_hl_fill = nullptr;
+static ID2D1SolidColorBrush *g_d2d_hl_border = nullptr;
 
 static bool init_d2d() {
     HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g_d2d_factory);
@@ -99,6 +114,8 @@ static bool init_d2d() {
 }
 
 static void cleanup_d2d() {
+    if (g_d2d_hl_fill) { g_d2d_hl_fill->Release(); g_d2d_hl_fill = nullptr; }
+    if (g_d2d_hl_border) { g_d2d_hl_border->Release(); g_d2d_hl_border = nullptr; }
     if (g_d2d_bitmap) { g_d2d_bitmap->Release(); g_d2d_bitmap = nullptr; }
     if (g_d2d_rt) { g_d2d_rt->Release(); g_d2d_rt = nullptr; }
     if (g_d2d_factory) { g_d2d_factory->Release(); g_d2d_factory = nullptr; }
@@ -794,10 +811,46 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 g_d2d_rt->DrawBitmap(g_d2d_bitmap, drawRect, 1.0f,
                                       D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
             }
+
+            // Layout highlight overlay (D2D)
+            if (LayoutWindow::is_visible()) {
+                int hl, ht, hr, hb;
+                if (LayoutWindow::get_highlight_bounds(hl, ht, hr, hb) && g_screen_w > 0 && g_screen_h > 0) {
+                    double aspect = (double)g_screen_w / g_screen_h;
+                    int dw, dh, ox, oy;
+                    if ((double)cw / ch > aspect) {
+                        dh = ch; dw = (int)(ch * aspect);
+                    } else {
+                        dw = cw; dh = (int)(cw / aspect);
+                    }
+                    if (dw == cw - 1) dw = cw;
+                    if (dh == ch - 1) dh = ch;
+                    ox = (cw - dw) / 2;
+                    oy = (ch - dh) / 2;
+
+                    uint32_t phy_w = g_screen_w * g_capture_config.scale;
+                    uint32_t phy_h = g_screen_h * g_capture_config.scale;
+                    float sx = (float)dw / phy_w;
+                    float sy = (float)dh / phy_h;
+                    D2D1_RECT_F hlRect = D2D1::RectF(
+                        ox + hl * sx, oy + ht * sy,
+                        ox + hr * sx, oy + hb * sy);
+
+                    if (!g_d2d_hl_fill)
+                        g_d2d_rt->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.47f, 0.84f, 0.25f), &g_d2d_hl_fill);
+                    if (g_d2d_hl_fill) g_d2d_rt->FillRectangle(hlRect, g_d2d_hl_fill);
+
+                    if (!g_d2d_hl_border)
+                        g_d2d_rt->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.47f, 0.84f, 0.9f), &g_d2d_hl_border);
+                    if (g_d2d_hl_border) g_d2d_rt->DrawRectangle(hlRect, g_d2d_hl_border, 2.0f);
+                }
+            }
             HRESULT hr = g_d2d_rt->EndDraw();
             if (FAILED(hr)) {
                 LOGW("D2D EndDraw failed (hr=0x%08X)", (unsigned)hr);
                 if (g_d2d_bitmap) { g_d2d_bitmap->Release(); g_d2d_bitmap = nullptr; g_d2d_bmp_w = 0; g_d2d_bmp_h = 0; }
+                if (g_d2d_hl_fill) { g_d2d_hl_fill->Release(); g_d2d_hl_fill = nullptr; }
+                if (g_d2d_hl_border) { g_d2d_hl_border->Release(); g_d2d_hl_border = nullptr; }
                 g_d2d_rt->Release();
                 g_d2d_rt = nullptr;
             }
@@ -840,6 +893,41 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                       g_cur_frame->data.data(),
                                       reinterpret_cast<BITMAPINFO *>(&bih),
                                       DIB_RGB_COLORS, SRCCOPY);
+                    }
+                }
+
+                // Layout highlight overlay (GDI)
+                if (LayoutWindow::is_visible() && g_screen_w > 0 && g_screen_h > 0) {
+                    int hl, ht, hr, hb;
+                    if (LayoutWindow::get_highlight_bounds(hl, ht, hr, hb)) {
+                        double aspect = (double)g_screen_w / g_screen_h;
+                        int dw, dh, ox, oy;
+                        if ((double)cw / ch > aspect) {
+                            dh = ch; dw = (int)(ch * aspect);
+                        } else {
+                            dw = cw; dh = (int)(cw / aspect);
+                        }
+                        if (dw == cw - 1) dw = cw;
+                        if (dh == ch - 1) dh = ch;
+                        ox = (cw - dw) / 2;
+                        oy = (ch - dh) / 2;
+
+                        uint32_t phy_w = g_screen_w * g_capture_config.scale;
+                        uint32_t phy_h = g_screen_h * g_capture_config.scale;
+                        double sx = (double)dw / phy_w;
+                        double sy = (double)dh / phy_h;
+                        RECT hlRect = {
+                            (LONG)(ox + hl * sx), (LONG)(oy + ht * sy),
+                            (LONG)(ox + hr * sx), (LONG)(oy + hb * sy)
+                        };
+
+                        HPEN pen = CreatePen(PS_SOLID, 2, RGB(0, 120, 214));
+                        HPEN oldPen = (HPEN)SelectObject(g_backbuffer_dc, pen);
+                        HBRUSH oldBr = (HBRUSH)SelectObject(g_backbuffer_dc, GetStockObject(NULL_BRUSH));
+                        Rectangle(g_backbuffer_dc, hlRect.left, hlRect.top, hlRect.right, hlRect.bottom);
+                        SelectObject(g_backbuffer_dc, oldPen);
+                        SelectObject(g_backbuffer_dc, oldBr);
+                        DeleteObject(pen);
                     }
                 }
 
@@ -936,6 +1024,56 @@ static void join_startup_thread() {
     if (g_startup_thread.joinable()) g_startup_thread.join();
 }
 
+static std::string dump_layout_json() {
+    if (!g_hdc) return "";
+
+    std::string output;
+    if (!g_hdc->shell_command("uitest dumpLayout", &output, 30)) {
+        LOGE("uitest dumpLayout shell command failed");
+        return "";
+    }
+
+    // Parse output: "DumpLayout saved to: /data/local/tmp/dumpLayout_xxx.json"
+    std::string device_path;
+    auto pos = output.find("DumpLayout saved to:");
+    if (pos != std::string::npos) {
+        device_path = output.substr(pos + 21);
+        while (!device_path.empty() && (device_path.front() == ' ' || device_path.front() == '\t'))
+            device_path.erase(device_path.begin());
+        while (!device_path.empty() && (device_path.back() == '\r' || device_path.back() == '\n' || device_path.back() == ' '))
+            device_path.pop_back();
+    }
+    if (device_path.empty()) {
+        LOGE("Could not parse dumpLayout output: %s", output.c_str());
+        return "";
+    }
+
+    char temp_dir[MAX_PATH];
+    GetTempPathA(MAX_PATH, temp_dir);
+    std::string local_path = std::string(temp_dir) + "hscrcpy_layout.json";
+
+    if (!g_hdc->pull_file(device_path, local_path)) {
+        LOGE("Failed to pull layout file: %s", device_path.c_str());
+        return "";
+    }
+
+    FILE *f = fopen(local_path.c_str(), "rb");
+    if (!f) {
+        LOGE("Failed to open local layout file: %s", local_path.c_str());
+        return "";
+    }
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::string json_str(len, '\0');
+    size_t read = fread(&json_str[0], 1, len, f);
+    json_str.resize(read);
+    fclose(f);
+
+    DeleteFileA(local_path.c_str());
+    return json_str;
+}
+
 static void stop_mirroring();
 
 static void try_update_frame() {
@@ -1003,6 +1141,21 @@ static void stop_mirroring() {
     EnableWindow(g_btn_start_hwnd, TRUE);
     set_status("Stopping...");
     g_snapshot_warned = false;
+
+    // Hide layout panel on stop
+    if (g_layout_visible) {
+        LayoutWindow::hide();
+        ShowWindow(g_splitter_hwnd, SW_HIDE);
+        g_layout_visible = false;
+        SetWindowTextA(g_btn_layout_hwnd, "Layout");
+        // Shrink window: remove panel width
+        RECT wr;
+        GetWindowRect(g_hwnd, &wr);
+        SetWindowPos(g_hwnd, NULL, 0, 0,
+                     wr.right - wr.left - LayoutWindow::panel_width(),
+                     wr.bottom - wr.top,
+                     SWP_NOMOVE | SWP_NOZORDER);
+    }
 
     InvalidateRect(g_canvas_hwnd, NULL, TRUE);
 
@@ -1116,6 +1269,60 @@ static void start_mirroring(const std::string &serial, const std::string &ip = "
     });
 }
 
+static LRESULT CALLBACK SplitterWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_SETCURSOR:
+        SetCursor(LoadCursor(NULL, IDC_SIZEWE));
+        return TRUE;
+    case WM_LBUTTONDOWN: {
+        g_splitter_dragging = true;
+        POINT pt;
+        GetCursorPos(&pt);
+        RECT sr;
+        GetWindowRect(hwnd, &sr);
+        g_splitter_drag_offset = pt.x - sr.left;
+        SetCapture(hwnd);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        if (g_splitter_dragging) {
+            POINT pt;
+            GetCursorPos(&pt);
+            int splitter_screen_x = pt.x - g_splitter_drag_offset;
+            POINT sp = {splitter_screen_x, 0};
+            ScreenToClient(g_hwnd, &sp);
+            RECT rc;
+            GetClientRect(g_hwnd, &rc);
+            int new_pw = rc.right - sp.x;
+            if (new_pw < 200) new_pw = 200;
+            int canvas_w = rc.right - new_pw;
+            if (canvas_w < 100) { canvas_w = 100; new_pw = rc.right - canvas_w; }
+            int client_h = rc.bottom - TOOLBAR_H;
+            LayoutWindow::reposition(canvas_w, TOOLBAR_H, new_pw, client_h);
+            MoveWindow(g_splitter_hwnd, canvas_w - 2, TOOLBAR_H, 4, client_h, TRUE);
+            MoveWindow(g_canvas_hwnd, 0, TOOLBAR_H, canvas_w, client_h, FALSE);
+            destroy_backbuffer();
+            if (g_d2d_rt) g_d2d_rt->Resize(D2D1::SizeU(canvas_w, client_h));
+            InvalidateRect(g_canvas_hwnd, NULL, FALSE);
+            return 0;
+        }
+        break;
+    }
+    case WM_LBUTTONUP: {
+        if (g_splitter_dragging) {
+            g_splitter_dragging = false;
+            ReleaseCapture();
+            RECT lr;
+            GetClientRect(LayoutWindow::hwnd(), &lr);
+            LayoutWindow::set_panel_width(lr.right);
+            return 0;
+        }
+        break;
+    }
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
@@ -1145,31 +1352,41 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetWindowTextA(g_btn_quality_hwnd, "\xE2\x9A\x99");
         }
 
+        g_btn_layout_hwnd = CreateWindowA("BUTTON", "",
+                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_ICON,
+                                           38, 34, 26, 22, hwnd, (HMENU)ID_BTN_LAYOUT, g_hInst, NULL);
+        HICON hLayout = load_png_icon("res\\layout_icon.png", 20);
+        if (hLayout) {
+            SendMessageA(g_btn_layout_hwnd, BM_SETIMAGE, IMAGE_ICON, (LPARAM)hLayout);
+        } else {
+            SetWindowTextA(g_btn_layout_hwnd, "Layout");
+        }
+
         g_btn_back_hwnd = CreateWindowA("BUTTON", "Back",
                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                         38, 34, 48, 22, hwnd, (HMENU)ID_BTN_BACK, g_hInst, NULL);
+                                         68, 34, 48, 22, hwnd, (HMENU)ID_BTN_BACK, g_hInst, NULL);
         g_btn_home_hwnd = CreateWindowA("BUTTON", "Home",
                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                         90, 34, 48, 22, hwnd, (HMENU)ID_BTN_HOME, g_hInst, NULL);
+                                         120, 34, 48, 22, hwnd, (HMENU)ID_BTN_HOME, g_hInst, NULL);
         g_btn_recent_hwnd = CreateWindowA("BUTTON", "Recent",
                                            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                           142, 34, 50, 22, hwnd, (HMENU)ID_BTN_RECENT, g_hInst, NULL);
+                                           172, 34, 50, 22, hwnd, (HMENU)ID_BTN_RECENT, g_hInst, NULL);
         g_btn_volup_hwnd = CreateWindowA("BUTTON", "Vol+",
                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                          196, 34, 42, 22, hwnd, (HMENU)ID_BTN_VOLUP, g_hInst, NULL);
+                                          226, 34, 42, 22, hwnd, (HMENU)ID_BTN_VOLUP, g_hInst, NULL);
         g_btn_voldown_hwnd = CreateWindowA("BUTTON", "Vol-",
                                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                            242, 34, 42, 22, hwnd, (HMENU)ID_BTN_VOLDOWN, g_hInst, NULL);
+                                            272, 34, 42, 22, hwnd, (HMENU)ID_BTN_VOLDOWN, g_hInst, NULL);
         g_btn_power_hwnd = CreateWindowA("BUTTON", "Power",
                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                          288, 34, 48, 22, hwnd, (HMENU)ID_BTN_POWER, g_hInst, NULL);
+                                          318, 34, 48, 22, hwnd, (HMENU)ID_BTN_POWER, g_hInst, NULL);
         g_btn_reboot_hwnd = CreateWindowA("BUTTON", "Reboot",
                                              WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                             340, 34, 50, 22, hwnd, (HMENU)ID_BTN_REBOOT, g_hInst, NULL);
+                                             370, 34, 50, 22, hwnd, (HMENU)ID_BTN_REBOOT, g_hInst, NULL);
 
         g_status_hwnd = CreateWindowA("STATIC", "",
                                        WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                       396, 38, 400, 18, hwnd, NULL, g_hInst, NULL);
+                                       450, 38, 400, 18, hwnd, NULL, g_hInst, NULL);
 
         g_canvas_hwnd = CreateWindowA(CANVAS_CLASS, "",
                                        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_TABSTOP,
@@ -1177,6 +1394,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         g_canvas_orig_wndproc = (WNDPROC)SetWindowLongPtrA(g_canvas_hwnd, GWLP_WNDPROC, (LONG_PTR)CanvasKeyProc);
         LOGI("Canvas subclassed, orig_wndproc=%p, err=%d", g_canvas_orig_wndproc, GetLastError());
+
+        LayoutWindow::create(g_hInst, hwnd, 420);
+
+        // Register and create splitter bar (hidden initially)
+        {
+            static bool reg = false;
+            if (!reg) {
+                WNDCLASSEXA swc = {};
+                swc.cbSize = sizeof(swc);
+                swc.style = CS_HREDRAW | CS_VREDRAW;
+                swc.lpfnWndProc = SplitterWndProc;
+                swc.hInstance = g_hInst;
+                swc.hCursor = LoadCursor(NULL, IDC_SIZEWE);
+                swc.hbrBackground = (HBRUSH)(COLOR_3DFACE + 1);
+                swc.lpszClassName = "HScrcpySplitterClass";
+                RegisterClassExA(&swc);
+                reg = true;
+            }
+            g_splitter_hwnd = CreateWindowA("HScrcpySplitterClass", "",
+                                             WS_CHILD | WS_VISIBLE,
+                                             0, TOOLBAR_H, 4, 100, hwnd, NULL, g_hInst, NULL);
+            ShowWindow(g_splitter_hwnd, SW_HIDE);
+        }
 
         refresh_devices();
         break;
@@ -1238,14 +1478,69 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_BTN_QUALITY:
             show_settings_dialog();
             break;
+        case ID_BTN_LAYOUT:
+            if (!g_mirroring) {
+                center_msgbox("Start mirroring first to inspect layout.", "HScrcpy", MB_OK | MB_ICONINFORMATION);
+                break;
+            }
+            if (LayoutWindow::is_visible()) {
+                LayoutWindow::hide();
+                ShowWindow(g_splitter_hwnd, SW_HIDE);
+                g_layout_visible = false;
+                SetWindowTextA(g_btn_layout_hwnd, "Layout");
+                // Shrink window: remove panel width (triggers WM_SIZE which repositions canvas)
+                {
+                    RECT wr;
+                    GetWindowRect(hwnd, &wr);
+                    SetWindowPos(hwnd, NULL, 0, 0,
+                                 wr.right - wr.left - LayoutWindow::panel_width(),
+                                 wr.bottom - wr.top,
+                                 SWP_NOMOVE | SWP_NOZORDER);
+                }
+            } else {
+                // Show layout panel first (so WM_SIZE can see it)
+                LayoutWindow::show(
+                    [](int left, int top, int right, int bottom) {
+                        InvalidateRect(g_canvas_hwnd, NULL, FALSE);
+                    },
+                    []() -> std::string {
+                        return dump_layout_json();
+                    }
+                );
+                ShowWindow(g_splitter_hwnd, SW_SHOW);
+                g_layout_visible = true;
+                SetWindowTextA(g_btn_layout_hwnd, "Hide");
+                // Expand window: add panel width to the right (triggers WM_SIZE)
+                {
+                    RECT wr;
+                    GetWindowRect(hwnd, &wr);
+                    SetWindowPos(hwnd, NULL, 0, 0,
+                                 wr.right - wr.left + LayoutWindow::panel_width(),
+                                 wr.bottom - wr.top,
+                                 SWP_NOMOVE | SWP_NOZORDER);
+                }
+            }
+            break;
         }
         break;
     case WM_SIZE: {
         RECT rc;
         GetClientRect(hwnd, &rc);
-        MoveWindow(g_canvas_hwnd, 0, TOOLBAR_H, rc.right, rc.bottom - TOOLBAR_H, FALSE);
+        int client_w = rc.right;
+        int client_h = rc.bottom - TOOLBAR_H;
+
+        int canvas_w = client_w;
+        if (g_layout_visible && LayoutWindow::is_visible()) {
+            int pw = LayoutWindow::panel_width();
+            canvas_w = client_w - pw;
+            if (canvas_w < 100) { canvas_w = 100; pw = client_w - canvas_w; }
+            LayoutWindow::reposition(canvas_w, TOOLBAR_H, pw, client_h);
+            MoveWindow(g_splitter_hwnd, canvas_w - 2, TOOLBAR_H, 4, client_h, TRUE);
+        }
+
+        MoveWindow(g_canvas_hwnd, 0, TOOLBAR_H, canvas_w, client_h, FALSE);
         destroy_backbuffer();
-        if (g_d2d_rt) g_d2d_rt->Resize(D2D1::SizeU(rc.right, rc.bottom - TOOLBAR_H));
+        if (g_d2d_rt) g_d2d_rt->Resize(D2D1::SizeU(canvas_w, client_h));
         InvalidateRect(g_canvas_hwnd, NULL, FALSE);
         break;
     }
@@ -1446,6 +1741,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_DESTROY:
         destroy_backbuffer();
+        LayoutWindow::destroy();
         join_cleanup_thread();
         join_startup_thread();
         if (g_canvas_orig_wndproc && g_canvas_hwnd) {
