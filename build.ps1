@@ -176,7 +176,7 @@ if (-not (Test-Path "build\res")) {
         Write-Ok "res\ - copied"
     }
 } else {
-    Copy-Item -Force "res\*" "build\res\"
+    Copy-Item -Recurse -Force "res\*" "build\res\"
     Write-Ok "res\ - updated"
 }
 

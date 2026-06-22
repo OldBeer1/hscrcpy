@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
+#include <uxtheme.h>
 #include <objidl.h>
 #include <gdiplus.h>
 #include <d2d1.h>
@@ -14,6 +15,7 @@
 #include "input_injector.h"
 #include "h264_decoder.h"
 #include "layout_window.h"
+#include "file_manager_window.h"
 #include "log.h"
 #include "version.h"
 #include <cmath>
@@ -47,9 +49,11 @@ static HWND g_btn_power_hwnd = nullptr;
 static HWND g_btn_reboot_hwnd = nullptr;
 static HWND g_btn_quality_hwnd = nullptr;
 static HWND g_btn_layout_hwnd = nullptr;
+static HWND g_btn_fm_hwnd = nullptr;
 static HWND g_status_hwnd = nullptr;
 static HWND g_canvas_hwnd = nullptr;
 static bool g_layout_visible = false;
+static bool g_fm_visible = false;
 
 // Splitter bar child window
 static HWND g_splitter_hwnd = nullptr;
@@ -66,7 +70,7 @@ static std::mutex g_frame_mutex;
 static uint64_t g_last_rendered_seq = 0;
 static HANDLE g_frame_event = nullptr;
 
-static int TOOLBAR_H = 62;
+static int TOOLBAR_H = 68;
 static bool g_snapshot_warned = false;
 
 static bool g_mouse_down = false;
@@ -88,6 +92,7 @@ static uint32_t g_device_screen_w = 0, g_device_screen_h = 0;
 #define ID_BTN_RECENT  1010
 #define ID_BTN_QUALITY 1011
 #define ID_BTN_LAYOUT  1012
+#define ID_BTN_FM      1013
 
 static ULONG_PTR g_gdiplus_token = 0;
 
@@ -206,7 +211,9 @@ static bool ensure_backbuffer(HDC ref_dc, int w, int h) {
     return true;
 }
 
-static HICON load_png_icon(const char *relative_path, int size) {
+static HICON load_png_icon(const char *relative_path, int size,
+                            BYTE tint_r = 0, BYTE tint_g = 0, BYTE tint_b = 0,
+                            bool tint = false) {
     char exe_path[MAX_PATH];
     GetModuleFileNameA(NULL, exe_path, MAX_PATH);
     std::string dir(exe_path);
@@ -216,14 +223,49 @@ static HICON load_png_icon(const char *relative_path, int size) {
 
     HICON icon = NULL;
     Gdiplus::Bitmap *src = Gdiplus::Bitmap::FromFile(std::wstring(path.begin(), path.end()).c_str());
-    if (src && src->GetLastStatus() == Gdiplus::Ok) {
-        int sw = src->GetWidth(), sh = src->GetHeight();
-        int dw = size, dh = size;
-        if (sw * dh > sh * dw) {
-            dh = (int)(size * (double)sh / sw);
-        } else {
-            dw = (int)(size * (double)sw / sh);
+    if (!src || src->GetLastStatus() != Gdiplus::Ok) { delete src; return NULL; }
+
+    int sw = src->GetWidth(), sh = src->GetHeight();
+
+    if (tint) {
+        // Scale source first
+        Gdiplus::Bitmap *scaled = new Gdiplus::Bitmap(size, size, PixelFormat32bppARGB);
+        { Gdiplus::Graphics gs(scaled);
+          gs.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
+          gs.Clear(Gdiplus::Color(0, 0, 0, 0));
+          gs.DrawImage(src, 0, 0, size, size); }
+        delete src; src = scaled;
+
+        // Read alpha from scaled, write tinted premultiplied pixels to dst
+        Gdiplus::BitmapData src_bd = {}, dst_bd = {};
+        Gdiplus::Rect r(0, 0, size, size);
+        src->LockBits(&r, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &src_bd);
+
+        Gdiplus::Bitmap *dst = new Gdiplus::Bitmap(size, size, PixelFormat32bppARGB);
+        dst->LockBits(&r, Gdiplus::ImageLockModeWrite, PixelFormat32bppARGB, &dst_bd);
+
+        for (int y = 0; y < size; y++) {
+            const BYTE *sp = (const BYTE *)src_bd.Scan0 + y * src_bd.Stride;
+            BYTE *dp = (BYTE *)dst_bd.Scan0 + y * dst_bd.Stride;
+            for (int x = 0; x < size; x++) {
+                BYTE a = sp[3];
+                dp[0] = (BYTE)(tint_b * a / 255);
+                dp[1] = (BYTE)(tint_g * a / 255);
+                dp[2] = (BYTE)(tint_r * a / 255);
+                dp[3] = a;
+                sp += 4; dp += 4;
+            }
         }
+        dst->UnlockBits(&dst_bd);
+        src->UnlockBits(&src_bd);
+        delete src; src = nullptr;
+
+        dst->GetHICON(&icon);
+        delete dst;
+    } else {
+        int dw = size, dh = size;
+        if (sw * dh > sh * dw) dh = (int)(size * (double)sh / sw);
+        else dw = (int)(size * (double)sw / sh);
         int ox = (size - dw) / 2, oy = (size - dh) / 2;
 
         Gdiplus::Bitmap *dst = new Gdiplus::Bitmap(size, size, PixelFormat32bppARGB);
@@ -1057,6 +1099,9 @@ static std::string dump_layout_json() {
         return "";
     }
 
+    // Clean up device-side dump file
+    g_hdc->shell_command("rm -f " + device_path, nullptr, 5);
+
     FILE *f = fopen(local_path.c_str(), "rb");
     if (!f) {
         LOGE("Failed to open local layout file: %s", local_path.c_str());
@@ -1137,7 +1182,12 @@ static void stop_mirroring() {
         g_cur_frame.reset();
     }
 
-    SetWindowTextA(g_btn_start_hwnd, "Start Mirroring");
+    {
+        HICON hPrev = (HICON)SendMessageA(g_btn_start_hwnd, BM_GETIMAGE, IMAGE_ICON, 0);
+        HICON hStartIcon = load_png_icon("res\\toolbar\\start.png", 24, 85, 85, 85, true);
+        SendMessageA(g_btn_start_hwnd, BM_SETIMAGE, IMAGE_ICON, (LPARAM)hStartIcon);
+        if (hPrev) DestroyIcon(hPrev);
+    }
     EnableWindow(g_btn_start_hwnd, TRUE);
     set_status("Stopping...");
     g_snapshot_warned = false;
@@ -1147,12 +1197,24 @@ static void stop_mirroring() {
         LayoutWindow::hide();
         ShowWindow(g_splitter_hwnd, SW_HIDE);
         g_layout_visible = false;
-        SetWindowTextA(g_btn_layout_hwnd, "Layout");
         // Shrink window: remove panel width
         RECT wr;
         GetWindowRect(g_hwnd, &wr);
         SetWindowPos(g_hwnd, NULL, 0, 0,
                      wr.right - wr.left - LayoutWindow::panel_width(),
+                     wr.bottom - wr.top,
+                     SWP_NOMOVE | SWP_NOZORDER);
+    }
+
+    // Hide file manager panel on stop
+    if (g_fm_visible) {
+        FileManagerWindow::hide();
+        ShowWindow(g_splitter_hwnd, SW_HIDE);
+        g_fm_visible = false;
+        RECT wr;
+        GetWindowRect(g_hwnd, &wr);
+        SetWindowPos(g_hwnd, NULL, 0, 0,
+                     wr.right - wr.left - FileManagerWindow::panel_width(),
                      wr.bottom - wr.top,
                      SWP_NOMOVE | SWP_NOZORDER);
     }
@@ -1298,7 +1360,11 @@ static LRESULT CALLBACK SplitterWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             int canvas_w = rc.right - new_pw;
             if (canvas_w < 100) { canvas_w = 100; new_pw = rc.right - canvas_w; }
             int client_h = rc.bottom - TOOLBAR_H;
-            LayoutWindow::reposition(canvas_w, TOOLBAR_H, new_pw, client_h);
+            if (g_layout_visible) {
+                LayoutWindow::reposition(canvas_w, TOOLBAR_H, new_pw, client_h);
+            } else if (g_fm_visible) {
+                FileManagerWindow::reposition(canvas_w, TOOLBAR_H, new_pw, client_h);
+            }
             MoveWindow(g_splitter_hwnd, canvas_w - 2, TOOLBAR_H, 4, client_h, TRUE);
             MoveWindow(g_canvas_hwnd, 0, TOOLBAR_H, canvas_w, client_h, FALSE);
             destroy_backbuffer();
@@ -1312,9 +1378,15 @@ static LRESULT CALLBACK SplitterWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         if (g_splitter_dragging) {
             g_splitter_dragging = false;
             ReleaseCapture();
-            RECT lr;
-            GetClientRect(LayoutWindow::hwnd(), &lr);
-            LayoutWindow::set_panel_width(lr.right);
+            if (g_layout_visible) {
+                RECT lr;
+                GetClientRect(LayoutWindow::hwnd(), &lr);
+                LayoutWindow::set_panel_width(lr.right);
+            } else if (g_fm_visible) {
+                RECT fr;
+                GetClientRect(FileManagerWindow::hwnd(), &fr);
+                FileManagerWindow::set_panel_width(fr.right);
+            }
             return 0;
         }
         break;
@@ -1326,67 +1398,57 @@ static LRESULT CALLBACK SplitterWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
+        // Row 1: Device label + combo + Refresh/Start icon buttons
         CreateWindowA("STATIC", "Device:",
                        WS_CHILD | WS_VISIBLE | SS_LEFT,
-                       8, 8, 48, 18, hwnd, NULL, g_hInst, NULL);
+                       8, 10, 48, 18, hwnd, NULL, g_hInst, NULL);
 
         g_combo_hwnd = CreateWindowA("COMBOBOX", "",
                                       WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-                                      58, 5, 180, 200, hwnd, (HMENU)ID_COMBO, g_hInst, NULL);
+                                      58, 6, 200, 200, hwnd, (HMENU)ID_COMBO, g_hInst, NULL);
 
-        g_btn_refresh_hwnd = CreateWindowA("BUTTON", "Refresh",
-                                            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                            245, 5, 52, 22, hwnd, (HMENU)ID_BTN_REFRESH, g_hInst, NULL);
-
-        g_btn_start_hwnd = CreateWindowA("BUTTON", "Start",
-                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
-                                           301, 5, 100, 22, hwnd, (HMENU)ID_BTN_START, g_hInst, NULL);
-
-        g_btn_quality_hwnd = CreateWindowA("BUTTON", "",
+        g_btn_refresh_hwnd = CreateWindowA("BUTTON", "",
                                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_ICON,
-                                            8, 34, 26, 22, hwnd, (HMENU)ID_BTN_QUALITY, g_hInst, NULL);
-        HICON hGear = load_png_icon("res\\settings_icon.png", 20);
-        if (hGear) {
-            SendMessageA(g_btn_quality_hwnd, BM_SETIMAGE, IMAGE_ICON, (LPARAM)hGear);
-        } else {
-            SetWindowTextA(g_btn_quality_hwnd, "\xE2\x9A\x99");
-        }
+                                            265, 5, 28, 28, hwnd, (HMENU)ID_BTN_REFRESH, g_hInst, NULL);
+        HICON hRefresh = load_png_icon("res\\toolbar\\refresh.png", 24, 85, 85, 85, true);
+        if (hRefresh) SendMessageA(g_btn_refresh_hwnd, BM_SETIMAGE, IMAGE_ICON, (LPARAM)hRefresh);
 
-        g_btn_layout_hwnd = CreateWindowA("BUTTON", "",
-                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_ICON,
-                                           38, 34, 26, 22, hwnd, (HMENU)ID_BTN_LAYOUT, g_hInst, NULL);
-        HICON hLayout = load_png_icon("res\\layout_icon.png", 20);
-        if (hLayout) {
-            SendMessageA(g_btn_layout_hwnd, BM_SETIMAGE, IMAGE_ICON, (LPARAM)hLayout);
-        } else {
-            SetWindowTextA(g_btn_layout_hwnd, "Layout");
-        }
+        g_btn_start_hwnd = CreateWindowA("BUTTON", "",
+                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_ICON | WS_DISABLED,
+                                           297, 5, 28, 28, hwnd, (HMENU)ID_BTN_START, g_hInst, NULL);
+        HICON hStart = load_png_icon("res\\toolbar\\start.png", 24, 85, 85, 85, true);
+        if (hStart) SendMessageA(g_btn_start_hwnd, BM_SETIMAGE, IMAGE_ICON, (LPARAM)hStart);
 
-        g_btn_back_hwnd = CreateWindowA("BUTTON", "Back",
-                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                         68, 34, 48, 22, hwnd, (HMENU)ID_BTN_BACK, g_hInst, NULL);
-        g_btn_home_hwnd = CreateWindowA("BUTTON", "Home",
-                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                         120, 34, 48, 22, hwnd, (HMENU)ID_BTN_HOME, g_hInst, NULL);
-        g_btn_recent_hwnd = CreateWindowA("BUTTON", "Recent",
-                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                           172, 34, 50, 22, hwnd, (HMENU)ID_BTN_RECENT, g_hInst, NULL);
-        g_btn_volup_hwnd = CreateWindowA("BUTTON", "Vol+",
-                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                          226, 34, 42, 22, hwnd, (HMENU)ID_BTN_VOLUP, g_hInst, NULL);
-        g_btn_voldown_hwnd = CreateWindowA("BUTTON", "Vol-",
-                                            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                            272, 34, 42, 22, hwnd, (HMENU)ID_BTN_VOLDOWN, g_hInst, NULL);
-        g_btn_power_hwnd = CreateWindowA("BUTTON", "Power",
-                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                          318, 34, 48, 22, hwnd, (HMENU)ID_BTN_POWER, g_hInst, NULL);
-        g_btn_reboot_hwnd = CreateWindowA("BUTTON", "Reboot",
-                                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                             370, 34, 50, 22, hwnd, (HMENU)ID_BTN_REBOOT, g_hInst, NULL);
+        SetWindowTheme(g_btn_refresh_hwnd, L"", L"");
+        SetWindowTheme(g_btn_start_hwnd, L"", L"");
+
+        // Row 2: icon buttons via mkbtn lambda
+        int bx = 8, by = 35, bsz = 28, bgap = 4;
+        auto mkbtn = [&](const char *png, int id) -> HWND {
+            HWND h = CreateWindowA("BUTTON", "",
+                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_ICON,
+                                    bx, by, bsz, bsz, hwnd, (HMENU)(INT_PTR)id, g_hInst, NULL);
+            HICON ico = load_png_icon(png, 24, 85, 85, 85, true);
+            if (ico) SendMessageA(h, BM_SETIMAGE, IMAGE_ICON, (LPARAM)ico);
+            SetWindowTheme(h, L"", L"");
+            bx += bsz + bgap;
+            return h;
+        };
+
+        g_btn_quality_hwnd = mkbtn("res\\toolbar\\settings.png", ID_BTN_QUALITY);
+        g_btn_layout_hwnd  = mkbtn("res\\toolbar\\layout.png", ID_BTN_LAYOUT);
+        g_btn_fm_hwnd      = mkbtn("res\\toolbar\\file-manager.png", ID_BTN_FM);
+        g_btn_back_hwnd    = mkbtn("res\\toolbar\\back.png", ID_BTN_BACK);
+        g_btn_home_hwnd    = mkbtn("res\\toolbar\\home.png", ID_BTN_HOME);
+        g_btn_recent_hwnd  = mkbtn("res\\toolbar\\recent.png", ID_BTN_RECENT);
+        g_btn_volup_hwnd   = mkbtn("res\\toolbar\\vol-increase.png", ID_BTN_VOLUP);
+        g_btn_voldown_hwnd = mkbtn("res\\toolbar\\vol-decrease.png", ID_BTN_VOLDOWN);
+        g_btn_power_hwnd   = mkbtn("res\\toolbar\\power.png", ID_BTN_POWER);
+        g_btn_reboot_hwnd  = mkbtn("res\\toolbar\\reboot.png", ID_BTN_REBOOT);
 
         g_status_hwnd = CreateWindowA("STATIC", "",
                                        WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                       450, 38, 400, 18, hwnd, NULL, g_hInst, NULL);
+                                       bx + 4, 38, 400, 18, hwnd, NULL, g_hInst, NULL);
 
         g_canvas_hwnd = CreateWindowA(CANVAS_CLASS, "",
                                        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_TABSTOP,
@@ -1396,6 +1458,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         LOGI("Canvas subclassed, orig_wndproc=%p, err=%d", g_canvas_orig_wndproc, GetLastError());
 
         LayoutWindow::create(g_hInst, hwnd, 420);
+        FileManagerWindow::create(g_hInst, hwnd, 420);
 
         // Register and create splitter bar (hidden initially)
         {
@@ -1484,21 +1547,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 break;
             }
             if (LayoutWindow::is_visible()) {
+                // Hide layout panel
                 LayoutWindow::hide();
                 ShowWindow(g_splitter_hwnd, SW_HIDE);
                 g_layout_visible = false;
-                SetWindowTextA(g_btn_layout_hwnd, "Layout");
-                // Shrink window: remove panel width (triggers WM_SIZE which repositions canvas)
-                {
-                    RECT wr;
-                    GetWindowRect(hwnd, &wr);
-                    SetWindowPos(hwnd, NULL, 0, 0,
-                                 wr.right - wr.left - LayoutWindow::panel_width(),
-                                 wr.bottom - wr.top,
-                                 SWP_NOMOVE | SWP_NOZORDER);
-                }
+                RECT wr;
+                GetWindowRect(hwnd, &wr);
+                SetWindowPos(hwnd, NULL, 0, 0,
+                             wr.right - wr.left - LayoutWindow::panel_width(),
+                             wr.bottom - wr.top,
+                             SWP_NOMOVE | SWP_NOZORDER);
             } else {
-                // Show layout panel first (so WM_SIZE can see it)
+                bool need_expand = !g_layout_visible && !g_fm_visible;
+                // Hide FM panel if visible
+                if (g_fm_visible) {
+                    FileManagerWindow::hide();
+                    g_fm_visible = false;
+                }
                 LayoutWindow::show(
                     [](int left, int top, int right, int bottom) {
                         InvalidateRect(g_canvas_hwnd, NULL, FALSE);
@@ -1509,15 +1574,70 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 );
                 ShowWindow(g_splitter_hwnd, SW_SHOW);
                 g_layout_visible = true;
-                SetWindowTextA(g_btn_layout_hwnd, "Hide");
-                // Expand window: add panel width to the right (triggers WM_SIZE)
-                {
+                if (need_expand) {
                     RECT wr;
                     GetWindowRect(hwnd, &wr);
                     SetWindowPos(hwnd, NULL, 0, 0,
                                  wr.right - wr.left + LayoutWindow::panel_width(),
                                  wr.bottom - wr.top,
                                  SWP_NOMOVE | SWP_NOZORDER);
+                } else {
+                    // Panel swapped, just reposition
+                    SendMessageW(hwnd, WM_SIZE, 0, 0);
+                }
+            }
+            break;
+        case ID_BTN_FM:
+            if (!g_mirroring) {
+                center_msgbox("Start mirroring first to use file manager.", "HScrcpy", MB_OK | MB_ICONINFORMATION);
+                break;
+            }
+            if (FileManagerWindow::is_visible()) {
+                // Hide FM panel
+                FileManagerWindow::hide();
+                ShowWindow(g_splitter_hwnd, SW_HIDE);
+                g_fm_visible = false;
+                RECT wr;
+                GetWindowRect(hwnd, &wr);
+                SetWindowPos(hwnd, NULL, 0, 0,
+                             wr.right - wr.left - FileManagerWindow::panel_width(),
+                             wr.bottom - wr.top,
+                             SWP_NOMOVE | SWP_NOZORDER);
+            } else {
+                bool need_expand = !g_layout_visible && !g_fm_visible;
+                // Hide layout panel if visible
+                if (g_layout_visible) {
+                    LayoutWindow::hide();
+                    g_layout_visible = false;
+                }
+                FileManagerWindow::show(
+                    [](const std::string &cmd, std::string *output, int timeout_sec) -> bool {
+                        if (!g_hdc) return false;
+                        return g_hdc->shell_command(cmd, output, timeout_sec);
+                    },
+                    [](const std::string &local, const std::string &remote) -> bool {
+                        if (!g_hdc) return false;
+                        return g_hdc->push_file(local, remote);
+                    },
+                    [](const std::string &remote, const std::string &local) -> bool {
+                        if (!g_hdc) return false;
+                        return g_hdc->pull_file(remote, local);
+                    },
+                    [](bool busy) {
+                    }
+                );
+                ShowWindow(g_splitter_hwnd, SW_SHOW);
+                g_fm_visible = true;
+                if (need_expand) {
+                    RECT wr;
+                    GetWindowRect(hwnd, &wr);
+                    SetWindowPos(hwnd, NULL, 0, 0,
+                                 wr.right - wr.left + FileManagerWindow::panel_width(),
+                                 wr.bottom - wr.top,
+                                 SWP_NOMOVE | SWP_NOZORDER);
+                } else {
+                    // Panel swapped, just reposition
+                    SendMessageW(hwnd, WM_SIZE, 0, 0);
                 }
             }
             break;
@@ -1536,6 +1656,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (canvas_w < 100) { canvas_w = 100; pw = client_w - canvas_w; }
             LayoutWindow::reposition(canvas_w, TOOLBAR_H, pw, client_h);
             MoveWindow(g_splitter_hwnd, canvas_w - 2, TOOLBAR_H, 4, client_h, TRUE);
+        } else if (g_fm_visible && FileManagerWindow::is_visible()) {
+            int pw = FileManagerWindow::panel_width();
+            canvas_w = client_w - pw;
+            if (canvas_w < 100) { canvas_w = 100; pw = client_w - canvas_w; }
+            FileManagerWindow::reposition(canvas_w, TOOLBAR_H, pw, client_h);
+            MoveWindow(g_splitter_hwnd, canvas_w - 2, TOOLBAR_H, 4, client_h, TRUE);
         }
 
         MoveWindow(g_canvas_hwnd, 0, TOOLBAR_H, canvas_w, client_h, FALSE);
@@ -1543,6 +1669,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_d2d_rt) g_d2d_rt->Resize(D2D1::SizeU(canvas_w, client_h));
         InvalidateRect(g_canvas_hwnd, NULL, FALSE);
         break;
+    }
+    case WM_CTLCOLORBTN: {
+        HDC hdcBtn = (HDC)wp;
+        SetBkMode(hdcBtn, TRANSPARENT);
+        SetTextColor(hdcBtn, RGB(60, 60, 60));
+        return (INT_PTR)GetSysColorBrush(COLOR_BTNFACE);
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC hdcStatic = (HDC)wp;
+        SetBkMode(hdcStatic, TRANSPARENT);
+        SetTextColor(hdcStatic, RGB(60, 60, 60));
+        return (INT_PTR)GetSysColorBrush(COLOR_BTNFACE);
     }
     case WM_TIMER:
         if (wp == 1 && g_mirroring) {
@@ -1623,7 +1761,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         g_mirroring = true;
         g_capture->set_notify_hwnd(g_hwnd);
-        SetWindowTextA(g_btn_start_hwnd, "Stop Mirroring");
+        {
+            HICON hPrev = (HICON)SendMessageA(g_btn_start_hwnd, BM_GETIMAGE, IMAGE_ICON, 0);
+            HICON hStopIcon = load_png_icon("res\\toolbar\\stop.png", 24, 85, 85, 85, true);
+            SendMessageA(g_btn_start_hwnd, BM_SETIMAGE, IMAGE_ICON, (LPARAM)hStopIcon);
+            if (hPrev) DestroyIcon(hPrev);
+        }
         EnableWindow(g_btn_start_hwnd, TRUE);
 
         double aspect = (double)g_screen_w / g_screen_h;
@@ -1742,6 +1885,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         destroy_backbuffer();
         LayoutWindow::destroy();
+        FileManagerWindow::destroy();
         join_cleanup_thread();
         join_startup_thread();
         if (g_canvas_orig_wndproc && g_canvas_hwnd) {

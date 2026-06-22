@@ -19,6 +19,7 @@ add_executable(hscrcpy WIN32
     src/cli.cpp
     src/config.cpp
     src/layout_window.cpp
+    src/file_manager_window.cpp
 )
 
 # ============================================
@@ -88,7 +89,7 @@ message(STATUS "FFmpeg: OK (${AVCODEC_LIB})")
 # Windows libraries
 # ============================================
 target_link_libraries(hscrcpy
-    gdi32 gdiplus ws2_32 shell32 user32 kernel32 ole32 d2d1 comctl32
+    gdi32 gdiplus ws2_32 shell32 user32 kernel32 ole32 d2d1 comctl32 uxtheme
 )
 
 target_compile_definitions(hscrcpy PRIVATE _CRT_SECURE_NO_WARNINGS)
