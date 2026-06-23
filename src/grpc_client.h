@@ -43,6 +43,7 @@ private:
     bool recv_grpc_response();
     bool parse_reply_message(const uint8_t *data, size_t size, GrpcReplyMessage &msg);
     void streaming_loop();
+    bool send_onstart_request(uint32_t stream_id);
 
     int sock_ = -1;
     std::string connected_host_;
@@ -57,6 +58,7 @@ private:
     uint32_t server_window_size_ = 65535;
     bool idr_requested_ = false;
     uint32_t next_stream_id_ = 3;
+    uint32_t active_stream_id_ = 1;
     int idle_timeout_sec_ = 300;
 };
 

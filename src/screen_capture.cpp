@@ -367,11 +367,11 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
         std::string kill_cmd = "kill -9";
         for (auto &p : pids) kill_cmd += " " + p;
         hdc_.shell_command(kill_cmd, nullptr, 3);
-        Sleep(500);
+        Sleep(1000);
     } else if (extension_running) {
         LOGI("Extension running but PID not found, killing by name");
         hdc_.shell_command("pkill -9 -f extension-name", nullptr, 3);
-        Sleep(500);
+        Sleep(1000);
     }
 
     std::string daemon_check;
@@ -399,15 +399,30 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
     }
 
     LOGI("Pushing %s to %s (md5_match=%s)", local_so.c_str(), kDeviceSoPath, so_up_to_date ? "yes" : "no");
-    if (!hdc_.push_file(local_so, kDeviceSoPath)) {
-        LOGE("Failed to push server SO");
-        return false;
+    if (!so_up_to_date) {
+        if (!hdc_.push_file(local_so, kDeviceSoPath)) {
+            LOGE("Failed to push server SO");
+            return false;
+        }
+    } else {
+        LOGI("SO already up to date, skipping push");
     }
 
     std::string cmd = build_extension_cmd();
     LOGI("Starting uitest extension: %s", cmd.c_str());
     hdc_.shell_command(cmd, nullptr, 5);
 
+    if (!wait_for_extension_ready()) {
+        return false;
+    }
+
+    Sleep(1000);
+
+    uitest_port_ = kDefaultVideoPort;
+    return true;
+}
+
+bool ScreenCapture::wait_for_extension_ready() {
     bool extension_ready = false;
     for (int i = 0; i < 30; i++) {
         Sleep(100);
@@ -420,11 +435,51 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
                 break;
             }
         } else {
+            // Check TCP port 5000 — HarmonyOS netstat may not show it reliably,
+            // so we also check the extension process as a fallback indicator.
             hdc_.shell_command("netstat -an", &check, 3);
-            if (check.find("5000") != std::string::npos && check.find("LISTEN") != std::string::npos) {
+            bool port_listening = false;
+            std::istringstream nss(check);
+            std::string nline;
+            while (std::getline(nss, nline)) {
+                if (nline.find("LISTEN") == std::string::npos) continue;
+                if (nline.find(":5000") != std::string::npos) {
+                    port_listening = true;
+                    break;
+                }
+            }
+            if (port_listening) {
                 LOGI("uitest extension ready (port 5000) after %d ms", (i + 1) * 100);
                 extension_ready = true;
                 break;
+            }
+            // Fallback: check if extension process is running and abstract socket exists
+            hdc_.shell_command("cat /proc/net/unix", &check, 3);
+            if (check.find(kGrpcSocketName) != std::string::npos) {
+                LOGI("uitest extension ready (abstract socket fallback) after %d ms", (i + 1) * 100);
+                use_abstract_socket_ = true;
+                extension_ready = true;
+                break;
+            }
+            // Final fallback: if extension process exists after a reasonable wait,
+            // assume it's ready (netstat may be unreliable on some HarmonyOS versions)
+            if (i >= 5) {
+                std::string ps_check;
+                hdc_.shell_command("ps -ef", &ps_check, 3);
+                std::istringstream pss(ps_check);
+                bool ext_found = false;
+                while (std::getline(pss, nline)) {
+                    if (nline.find("extension-name") != std::string::npos &&
+                        nline.find("grep") == std::string::npos) {
+                        ext_found = true;
+                        break;
+                    }
+                }
+                if (ext_found) {
+                    LOGI("uitest extension ready (process detected, netstat unreliable) after %d ms", (i + 1) * 100);
+                    extension_ready = true;
+                    break;
+                }
             }
         }
     }
@@ -449,9 +504,6 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
         return false;
     }
 
-    Sleep(500);
-
-    uitest_port_ = kDefaultVideoPort;
     return true;
 }
 
@@ -749,7 +801,13 @@ bool ScreenCapture::reconnect_grpc_stream() {
     // Kill and restart extension (same as fresh connection)
     kill_uitest_extension();
     hdc_.shell_command(build_extension_cmd(), nullptr, 5);
-    Sleep(500);
+
+    if (!wait_for_extension_ready()) {
+        LOGE("Reconnect: uitest extension failed to start");
+        return false;
+    }
+
+    Sleep(1000);
 
     if (!setup_port_forward()) {
         LOGE("Reconnect: failed to setup port forward");
@@ -894,6 +952,7 @@ static bool is_idr_frame(const uint8_t *data, size_t size) {
 void ScreenCapture::decode_loop() {
     LOGI("Decode loop started");
 
+    int total_packets = 0;
     while (running_) {
         std::shared_ptr<std::vector<uint8_t>> h264_data;
         {
@@ -929,6 +988,7 @@ void ScreenCapture::decode_loop() {
             h264_queue_.pop_front();
         }
 
+        total_packets++;
         bool ok = decoder_.decode(h264_data->data(), h264_data->size());
         if (ok) {
             auto &img = decoder_.image();
@@ -964,7 +1024,8 @@ void ScreenCapture::decode_loop() {
         }
     }
 
-    LOGI("Decode loop ended");
+    LOGI("Decode loop ended (total_packets=%d, frames_decoded=%llu)",
+         total_packets, (unsigned long long)frame_count_.load());
 }
 
 bool ScreenCapture::capture_one_snapshot() {

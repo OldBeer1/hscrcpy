@@ -401,35 +401,43 @@ void GrpcClient::disconnect() {
     connected_ = false;
 }
 
+bool GrpcClient::send_onstart_request(uint32_t stream_id) {
+    std::vector<uint8_t> hpack_block;
+    std::string authority = connected_host_ + ":" + std::to_string(connected_port_);
+    build_grpc_headers(hpack_block, "/ScrcpyService/onStart", authority);
+
+    std::vector<uint8_t> headers_frame;
+    write_frame(headers_frame, 0x01, 0x04, stream_id,
+                hpack_block.data(), hpack_block.size());
+
+    if (!send_all(sock_, headers_frame.data(), headers_frame.size())) {
+        LOGE("Failed to send HEADERS frame on stream %u", stream_id);
+        return false;
+    }
+
+    uint8_t grpc_empty[5] = {0, 0, 0, 0, 0};
+    std::vector<uint8_t> data_frame;
+    write_frame(data_frame, 0x00, 0x01, stream_id, grpc_empty, 5);
+
+    if (!send_all(sock_, data_frame.data(), data_frame.size())) {
+        LOGE("Failed to send DATA frame on stream %u", stream_id);
+        return false;
+    }
+
+    LOGI("Sent gRPC onStart request on stream %u", stream_id);
+    return true;
+}
+
 bool GrpcClient::start_streaming(const std::function<void(const uint8_t *, size_t)> &on_h264_frame) {
     if (streaming_) return true;
     if (!connected_) return false;
 
     on_frame_ = on_h264_frame;
 
-    std::vector<uint8_t> hpack_block;
-    std::string authority = connected_host_ + ":" + std::to_string(connected_port_);
-    build_grpc_headers(hpack_block, "/ScrcpyService/onStart", authority);
-
-    std::vector<uint8_t> headers_frame;
-    write_frame(headers_frame, 0x01, 0x04, 1,
-                hpack_block.data(), hpack_block.size());
-
-    if (!send_all(sock_, headers_frame.data(), headers_frame.size())) {
-        LOGE("Failed to send HEADERS frame");
+    active_stream_id_ = 1;
+    if (!send_onstart_request(active_stream_id_)) {
         return false;
     }
-
-    uint8_t grpc_empty[5] = {0, 0, 0, 0, 0};
-    std::vector<uint8_t> data_frame;
-    write_frame(data_frame, 0x00, 0x01, 1, grpc_empty, 5);
-
-    if (!send_all(sock_, data_frame.data(), data_frame.size())) {
-        LOGE("Failed to send DATA frame (empty protobuf)");
-        return false;
-    }
-
-    LOGI("Sent gRPC onStart request (HEADERS + empty DATA)");
 
     send_window_update(sock_, 0, 4194304 - 65535);
 
@@ -488,6 +496,13 @@ void GrpcClient::streaming_loop() {
     uint32_t bytes_received_on_stream = 0;
     uint32_t window_update_threshold = 262144;
     int consecutive_rst_on_idr = 0;
+    int end_stream_retries = 0;
+    const int kMaxEndStreamRetries = 500;  // TCP devices need a new stream per frame; allow sustained streaming
+    int stall_retries = 0;
+    const int kMaxStallRetries = 10;  // Max consecutive stall recoveries without receiving data
+    const int kStallTimeoutSec = 30;  // Fallback: if no data for 30s, try new stream (END_STREAM recovery handles normal case)
+    bool got_response_headers = false;  // Did we receive HEADERS on active_stream_id_?
+    const int kNoResponseTimeoutSec = 5;  // If no response headers in 5s, retry
 
     std::vector<uint8_t> grpc_msg_buf;
     grpc_msg_buf.reserve(512 * 1024);
@@ -509,6 +524,72 @@ void GrpcClient::streaming_loop() {
         }
         if (sel == 0) {
             idle_count++;
+            // No response detection: if no HEADERS received on active stream within N seconds,
+            // the server is not processing our onStart request. Try opening a new stream.
+            if (!got_response_headers && idle_count >= kNoResponseTimeoutSec * 2) {
+                LOGW("No response headers on stream %u after %ds (retries=%d/%d)",
+                     active_stream_id_, kNoResponseTimeoutSec, end_stream_retries, kMaxEndStreamRetries);
+                if (end_stream_retries < kMaxEndStreamRetries) {
+                    end_stream_retries++;
+                    uint32_t new_stream_id = next_stream_id_;
+                    next_stream_id_ += 2;
+                    LOGI("Opening new stream %u for onStart (no response retry %d)", new_stream_id, end_stream_retries);
+                    if (send_onstart_request(new_stream_id)) {
+                        active_stream_id_ = new_stream_id;
+                        grpc_consumed = 0;
+                        grpc_buf_size = 0;
+                        grpc_header_parsed = false;
+                        grpc_expected_len = 0;
+                        bytes_received_on_stream = 0;
+                        idr_requested_ = false;
+                        idle_count = 0;
+                        got_response_headers = false;
+                        LOGI("New stream %u opened (no response retry), waiting for data", new_stream_id);
+                    } else {
+                        LOGW("Failed to open new stream, stopping");
+                        streaming_ = false;
+                        break;
+                    }
+                } else {
+                    LOGW("Max no-response retries reached, stopping streaming");
+                    streaming_ = false;
+                    break;
+                }
+            }
+            // Stream stall detection: if we've received data before but now no data for N seconds,
+            // the server has gone silent without sending END_STREAM. Try opening a new stream.
+            if (got_first_data && idle_count >= kStallTimeoutSec * 2) {
+                LOGW("Stream stalled: no data for %ds after first frame (stall_retries=%d/%d)",
+                     kStallTimeoutSec, stall_retries, kMaxStallRetries);
+                if (stall_retries < kMaxStallRetries) {
+                    stall_retries++;
+                    uint32_t new_stream_id = next_stream_id_;
+                    next_stream_id_ += 2;
+                    LOGI("Opening new stream %u after stall (retry %d)", new_stream_id, stall_retries);
+                    if (send_onstart_request(new_stream_id)) {
+                        active_stream_id_ = new_stream_id;
+                        grpc_consumed = 0;
+                        grpc_buf_size = 0;
+                        grpc_header_parsed = false;
+                        grpc_expected_len = 0;
+                        bytes_received_on_stream = 0;
+                        idr_requested_ = false;
+                        idle_count = 0;
+                        got_response_headers = false;
+                        got_first_data = false;  // Reset so stall detection doesn't re-trigger immediately
+                        LOGI("New stream %u opened after stall, waiting for data", new_stream_id);
+                        continue;
+                    } else {
+                        LOGW("Failed to open new stream after stall, stopping");
+                        streaming_ = false;
+                        break;
+                    }
+                } else {
+                    LOGW("Max stall retries reached, stopping streaming");
+                    streaming_ = false;
+                    break;
+                }
+            }
             if (idle_count >= idle_timeout_sec_ * 2) {
                 LOGI("No data for %ds, stream dead", idle_timeout_sec_);
                 connected_ = false;
@@ -545,11 +626,19 @@ void GrpcClient::streaming_loop() {
             size_t total = 9 + frame_len;
             if (pos + total > buf_used) break;
 
+            // Log important HTTP2 frames only (END_STREAM, RST_STREAM, GOAWAY, SETTINGS)
+            if ((flags & 0x01) || frame_type == 0x03 || frame_type == 0x07) {
+                LOGI("HTTP2: type=%u flags=0x%02x stream=%u len=%u", frame_type, flags, stream_id, frame_len);
+            }
+
             if (frame_type == 0x00) {
                 const uint8_t *payload = recv_buffer_.data() + pos + 9;
                 bytes_received_on_stream += frame_len;
 
-                if (stream_id == 1) {
+                if (stream_id == active_stream_id_) {
+                    if (!got_response_headers) {
+                        got_response_headers = true;
+                    }
                     if (grpc_consumed > 0) {
                         if (grpc_consumed < grpc_buf_size) {
                             size_t remaining = grpc_buf_size - grpc_consumed;
@@ -591,6 +680,7 @@ void GrpcClient::streaming_loop() {
                                 on_frame_(h264_ref.data, h264_ref.size);
                                 got_first_data = true;
                                 consecutive_rst_on_idr = 0;
+                                end_stream_retries = 0;  // Data received, stream recovery working
                             }
                         }
 
@@ -606,15 +696,84 @@ void GrpcClient::streaming_loop() {
                     bytes_received_on_stream = 0;
                 }
 
+                // Proactive WINDOW_UPDATE: send immediately after first DATA on active stream
+                // to signal the server we're consuming data. Some servers (uitest 5.0.1.2 on TCP)
+                // may stop streaming if they don't see WINDOW_UPDATE promptly.
+                if (stream_id == active_stream_id_ && bytes_received_on_stream > 0 &&
+                    bytes_received_on_stream < window_update_threshold) {
+                    send_window_update(sock_, stream_id, bytes_received_on_stream);
+                    send_window_update(sock_, 0, bytes_received_on_stream);
+                    bytes_received_on_stream = 0;
+                }
+
                 if (flags & 0x01) {
-                    if (stream_id == 1) {
-                        LOGI("Server closed stream 1 (END_STREAM)");
-                        streaming_ = false;
+                    if (stream_id == active_stream_id_) {
+                        LOGI("Server closed stream %u (END_STREAM), retries=%d/%d",
+                             active_stream_id_, end_stream_retries, kMaxEndStreamRetries);
+                        if (end_stream_retries < kMaxEndStreamRetries) {
+                            end_stream_retries++;
+                            uint32_t new_stream_id = next_stream_id_;
+                            next_stream_id_ += 2;
+                            LOGI("Opening new stream %u for onStart retry %d", new_stream_id, end_stream_retries);
+                            if (send_onstart_request(new_stream_id)) {
+                                active_stream_id_ = new_stream_id;
+                                grpc_consumed = 0;
+                                grpc_buf_size = 0;
+                                grpc_header_parsed = false;
+                                grpc_expected_len = 0;
+                                bytes_received_on_stream = 0;
+                                idr_requested_ = false;
+                                idle_count = 0;
+                                got_first_data = false;
+                                got_response_headers = false;
+                                LOGI("New stream %u opened, continuing streaming", new_stream_id);
+                            } else {
+                                LOGW("Failed to open new stream, stopping");
+                                streaming_ = false;
+                            }
+                        } else {
+                            LOGW("Max END_STREAM retries reached, stopping streaming");
+                            streaming_ = false;
+                        }
                     }
                 }
             } else if (frame_type == 0x01) {
-                if (stream_id == 1 && !idr_requested_) {
-                    idr_requested_ = true;
+                if (stream_id == active_stream_id_) {
+                    if (!idr_requested_) {
+                        idr_requested_ = true;
+                    }
+                    if (!got_response_headers) {
+                        got_response_headers = true;
+                    }
+                    // gRPC trailers: HEADERS with END_STREAM flag closes the stream
+                    if (flags & 0x01) {
+                        LOGI("Server closed stream %u (trailers HEADERS with END_STREAM)", active_stream_id_);
+                        if (end_stream_retries < kMaxEndStreamRetries) {
+                            end_stream_retries++;
+                            uint32_t new_stream_id = next_stream_id_;
+                            next_stream_id_ += 2;
+                            LOGI("Opening new stream %u for onStart retry %d", new_stream_id, end_stream_retries);
+                            if (send_onstart_request(new_stream_id)) {
+                                active_stream_id_ = new_stream_id;
+                                grpc_consumed = 0;
+                                grpc_buf_size = 0;
+                                grpc_header_parsed = false;
+                                grpc_expected_len = 0;
+                                bytes_received_on_stream = 0;
+                                idr_requested_ = false;
+                                idle_count = 0;
+                                got_first_data = false;
+                                got_response_headers = false;
+                                LOGI("New stream %u opened after trailers, continuing streaming", new_stream_id);
+                            } else {
+                                LOGW("Failed to open new stream, stopping");
+                                streaming_ = false;
+                            }
+                        } else {
+                            LOGW("Max END_STREAM retries reached, stopping streaming");
+                            streaming_ = false;
+                        }
+                    }
                 }
             } else if (frame_type == 0x04) {
                 if (!(flags & 0x01)) {
@@ -631,7 +790,7 @@ void GrpcClient::streaming_loop() {
                 streaming_ = false;
             } else if (frame_type == 0x03) {
                 LOGW("Received RST_STREAM on stream %u", stream_id);
-                if (stream_id == 1) {
+                if (stream_id == active_stream_id_) {
                     streaming_ = false;
                 } else if (stream_id > 1 && (stream_id & 1)) {
                     consecutive_rst_on_idr++;
@@ -670,7 +829,8 @@ void GrpcClient::streaming_loop() {
     }
 
     streaming_ = false;
-    LOGI("Streaming loop ended, got_data=%d, connected=%d", got_first_data, (int)connected_.load());
+    LOGI("Streaming loop ended, got_data=%d, connected=%d, stall_retries=%d, end_stream_retries=%d",
+         got_first_data, (int)connected_.load(), stall_retries, end_stream_retries);
 }
 
 } // namespace hscrcpy

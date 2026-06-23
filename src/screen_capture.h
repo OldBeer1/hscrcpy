@@ -59,6 +59,7 @@ private:
     bool setup_grpc_stream(bool force_restart = false);
     bool setup_snapshot_fallback();
     bool start_uitest_with_extension(bool force_restart = false);
+    bool wait_for_extension_ready();
     bool setup_port_forward();
     bool reconnect_grpc_stream();
     std::string get_local_so_md5(const std::string &filepath);

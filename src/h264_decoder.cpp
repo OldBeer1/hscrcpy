@@ -143,6 +143,10 @@ bool H264Decoder::decode(const uint8_t *h264_data, size_t h264_size) {
 
         int send_ret = avcodec_send_packet(codec_ctx_, pkt_);
         if (send_ret < 0 && send_ret != AVERROR(EAGAIN)) {
+            static int send_fail_count = 0;
+            if (++send_fail_count <= 5) {
+                LOGW("avcodec_send_packet error ret=%d pkt_size=%d", send_ret, pkt_->size);
+            }
             continue;
         }
         data_accepted = true;
