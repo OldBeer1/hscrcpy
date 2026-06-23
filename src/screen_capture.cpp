@@ -777,6 +777,28 @@ void ScreenCapture::kill_uitest_extension() {
 bool ScreenCapture::reconnect_grpc_stream() {
     LOGI("Attempting gRPC reconnection...");
 
+    // Check if hdc connection to device is still alive before attempting reconnection.
+    // If the device disconnected (e.g. TCP device went offline), all hdc shell commands
+    // will time out and reconnection is impossible — we should fail fast.
+    if (!hdc_.is_device_reachable()) {
+        // For TCP devices, the device may have reconnected with a new port.
+        // Try to find it in the device list and update the serial.
+        if (hdc_.is_tcp() && hdc_.try_reconnect_new_port()) {
+            LOGI("Device reconnected with new port, continuing reconnection");
+        } else {
+            LOGE("Reconnect: device is not reachable via hdc (TCP connection may be lost)");
+            return false;
+        }
+    }
+
+    // For TCP devices, re-establish the hdc connection
+    if (hdc_.is_tcp()) {
+        if (!hdc_.ensure_connected()) {
+            LOGE("Reconnect: failed to re-establish hdc connection");
+            return false;
+        }
+    }
+
     grpc_client_.disconnect();
     Sleep(500);
 
@@ -858,10 +880,38 @@ void ScreenCapture::grpc_stream_loop() {
 
     int reconnect_attempts = 0;
     uint64_t last_frame_count = frame_count_.load();
+    int hdc_check_counter = 0;  // Check hdc reachability every ~10s while streaming
 
     while (running_) {
         while (running_ && grpc_client_.is_connected() && grpc_client_.is_streaming_active()) {
             Sleep(100);
+
+            // If PING keepalive is failing, break out to trigger reconnection
+            if (grpc_client_.is_ping_failing()) {
+                LOGW("PING keepalive failing, breaking out of streaming loop");
+                break;
+            }
+
+            // Periodically check hdc reachability for TCP devices (~every 10s)
+            if (hdc_.is_tcp()) {
+                hdc_check_counter++;
+                if (hdc_check_counter >= 100) {
+                    hdc_check_counter = 0;
+                    if (!hdc_.is_device_reachable()) {
+                        // Device may have reconnected with new port, try to find it
+                        if (hdc_.try_reconnect_new_port()) {
+                            LOGI("Device reconnected with new port during streaming, triggering gRPC reconnect");
+                            break;  // Break inner loop to trigger gRPC reconnection
+                        }
+                        LOGE("Device disconnected (hdc unreachable during streaming)");
+                        if (notify_hwnd_) {
+                            PostMessageA(notify_hwnd_, kMsgDeviceDisconnected, 0, 0);
+                        }
+                        running_ = false;
+                        break;
+                    }
+                }
+            }
         }
 
         if (!running_) break;
@@ -885,6 +935,21 @@ void ScreenCapture::grpc_stream_loop() {
 
         if (!reconnect_grpc_stream()) {
             LOGE("Reconnect failed (attempt %d/%d)", reconnect_attempts, max_grpc_reconnect_);
+
+            // If hdc connection to device is lost, try to find device with new port.
+            // Only give up if the device is truly gone from the hdc device list.
+            if (!hdc_.is_device_reachable()) {
+                if (hdc_.is_tcp() && hdc_.try_reconnect_new_port()) {
+                    LOGI("Device reconnected with new port, retrying gRPC reconnection");
+                    continue;
+                }
+                LOGE("Device disconnected (hdc unreachable), stopping reconnection");
+                if (notify_hwnd_) {
+                    PostMessageA(notify_hwnd_, kMsgDeviceDisconnected, 0, 0);
+                }
+                break;
+            }
+
             if (reconnect_attempts >= max_grpc_reconnect_) break;
             Sleep(1000);
             continue;
@@ -916,8 +981,14 @@ void ScreenCapture::grpc_stream_loop() {
 
     grpc_client_.stop_streaming();
     reconnecting_ = false;
+    running_ = false;
     h264_queue_cv_.notify_all();
     LOGI("gRPC stream loop ended, frames: %llu", (unsigned long long)frame_count_.load());
+
+    // Notify UI that streaming has stopped (connection lost or max retries exceeded)
+    if (notify_hwnd_) {
+        PostMessageA(notify_hwnd_, kMsgStreamEnded, 0, 0);
+    }
 }
 
 static bool is_idr_frame(const uint8_t *data, size_t size) {
@@ -1014,7 +1085,7 @@ void ScreenCapture::decode_loop() {
                 }
                 frame_count_++;
                 if (frame_event_) SetEvent(frame_event_);
-                if (notify_hwnd_) PostMessageA(notify_hwnd_, WM_USER + 10, 0, 0);
+                if (notify_hwnd_) PostMessageA(notify_hwnd_, kMsgFrameRender, 0, 0);
             }
         } else {
             static int decode_fail_count = 0;

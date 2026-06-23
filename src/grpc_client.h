@@ -31,6 +31,7 @@ public:
     void disconnect();
     bool is_connected() const { return connected_; }
     bool is_streaming_active() const { return streaming_; }
+    bool is_ping_failing() const { return ping_fail_count_ >= kPingFailThreshold; }
 
     bool start_streaming(const std::function<void(const uint8_t *, size_t)> &on_h264_frame);
     void stop_streaming();
@@ -60,6 +61,8 @@ private:
     uint32_t next_stream_id_ = 3;
     uint32_t active_stream_id_ = 1;
     int idle_timeout_sec_ = 300;
+    static constexpr int kPingFailThreshold = 2;  // Early warning: 2 unanswered PINGs
+    std::atomic<int> ping_fail_count_{0};
 };
 
 } // namespace hscrcpy

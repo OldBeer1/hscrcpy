@@ -462,6 +462,14 @@ LRESULT CALLBACK LayoutWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         NMHDR *nm = reinterpret_cast<NMHDR *>(lp);
         if (nm->idFrom == 1 && nm->code == TVN_SELCHANGEDW) {
             on_tree_select();
+            // Update Expand/Collapse button text based on selected node's state
+            HTREEITEM sel = TreeView_GetSelection(g_tree);
+            if (sel && g_expand_btn) {
+                UINT state = TreeView_GetItemState(g_tree, sel, TVIS_EXPANDED);
+                bool has_children = TreeView_GetChild(g_tree, sel) != nullptr;
+                if (has_children)
+                    SetWindowTextW(g_expand_btn, (state & TVIS_EXPANDED) ? L"Collapse" : L"Expand");
+            }
         } else if (nm->idFrom == 2) {
             if (nm->code == LVN_KEYDOWN) {
                 auto *lvkd = reinterpret_cast<NMLVKEYDOWN *>(lp);
@@ -493,14 +501,15 @@ LRESULT CALLBACK LayoutWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         case 21: copy_list_value(hwnd, get_selected_list_item()); break;
         case 22: copy_list_property(hwnd, get_selected_list_item()); break;
         case 13: {
-            static bool expanded = false;
-            HTREEITEM root = TreeView_GetRoot(g_tree);
-            while (root) {
-                TreeView_Expand(g_tree, root, expanded ? TVE_COLLAPSE : TVE_EXPAND);
-                root = TreeView_GetNextSibling(g_tree, root);
+            // Toggle expand/collapse on the currently selected node (or root if none selected)
+            HTREEITEM target = TreeView_GetSelection(g_tree);
+            if (!target) target = TreeView_GetRoot(g_tree);
+            if (target) {
+                UINT state = TreeView_GetItemState(g_tree, target, TVIS_EXPANDED);
+                bool is_expanded = (state & TVIS_EXPANDED) != 0;
+                TreeView_Expand(g_tree, target, is_expanded ? TVE_COLLAPSE : TVE_EXPAND);
+                SetWindowTextW(g_expand_btn, is_expanded ? L"Expand" : L"Collapse");
             }
-            SetWindowTextW(g_expand_btn, expanded ? L"Expand" : L"Collapse");
-            expanded = !expanded;
             break;
         }
         }
@@ -516,7 +525,12 @@ LRESULT CALLBACK LayoutWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             TreeView_DeleteAllItems(g_tree);
             ListView_DeleteAllItems(g_list);
             g_has_hl = false;
-            if (!g_root.attr("type").empty()) build_tree(TVI_ROOT, g_root);
+            if (!g_root.attr("type").empty()) {
+                build_tree(TVI_ROOT, g_root);
+                HTREEITEM root = TreeView_GetRoot(g_tree);
+                if (root) TreeView_Expand(g_tree, root, TVE_EXPAND);
+                if (g_expand_btn) SetWindowTextW(g_expand_btn, L"Collapse");
+            }
             if (g_status_label) SetWindowTextW(g_status_label, L"UI Layout");
         } else {
             if (g_status_label) SetWindowTextW(g_status_label, L"Failed to load layout");

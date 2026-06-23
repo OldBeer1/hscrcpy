@@ -1,4 +1,5 @@
 #include "grpc_client.h"
+#include "net_util.h"
 #include "log.h"
 #include <cstring>
 #include <cstdio>
@@ -126,6 +127,15 @@ static void send_window_update(int sock, uint32_t stream_id, uint32_t increment)
     frame[8] = static_cast<uint8_t>(stream_id & 0xFF);
     memcpy(frame + 9, payload, 4);
     send_all(sock, frame, 13);
+}
+
+static bool send_ping(int sock, uint64_t opaque) {
+    uint8_t frame[17];
+    frame[0] = 0; frame[1] = 0; frame[2] = 8;
+    frame[3] = 0x06; frame[4] = 0x00;  // PING, no ACK
+    frame[5] = 0; frame[6] = 0; frame[7] = 0; frame[8] = 0;
+    memcpy(frame + 9, &opaque, 8);
+    return send_all(sock, frame, 17);
 }
 
 static void send_ping_ack(int sock, const uint8_t *opaque_data) {
@@ -293,6 +303,9 @@ bool GrpcClient::connect(const std::string &host, uint16_t port) {
     int flag = 1;
     setsockopt(static_cast<socket_t>(sock_), IPPROTO_TCP, TCP_NODELAY,
                reinterpret_cast<const char *>(&flag), sizeof(flag));
+
+    // Enable TCP keepalive to detect silently dropped connections (especially TCP devices over network)
+    set_tcp_keepalive(sock_);
 
     struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
@@ -493,6 +506,9 @@ void GrpcClient::streaming_loop() {
 
     bool got_first_data = false;
     int idle_count = 0;
+    int ping_sent_count = 0;  // consecutive PING sent without receiving any data/ACK
+    const int kPingIntervalSec = 15;  // send PING every 15s when idle
+    const int kMaxPingWithoutResponse = 3;  // after 3 unanswered PINGs (~45s), consider connection dead
     uint32_t bytes_received_on_stream = 0;
     uint32_t window_update_threshold = 262144;
     int consecutive_rst_on_idr = 0;
@@ -524,6 +540,28 @@ void GrpcClient::streaming_loop() {
         }
         if (sel == 0) {
             idle_count++;
+
+            // Send HTTP/2 PING to detect half-open connections when idle.
+            // This is critical for TCP devices where the connection can be silently
+            // dropped by NAT/firewall without any RST/FIN.
+            if (got_first_data && idle_count > 0 && (idle_count % (kPingIntervalSec * 2)) == 0) {
+                uint64_t ping_opaque = 0x6873637263707900ULL + static_cast<uint64_t>(ping_sent_count);
+                LOGI("Sending keepalive PING (idle=%ds, ping_sent=%d)", idle_count / 2, ping_sent_count + 1);
+                if (!send_ping(sock_, ping_opaque)) {
+                    LOGW("Failed to send keepalive PING, connection is dead");
+                    connected_ = false;
+                    break;
+                }
+                ping_sent_count++;
+                ping_fail_count_.store(ping_sent_count);
+                if (ping_sent_count >= kMaxPingWithoutResponse) {
+                    LOGW("No response after %d keepalive PINGs (~%ds), connection is dead",
+                         ping_sent_count, ping_sent_count * kPingIntervalSec);
+                    connected_ = false;
+                    break;
+                }
+            }
+
             // No response detection: if no HEADERS received on active stream within N seconds,
             // the server is not processing our onStart request. Try opening a new stream.
             if (!got_response_headers && idle_count >= kNoResponseTimeoutSec * 2) {
@@ -558,7 +596,11 @@ void GrpcClient::streaming_loop() {
             }
             // Stream stall detection: if we've received data before but now no data for N seconds,
             // the server has gone silent without sending END_STREAM. Try opening a new stream.
-            if (got_first_data && idle_count >= kStallTimeoutSec * 2) {
+            // Only trigger when PING keepalive is working — if PING is also failing, the PING
+            // loop above already handles the disconnect. Stall means: server is alive (PING OK)
+            // but not producing frames (uitest extension may have crashed on the device).
+            if (got_first_data && idle_count >= kStallTimeoutSec * 2 &&
+                ping_sent_count == 0) {
                 LOGW("Stream stalled: no data for %ds after first frame (stall_retries=%d/%d)",
                      kStallTimeoutSec, stall_retries, kMaxStallRetries);
                 if (stall_retries < kMaxStallRetries) {
@@ -590,14 +632,20 @@ void GrpcClient::streaming_loop() {
                     break;
                 }
             }
-            if (idle_count >= idle_timeout_sec_ * 2) {
-                LOGI("No data for %ds, stream dead", idle_timeout_sec_);
+            // Idle timeout (fallback): if no data for the configured idle_timeout but
+            // PING keepalive is working, the server is alive but not producing frames.
+            // This catches cases where the uitest extension has crashed but the gRPC
+            // server is still responding. If PING is failing, the PING loop handles it.
+            if (got_first_data && idle_count >= idle_timeout_sec_ * 2 && ping_sent_count == 0) {
+                LOGI("No data for %ds but PING alive, server stopped producing frames", idle_timeout_sec_);
                 connected_ = false;
                 break;
             }
             continue;
         }
         idle_count = 0;
+        ping_sent_count = 0;
+        ping_fail_count_.store(0);
 
         int n = ::recv(static_cast<socket_t>(sock_),
                        reinterpret_cast<char *>(recv_buffer_.data() + buf_used),
@@ -681,6 +729,8 @@ void GrpcClient::streaming_loop() {
                                 got_first_data = true;
                                 consecutive_rst_on_idr = 0;
                                 end_stream_retries = 0;  // Data received, stream recovery working
+                                ping_sent_count = 0;  // Data flowing, no need for keepalive PING
+                                ping_fail_count_.store(0);
                             }
                         }
 
@@ -783,7 +833,13 @@ void GrpcClient::streaming_loop() {
                 }
             } else if (frame_type == 0x06) {
                 if (!(flags & 0x01)) {
+                    // Server-initiated PING: send ACK
                     send_ping_ack(sock_, recv_buffer_.data() + pos + 9);
+                } else {
+                    // PING ACK from our keepalive PING: connection is alive
+                    ping_sent_count = 0;
+                    ping_fail_count_.store(0);
+                    LOGI("Received PING ACK, connection alive");
                 }
             } else if (frame_type == 0x07) {
                 LOGW("Received GOAWAY");

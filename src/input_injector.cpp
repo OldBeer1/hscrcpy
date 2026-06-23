@@ -1,6 +1,7 @@
 #include "input_injector.h"
 #include "config.h"
 #include "log.h"
+#include "net_util.h"
 #include "protocol.h"
 #include <cstdio>
 #include <cstdlib>
@@ -219,6 +220,9 @@ bool InputInjector::setup_control_port() {
         int nodelay = 1;
         setsockopt(static_cast<socket_t>(sock), IPPROTO_TCP, TCP_NODELAY,
                    reinterpret_cast<const char *>(&nodelay), sizeof(nodelay));
+
+        // TCP keepalive: detect silently dropped connections on TCP devices
+        set_tcp_keepalive(sock);
 
         // Non-blocking mode: never block UI thread on send buffer full
         u_long nonblock = 1;

@@ -26,6 +26,8 @@ public:
     ~HdcWrapper();
 
     bool ensure_connected();
+    bool is_device_reachable();
+    bool try_reconnect_new_port();
 
     std::vector<HdcDevice> list_devices();
     bool forward_tcp(uint16_t local_port, uint16_t remote_port);
@@ -46,6 +48,7 @@ public:
     bool get_screen_resolution(uint32_t &width, uint32_t &height);
 
 private:
+    void update_serial(const std::string &new_serial);
     int run_process(const std::string &cmd, std::string *output = nullptr, int timeout_ms = 30000);
     std::string build_hdc_cmd(const std::string &subcmd);
 

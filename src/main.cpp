@@ -490,7 +490,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
                                 old_config.iframe_interval != g_capture_config.iframe_interval)) {
                 if (center_msgbox("Settings changed. Restart mirroring to apply?",
                                   "HScrcpy", MB_YESNO | MB_ICONQUESTION) == IDYES) {
-                    PostMessageA(g_hwnd, WM_USER + 7, 0, 0);
+                    PostMessageA(g_hwnd, kMsgConnLostStartup, 0, 0);
                 }
             }
             return TRUE;
@@ -1134,7 +1134,7 @@ static void try_update_frame() {
                      g_screen_w, g_screen_h, img->width, img->height);
                 g_screen_w = img->width;
                 g_screen_h = img->height;
-                PostMessageA(g_hwnd, WM_USER + 5, 0, 0);
+                PostMessageA(g_hwnd, kMsgLayoutUpdate, 0, 0);
             }
             std::lock_guard<std::mutex> lock(g_frame_mutex);
             g_cur_frame = std::move(img);
@@ -1233,7 +1233,7 @@ static void stop_mirroring() {
         if (cap) { cap->stop(); delete cap; }
         if (inp) { delete inp; }
         if (hdc) { delete hdc; }
-        PostMessageA(g_hwnd, WM_USER + 4, 0, 0);
+        PostMessageA(g_hwnd, kMsgStopComplete, 0, 0);
     });
 }
 
@@ -1267,14 +1267,14 @@ static void start_mirroring(const std::string &serial, const std::string &ip = "
             }
             if (!found) {
                 LOGE("Device %s not in hdc device list", serial.c_str());
-                PostMessageA(g_hwnd, WM_USER + 1, 0, 0);
+                PostMessageA(g_hwnd, kMsgStartFailed, 0, 0);
                 return;
             }
         }
         // Secondary: quick echo to verify shell access
         if (!g_hdc->shell_command("echo ok", nullptr, 3)) {
             LOGE("Device %s not reachable", serial.c_str());
-            PostMessageA(g_hwnd, WM_USER + 1, 0, 0);
+            PostMessageA(g_hwnd, kMsgStartFailed, 0, 0);
             return;
         }
 
@@ -1298,7 +1298,7 @@ static void start_mirroring(const std::string &serial, const std::string &ip = "
         char status_buf[256];
         snprintf(status_buf, sizeof(status_buf), "Connecting... (scale=%d, %s, %dfps)",
                  g_capture_config.scale, bitrate_label(g_capture_config.bit_rate), g_capture_config.frame_rate);
-        PostMessageA(g_hwnd, WM_USER + 6, 0, 0);
+        PostMessageA(g_hwnd, kMsgConnectingStatus, 0, 0);
 
         bool ok = false;
         try {
@@ -1309,7 +1309,7 @@ static void start_mirroring(const std::string &serial, const std::string &ip = "
         }
 
         if (!ok) {
-            PostMessageA(g_hwnd, WM_USER + 1, 0, 0);
+            PostMessageA(g_hwnd, kMsgStartFailed, 0, 0);
             return;
         }
 
@@ -1323,11 +1323,11 @@ static void start_mirroring(const std::string &serial, const std::string &ip = "
         }
 
         if (g_capture->width() == 0) {
-            PostMessageA(g_hwnd, WM_USER + 2, 0, 0);
+            PostMessageA(g_hwnd, kMsgNoFrame, 0, 0);
             return;
         }
 
-        PostMessageA(g_hwnd, WM_USER + 3, 0, 0);
+        PostMessageA(g_hwnd, kMsgCaptureReady, 0, 0);
     });
 }
 
@@ -1716,7 +1716,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         break;
-    case WM_USER + 1: {
+    case kMsgStartFailed: {
         g_starting = false;
         show_error("Failed to start screen capture.");
         auto *cap = g_capture;
@@ -1732,7 +1732,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         });
         break;
     }
-    case WM_USER + 2: {
+    case kMsgNoFrame: {
         g_starting = false;
         show_error("No frame received.");
         auto *cap = g_capture;
@@ -1748,7 +1748,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         });
         break;
     }
-    case WM_USER + 3: {
+    case kMsgCaptureReady: {
         g_starting = false;
         g_screen_w = g_capture->width();
         g_screen_h = g_capture->height();
@@ -1805,7 +1805,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     }
-    case WM_USER + 4: {
+    case kMsgStopComplete: {
         g_stopping = false;
         std::string cleaned = std::move(g_cleanup_serial);
         g_cleanup_serial.clear();
@@ -1825,7 +1825,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     }
-    case WM_USER + 5: {
+    case kMsgLayoutUpdate: {
         if (!g_mirroring || !g_capture || !g_hdc) break;
 
         double aspect = (double)g_screen_w / g_screen_h;
@@ -1854,7 +1854,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         set_status(buf);
         break;
     }
-    case WM_USER + 6: {
+    case kMsgConnectingStatus: {
         char buf[256];
         snprintf(buf, sizeof(buf), "Connecting... (scale=%d, %s, %dfps)",
                  g_capture_config.scale, bitrate_label(g_capture_config.bit_rate),
@@ -1862,7 +1862,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         set_status(buf);
         break;
     }
-    case WM_USER + 7: {
+    case kMsgConnLostStartup: {
         if (g_mirroring && g_hdc) {
             std::string serial = g_hdc->serial();
             std::string ip = g_hdc->ip();
@@ -1877,9 +1877,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     }
-    case WM_USER + 10: {
+    case kMsgDeviceDisconnected: {
+        // Device disconnected (hdc unreachable) — stop mirroring and notify user
+        if (g_mirroring) {
+            show_error("Device disconnected. Please reconnect and try again.");
+            EnableWindow(g_btn_start_hwnd, FALSE);
+            stop_mirroring();
+        }
+        break;
+    }
+    case kMsgFrameRender: {
         // Event-driven frame rendering: decode thread notifies UI immediately
         if (g_mirroring) try_update_frame();
+        break;
+    }
+    case kMsgStreamEnded: {
+        // Stream loop ended (connection lost / max retries exceeded)
+        // Auto-stop mirroring and update UI so user knows the connection is dead
+        if (g_mirroring) {
+            LOGI("Stream ended notification received, stopping mirroring");
+            stop_mirroring();
+        }
         break;
     }
     case WM_DESTROY:

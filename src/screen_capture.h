@@ -32,6 +32,20 @@ enum class CaptureMode {
     kSnapshotFallback,
 };
 
+// Custom window messages for UI notification (WM_USER + offset)
+enum WmNotify : UINT {
+    kMsgStartFailed       = WM_USER + 1,  // Screen capture start failed
+    kMsgNoFrame           = WM_USER + 2,  // No frame received
+    kMsgCaptureReady      = WM_USER + 3,  // Capture ready, resize canvas
+    kMsgStopComplete      = WM_USER + 4,  // Stop mirroring complete
+    kMsgLayoutUpdate      = WM_USER + 5,  // Layout window update
+    kMsgConnectingStatus  = WM_USER + 6,  // Show "Connecting..." status
+    kMsgConnLostStartup   = WM_USER + 7,  // Connection lost during startup
+    kMsgDeviceDisconnected = WM_USER + 8,  // Device disconnected (hdc unreachable)
+    kMsgStreamEnded       = WM_USER + 9,  // Stream loop ended
+    kMsgFrameRender       = WM_USER + 10, // Event-driven frame rendering
+};
+
 class ScreenCapture {
 public:
     ScreenCapture(HdcWrapper &hdc, const CaptureConfig &config = CaptureConfig{});

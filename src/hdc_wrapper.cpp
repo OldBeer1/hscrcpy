@@ -37,6 +37,75 @@ bool HdcWrapper::ensure_connected() {
     return false;
 }
 
+bool HdcWrapper::is_device_reachable() {
+    // Quick connectivity check: try echo command with short timeout.
+    // For TCP devices, this also verifies the hdc->device channel is alive.
+    std::string output;
+    return shell_command("echo ok", &output, 3) && output.find("ok") != std::string::npos;
+}
+
+bool HdcWrapper::try_reconnect_new_port() {
+    // For TCP devices: when the old serial is unreachable, the device may have
+    // reconnected with a new port. Wait and retry the old serial first,
+    // then scan for TCP devices with the same IP:port prefix.
+    // Note: we cannot reliably distinguish different devices on 127.0.0.1,
+    // so we only auto-switch if there's exactly one TCP device on that IP
+    // and the old serial is gone.
+    if (!is_tcp()) return false;
+
+    // Try up to 3 times with 2s delay, waiting for the old serial to come back
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) {
+            LOGI("Waiting for device %s to reappear (attempt %d/3)...", serial_.c_str(), attempt + 1);
+            Sleep(2000);
+        }
+
+        // Check if old serial is back (device may have reconnected with same port)
+        std::string output;
+        if (shell_command("echo ok", &output, 3) && output.find("ok") != std::string::npos) {
+            LOGI("Device back online with same serial: %s", serial_.c_str());
+            return true;
+        }
+    }
+
+    // Old serial is truly gone. Check if there's exactly one TCP device on the same IP.
+    // This handles the case where the device reconnected with a different port.
+    // Only auto-switch when unambiguous (single TCP device on that IP).
+    auto devices = list_devices();
+    std::vector<HdcDevice> tcp_same_ip;
+    for (const auto &d : devices) {
+        if (d.serial.find(':') == std::string::npos) continue;  // skip USB
+        if (d.ip == ip_ && d.serial != serial_) {
+            tcp_same_ip.push_back(d);
+        }
+    }
+
+    if (tcp_same_ip.size() == 1) {
+        const auto &d = tcp_same_ip[0];
+        LOGI("Old serial %s gone, found one TCP device on same IP: %s", serial_.c_str(), d.serial.c_str());
+        update_serial(d.serial);
+        if (ensure_connected()) {
+            LOGI("Reconnected to device via new serial: %s", serial_.c_str());
+            return true;
+        }
+    } else if (tcp_same_ip.size() > 1) {
+        LOGW("Multiple TCP devices on IP %s, cannot auto-determine which one is the target", ip_.c_str());
+    }
+
+    LOGW("Device %s not recoverable (IP=%s)", serial_.c_str(), ip_.c_str());
+    return false;
+}
+
+void HdcWrapper::update_serial(const std::string &new_serial) {
+    serial_ = new_serial;
+    // Update ip_ and port_ from new serial
+    auto colon_pos = new_serial.find(':');
+    if (colon_pos != std::string::npos) {
+        ip_ = new_serial.substr(0, colon_pos);
+        port_ = new_serial.substr(colon_pos + 1);
+    }
+}
+
 std::string HdcWrapper::build_hdc_cmd(const std::string &subcmd) {
     std::string cmd = "hdc";
     if (!serial_.empty()) {
