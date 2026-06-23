@@ -35,8 +35,8 @@ public:
     int forward_count();
     bool cleanup_stale_forwards(const std::vector<uint16_t> &our_ports = {});
     bool shell_command(const std::string &cmd, std::string *output = nullptr, int timeout_sec = 30);
-    bool push_file(const std::string &local_path, const std::string &remote_path);
-    bool pull_file(const std::string &remote_path, const std::string &local_path);
+    bool push_file(const std::string &local_path, const std::string &remote_path, std::string *output = nullptr);
+    bool pull_file(const std::string &remote_path, const std::string &local_path, std::string *output = nullptr);
 
     const std::string &serial() const { return serial_; }
     const std::string &ip() const { return ip_; }

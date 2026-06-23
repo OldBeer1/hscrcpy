@@ -41,8 +41,8 @@ struct FileClipboard {
 class FileManagerWindow {
 public:
     using OnShellCommand = std::function<bool(const std::string &cmd, std::string *output, int timeout_sec)>;
-    using OnPushFile = std::function<bool(const std::string &local, const std::string &remote)>;
-    using OnPullFile = std::function<bool(const std::string &remote, const std::string &local)>;
+    using OnPushFile = std::function<bool(const std::string &local, const std::string &remote, std::string *output)>;
+    using OnPullFile = std::function<bool(const std::string &remote, const std::string &local, std::string *output)>;
     using OnBusy = std::function<void(bool busy)>;
 
     static void create(HINSTANCE inst, HWND parent, int width = 420);
@@ -80,6 +80,8 @@ private:
         // Context menu commands
         IDM_OPEN = 2101,
         IDM_PUSH,
+        IDM_PUSH_FOLDER,
+        IDM_OPEN_CONTAINING_FOLDER,
         IDM_PULL,
         IDM_COPY,
         IDM_PASTE,
@@ -102,6 +104,7 @@ private:
     static void refresh_list();
     static void search_files();
     static void import_files();
+    static void import_folder();
     static void export_files();
     static void new_item();
     static void delete_selected();

@@ -1495,7 +1495,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         if (!dev.serial.empty() && dev.serial != g_hdc->serial()) {
                             start_mirroring(dev.serial, dev.ip, dev.port);
                         }
-                    } else {
+                    } else if (!g_starting) {
                         EnableWindow(g_btn_start_hwnd, TRUE);
                     }
                 }
@@ -1615,13 +1615,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         if (!g_hdc) return false;
                         return g_hdc->shell_command(cmd, output, timeout_sec);
                     },
-                    [](const std::string &local, const std::string &remote) -> bool {
+                    [](const std::string &local, const std::string &remote, std::string *output) -> bool {
                         if (!g_hdc) return false;
-                        return g_hdc->push_file(local, remote);
+                        return g_hdc->push_file(local, remote, output);
                     },
-                    [](const std::string &remote, const std::string &local) -> bool {
+                    [](const std::string &remote, const std::string &local, std::string *output) -> bool {
                         if (!g_hdc) return false;
-                        return g_hdc->pull_file(remote, local);
+                        return g_hdc->pull_file(remote, local, output);
                     },
                     [](bool busy) {
                     }

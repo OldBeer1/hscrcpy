@@ -177,7 +177,7 @@ int HdcWrapper::run_process(const std::string &cmd, std::string *output, int tim
     if (s_hdc_path.empty()) s_hdc_path = find_hdc_exe();
     bool ran_direct = false;
     if (!s_hdc_path.empty() && cmd.find("hdc") == 0) {
-        full_cmd = s_hdc_path + cmd.substr(4);
+        full_cmd = s_hdc_path + " " + cmd.substr(4);
         if (CreateProcessA(NULL, const_cast<char *>(full_cmd.c_str()),
                             NULL, NULL, TRUE, CREATE_NO_WINDOW,
                             NULL, NULL, &si, &pi)) {
@@ -412,19 +412,21 @@ bool HdcWrapper::shell_command(const std::string &cmd, std::string *output, int 
     return run_process(build_hdc_cmd("shell " + cmd), output, timeout_sec * 1000) == 0;
 }
 
-bool HdcWrapper::push_file(const std::string &local_path, const std::string &remote_path) {
-    std::string subcmd = "file send \"" + local_path + "\" " + remote_path;
+bool HdcWrapper::push_file(const std::string &local_path, const std::string &remote_path, std::string *output) {
+    std::string subcmd = "file send \"" + local_path + "\" \"" + remote_path + "\"";
     std::string result;
     int ret = run_process(build_hdc_cmd(subcmd), &result, 30000);
     LOGD("push_file: %s -> %s, result: %s", local_path.c_str(), remote_path.c_str(), result.c_str());
+    if (output) *output = result;
     return ret == 0;
 }
 
-bool HdcWrapper::pull_file(const std::string &remote_path, const std::string &local_path) {
-    std::string subcmd = "file recv " + remote_path + " \"" + local_path + "\"";
+bool HdcWrapper::pull_file(const std::string &remote_path, const std::string &local_path, std::string *output) {
+    std::string subcmd = "file recv \"" + remote_path + "\" \"" + local_path + "\"";
     std::string result;
     int ret = run_process(build_hdc_cmd(subcmd), &result, 30000);
     LOGD("pull_file: %s -> %s, result: %s", remote_path.c_str(), local_path.c_str(), result.c_str());
+    if (output) *output = result;
     return ret == 0;
 }
 

@@ -4,6 +4,7 @@
 #include <commctrl.h>
 #include <uxtheme.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <gdiplus.h>
 #include <cstdio>
 #include <cstring>
@@ -79,6 +80,7 @@ static LRESULT CALLBACK InputDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
         HWND edit = GetDlgItem(hwnd, 3001);
         SetFocus(edit);
         SendMessageW(edit, EM_SETSEL, 0, -1);
+        SetPropW(hwnd, L"id_font", (HANDLE)hf);
         return 0;
     }
     case WM_COMMAND:
@@ -96,8 +98,11 @@ static LRESULT CALLBACK InputDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     case WM_CLOSE:
         DestroyWindow(hwnd);
         return 0;
-    case WM_DESTROY:
+    case WM_DESTROY: {
+        HFONT hf = (HFONT)GetPropW(hwnd, L"id_font");
+        if (hf) { DeleteObject(hf); RemovePropW(hwnd, L"id_font"); }
         break;
+    }
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -122,7 +127,7 @@ bool FileManagerWindow::show_input_dialog(const wchar_t *title, const wchar_t *p
     data.title = title;
     data.prompt = prompt;
 
-    HWND owner = g_hwnd;
+    HWND owner = g_parent;
     RECT orr;
     GetWindowRect(owner, &orr);
 
@@ -141,6 +146,7 @@ bool FileManagerWindow::show_input_dialog(const wchar_t *title, const wchar_t *p
     MSG m;
     while (IsWindow(dlg) && GetMessageW(&m, NULL, 0, 0)) {
         if (!IsWindow(dlg)) break;
+        if (m.message == WM_QUIT) { PostQuitMessage((int)m.wParam); break; }
         if (!IsDialogMessageW(dlg, &m)) {
             TranslateMessage(&m);
             DispatchMessageW(&m);
@@ -148,6 +154,7 @@ bool FileManagerWindow::show_input_dialog(const wchar_t *title, const wchar_t *p
     }
 
     EnableWindow(owner, TRUE);
+    SetForegroundWindow(owner);
     SetFocus(owner);
 
     if (data.ok) {
@@ -303,6 +310,300 @@ HICON FileManagerWindow::g_icon_link = nullptr;
 HIMAGELIST FileManagerWindow::g_img_list = nullptr;
 HWND FileManagerWindow::g_toast_hwnd = nullptr;
 
+// Error detail strings shared between worker threads and WndProc
+static std::string s_last_error;   // push/import
+static std::string s_pull_error;   // pull/export
+static std::string s_del_error;    // delete
+static std::string s_paste_error;  // paste
+
+// CBT hook to center MessageBox on the file manager panel
+// ── Custom message/confirm dialogs (replaces MessageBoxW) ──
+// MessageBoxW with WS_CHILD owner causes the main window to disappear.
+// Custom popup dialogs with WS_EX_TOPMOST + own modal loop avoid this.
+
+static HWND s_fm_hwnd_for_dialog = nullptr;  // set by FileManagerWindow::show()
+
+struct CustomMsgData {
+    std::wstring text;
+    std::wstring title;
+    bool is_confirm;  // true = Yes/No, false = OK only
+    bool yes_clicked;
+};
+
+static LRESULT CALLBACK CustomMsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    auto *data = reinterpret_cast<CustomMsgData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+    case WM_CREATE: {
+        auto *cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+        data = reinterpret_cast<CustomMsgData*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)data);
+        SetWindowTextW(hwnd, data->title.c_str());
+
+        // Measure text to size dialog
+        HDC hdc = GetDC(hwnd);
+        HFONT hf = CreateFontW(16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+        SelectObject(hdc, hf);
+        RECT tr = {0, 0, 400, 0};
+        DrawTextW(hdc, data->text.c_str(), -1, &tr, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+        ReleaseDC(hwnd, hdc);
+
+        int text_w = tr.right - tr.left + 24;
+        int text_h = tr.bottom - tr.top;
+        int dlg_w = text_w + 24;
+        if (dlg_w < 280) dlg_w = 280;
+        if (dlg_w > 500) dlg_w = 500;
+
+        // Account for non-client area (title bar + borders ~30px) and button row (48px)
+        const int btn_row_h = 48;
+        const int nc_h = GetSystemMetrics(SM_CYCAPTION) + GetSystemMetrics(SM_CYFIXEDFRAME) * 2;
+        int client_h = text_h + 12 + btn_row_h;  // 12px top margin before text
+        int max_client_h = GetSystemMetrics(SM_CYSCREEN) - nc_h - 80;  // leave margin
+        if (client_h > max_client_h) client_h = max_client_h;
+        if (client_h < 80) client_h = 80;
+
+        // Adjust window rect: client_h -> total dlg_h
+        RECT adj = {0, 0, dlg_w, client_h};
+        AdjustWindowRectEx(&adj, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME | WS_EX_TOPMOST);
+        int dlg_h = adj.bottom - adj.top;
+
+        // Visible text area height (may be less than full text_h if clipped)
+        int vis_text_h = client_h - 12 - btn_row_h;
+        if (vis_text_h < 40) vis_text_h = 40;
+
+        // Resize and center dialog
+        RECT wr;
+        GetWindowRect(hwnd, &wr);
+        int cx = wr.left + (wr.right - wr.left - dlg_w) / 2;
+        int cy = wr.top + (wr.bottom - wr.top - dlg_h) / 2;
+        MoveWindow(hwnd, cx, cy, dlg_w, dlg_h, FALSE);
+
+        // Text area — use read-only EDIT with scrollbar for long content
+        // No ES_AUTOHSCROLL so text wraps; convert \n to \r\n for Windows EDIT
+        DWORD edit_style = WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_LEFT;
+        if (text_h > vis_text_h)
+            edit_style |= WS_VSCROLL;
+        std::wstring fixed_text = data->text;
+        // Replace standalone \n (not preceded by \r) with \r\n
+        std::wstring result;
+        result.reserve(fixed_text.size());
+        for (size_t i = 0; i < fixed_text.size(); i++) {
+            if (fixed_text[i] == L'\n' && (i == 0 || fixed_text[i - 1] != L'\r'))
+                result += L"\r\n";
+            else
+                result += fixed_text[i];
+        }
+        CreateWindowExW(0, L"EDIT", result.c_str(),
+            edit_style,
+            12, 12, dlg_w - 24, vis_text_h, hwnd, NULL, cs->hInstance, NULL);
+
+        int btn_y = 12 + vis_text_h + 8;
+        if (data->is_confirm) {
+            CreateWindowW(L"BUTTON", L"Yes",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
+                dlg_w / 2 - 90, btn_y, 80, 28, hwnd, (HMENU)IDYES, cs->hInstance, NULL);
+            CreateWindowW(L"BUTTON", L"No",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                dlg_w / 2 + 10, btn_y, 80, 28, hwnd, (HMENU)IDNO, cs->hInstance, NULL);
+        } else {
+            CreateWindowW(L"BUTTON", L"OK",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
+                dlg_w / 2 - 40, btn_y, 80, 28, hwnd, (HMENU)IDOK, cs->hInstance, NULL);
+        }
+
+        SendMessageW(hwnd, WM_SETFONT, (WPARAM)hf, TRUE);
+        EnumChildWindows(hwnd, [](HWND child, LPARAM lp) -> BOOL {
+            SendMessageW(child, WM_SETFONT, (WPARAM)lp, TRUE); return TRUE;
+        }, (LPARAM)hf);
+        SetPropW(hwnd, L"cm_font", (HANDLE)hf);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK || LOWORD(wp) == IDYES) {
+            if (data) data->yes_clicked = true;
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        } else if (LOWORD(wp) == IDNO) {
+            if (data) data->yes_clicked = false;
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY: {
+        HFONT hf = (HFONT)GetPropW(hwnd, L"cm_font");
+        if (hf) { DeleteObject(hf); RemovePropW(hwnd, L"cm_font"); }
+        break;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// Show a custom popup dialog. Returns true for Yes (confirm) or always for OK (msg_box).
+static bool show_custom_dialog(const std::wstring &title, const std::wstring &text, bool is_confirm) {
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = CustomMsgProc;
+        wc.hInstance = (HINSTANCE)GetModuleHandle(NULL);
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"HScrcpyCustomMsgClass";
+        RegisterClassExW(&wc);
+        reg = true;
+    }
+
+    CustomMsgData data;
+    data.text = text;
+    data.title = title;
+    data.is_confirm = is_confirm;
+    data.yes_clicked = false;
+
+    // Center on file manager panel
+    RECT orr = {};
+    if (s_fm_hwnd_for_dialog)
+        GetWindowRect(s_fm_hwnd_for_dialog, &orr);
+    else if (GetForegroundWindow())
+        GetWindowRect(GetForegroundWindow(), &orr);
+    int cx = orr.left + (orr.right - orr.left - 360) / 2;
+    int cy = orr.top + (orr.bottom - orr.top - 160) / 2;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        L"HScrcpyCustomMsgClass", title.c_str(),
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        cx, cy, 360, 160,
+        NULL, NULL, (HINSTANCE)GetModuleHandle(NULL), &data);
+
+    ShowWindow(dlg, SW_SHOW);
+    UpdateWindow(dlg);
+
+    // Modal message loop
+    MSG m;
+    while (IsWindow(dlg) && GetMessageW(&m, NULL, 0, 0)) {
+        if (!IsWindow(dlg)) break;
+        if (m.message == WM_QUIT) { PostQuitMessage((int)m.wParam); break; }
+        if (!IsDialogMessageW(dlg, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+
+    return data.yes_clicked;
+}
+
+// ── Text viewer dialog ──────────────────────────────────
+
+struct TextViewerData {
+    std::wstring title;
+    std::wstring content;  // already \r\n converted
+};
+
+static LRESULT CALLBACK TextViewerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    auto *data = reinterpret_cast<TextViewerData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+    case WM_CREATE: {
+        auto *cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+        data = reinterpret_cast<TextViewerData*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)data);
+        SetWindowTextW(hwnd, data->title.c_str());
+
+        HFONT hf = CreateFontW(15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                                0, 0, CLEARTYPE_QUALITY, 0, L"Consolas");
+
+        // Full-size read-only EDIT control
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        HWND edit = CreateWindowExW(0, L"EDIT", data->content.c_str(),
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
+            ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_LEFT,
+            0, 0, rc.right, rc.bottom - 36, hwnd, (HMENU)4001, cs->hInstance, NULL);
+        SendMessageW(edit, WM_SETFONT, (WPARAM)hf, TRUE);
+
+        // Close button
+        CreateWindowW(L"BUTTON", L"Close",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
+            rc.right / 2 - 40, rc.bottom - 32, 80, 26, hwnd, (HMENU)IDOK, cs->hInstance, NULL);
+        SendMessageW(GetDlgItem(hwnd, IDOK), WM_SETFONT, (WPARAM)hf, TRUE);
+
+        // Delete the font when dialog closes (store as prop)
+        SetPropW(hwnd, L"tv_font", (HANDLE)hf);
+        return 0;
+    }
+    case WM_SIZE: {
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        HWND edit = GetDlgItem(hwnd, 4001);
+        HWND btn = GetDlgItem(hwnd, IDOK);
+        if (edit) MoveWindow(edit, 0, 0, rc.right, rc.bottom - 36, TRUE);
+        if (btn) MoveWindow(btn, rc.right / 2 - 40, rc.bottom - 32, 80, 26, TRUE);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK)
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_DESTROY: {
+        HFONT hf = (HFONT)GetPropW(hwnd, L"tv_font");
+        if (hf) { DeleteObject(hf); RemovePropW(hwnd, L"tv_font"); }
+        break;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void show_text_viewer(const std::wstring &title, const std::wstring &content) {
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = TextViewerProc;
+        wc.hInstance = (HINSTANCE)GetModuleHandle(NULL);
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"HScrcpyTextViewerClass";
+        RegisterClassExW(&wc);
+        reg = true;
+    }
+
+    TextViewerData data;
+    data.title = title;
+    data.content = content;
+
+    // Center on file manager panel
+    RECT orr = {};
+    if (s_fm_hwnd_for_dialog)
+        GetWindowRect(s_fm_hwnd_for_dialog, &orr);
+    else if (GetForegroundWindow())
+        GetWindowRect(GetForegroundWindow(), &orr);
+
+    int dlg_w = 560, dlg_h = 440;
+    int cx = orr.left + (orr.right - orr.left - dlg_w) / 2;
+    int cy = orr.top + (orr.bottom - orr.top - dlg_h) / 2;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        L"HScrcpyTextViewerClass", title.c_str(),
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_SIZEBOX,
+        cx, cy, dlg_w, dlg_h,
+        NULL, NULL, (HINSTANCE)GetModuleHandle(NULL), &data);
+
+    ShowWindow(dlg, SW_SHOW);
+    UpdateWindow(dlg);
+
+    // Modal message loop
+    MSG m;
+    while (IsWindow(dlg) && GetMessageW(&m, NULL, 0, 0)) {
+        if (!IsWindow(dlg)) break;
+        if (m.message == WM_QUIT) { PostQuitMessage((int)m.wParam); break; }
+        if (!IsDialogMessageW(dlg, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+    }
+}
+
 static const wchar_t *FM_CLASS_W = L"HScrcpyFileManagerClass";
 
 // ── Edit subclass for Enter key ──────────────────────────
@@ -361,6 +662,7 @@ void FileManagerWindow::show(OnShellCommand on_shell, OnPushFile on_push, OnPull
                                   WS_CHILD | WS_BORDER | WS_CLIPCHILDREN,
                                   0, 0, g_panel_w, 100, g_parent, NULL, g_inst, NULL);
     }
+    s_fm_hwnd_for_dialog = g_hwnd;
 
     ShowWindow(g_hwnd, SW_SHOW);
     if (g_current_dir.empty()) navigate("/");
@@ -481,15 +783,79 @@ void FileManagerWindow::enter_selected() {
 
     const FileEntry &e = g_entries[sel];
     if (e.is_dir() || e.is_link()) {
-        // For symlinks pointing to dirs, we just try to navigate
-        navigate(build_remote_path(g_current_dir, e.name));
+        // Search results have full absolute paths; normal listings have relative names
+        if (!e.name.empty() && e.name[0] == '/') {
+            navigate(e.name);
+        } else {
+            navigate(build_remote_path(g_current_dir, e.name));
+        }
+    } else if (e.is_file()) {
+        // Double-click on a file
+        if (!e.can_read()) {
+            msg_box("Permission Denied", "Cannot read '%s': %s", e.name.c_str(), e.perms.c_str());
+            return;
+        }
+
+        // Build remote path
+        std::string path;
+        if (!e.name.empty() && e.name[0] == '/') {
+            path = e.name;
+        } else {
+            path = ensure_dir_sep(g_current_dir) + e.name;
+        }
+
+        const long long MAX_VIEW_SIZE = 1024 * 1024;  // 1 MB
+        if (e.size > MAX_VIEW_SIZE) {
+            // File too large — export instead
+            export_files();
+            return;
+        }
+
+        // Cat file content and show in text viewer
+        g_busy = true;
+        if (g_on_busy) g_on_busy(true);
+        if (g_status_label) SetWindowTextW(g_status_label, L"Loading file...");
+
+        auto file_name = e.name;
+        auto file_path = path;
+        DWORD tid;
+        CreateThread(NULL, 0, [](LPVOID param) -> DWORD {
+            auto *d = reinterpret_cast<std::pair<std::string, std::string>*>(param);
+            auto &name = d->first;
+            auto &path = d->second;
+
+            std::string output;
+            bool ok = g_on_shell("cat " + shell_escape(path), &output, 15);
+            std::wstring wcontent;
+            if (ok && !shell_output_has_error(output)) {
+                // Convert \n to \r\n for Windows EDIT control
+                std::wstring wide = utf8_to_wide(output);
+                wcontent.reserve(wide.size());
+                for (size_t i = 0; i < wide.size(); i++) {
+                    if (wide[i] == L'\n' && (i == 0 || wide[i - 1] != L'\r'))
+                        wcontent += L"\r\n";
+                    else
+                        wcontent += wide[i];
+                }
+            } else {
+                wcontent = L"Failed to read file: " + utf8_to_wide(name);
+                if (!output.empty()) wcontent += L"\r\n" + utf8_to_wide(output);
+            }
+
+            // Post result to UI thread
+            auto *result = new std::pair<std::string, std::wstring>(name, std::move(wcontent));
+            PostMessageW(g_hwnd, WM_USER + 205, 0, (LPARAM)result);
+
+            delete d;
+            return 0;
+        }, new std::pair<std::string, std::string>(std::move(file_name), std::move(file_path)), 0, &tid);
     }
 }
 
 // ── Refresh ──────────────────────────────────────────────
 
 void FileManagerWindow::refresh_list() {
-    if (!g_on_shell || g_busy) return;
+    if (!g_on_shell || g_busy || !g_hwnd) return;
     g_busy = true;
     if (g_on_busy) g_on_busy(true);
     if (g_status_label) SetWindowTextW(g_status_label, L"Loading...");
@@ -532,7 +898,7 @@ DWORD WINAPI FileManagerWindow::LsThreadProc(LPVOID) {
 
     // wp: 1=success, 2=permission denied, 0=other error
     int result = ok ? (perm_denied ? 2 : 1) : 0;
-    PostMessageW(g_hwnd, WM_USER + 200, result, 0);
+    if (g_hwnd) PostMessageW(g_hwnd, WM_USER + 200, result, 0);
     return 0;
 }
 
@@ -587,8 +953,20 @@ void FileManagerWindow::search_files() {
         // Normalize DIR: strip trailing slash (except root "/")
         std::string norm_dir = dir;
         while (norm_dir.size() > 1 && norm_dir.back() == '/') norm_dir.pop_back();
-        script += "DIR='" + norm_dir + "'\n";
-        script += "Q='*" + query + "*'\n";
+        // Escape single quotes in directory path for shell safety
+        std::string escaped_dir;
+        for (char c : norm_dir) {
+            if (c == '\'') escaped_dir += "'\\''";
+            else escaped_dir += c;
+        }
+        script += "DIR='" + escaped_dir + "'\n";
+        // Escape single quotes in search query for shell safety
+        std::string escaped_query;
+        for (char c : query) {
+            if (c == '\'') escaped_query += "'\\''";
+            else escaped_query += c;
+        }
+        script += "Q='*" + escaped_query + "*'\n";
         script += "(\n";
 
         // When DIR is root "/", $DIR/subdir becomes "//subdir" which may fail.
@@ -653,7 +1031,7 @@ void FileManagerWindow::search_files() {
 
             // Push script to device
             if (g_on_push) {
-                g_on_push(local_script, remote_script);
+                g_on_push(local_script, remote_script, nullptr);
             }
 
             // Clean up local temp file
@@ -738,32 +1116,141 @@ void FileManagerWindow::search_files() {
 void FileManagerWindow::import_files() {
     if (!g_on_push || !g_on_shell) return;
 
-    // Open file dialog (supports both files and folders via OFN_ALLOWMULTISELECT)
-    OPENFILENAMEA ofn = {};
-    char file_buf[4096] = {};
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = g_hwnd;
-    ofn.lpstrFile = file_buf;
-    ofn.nMaxFile = sizeof(file_buf);
-    ofn.lpstrFilter = "All Files\0*.*\0\0";
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_ALLOWMULTISELECT | OFN_EXPLORER;
-    ofn.lpstrTitle = "Select files or folders to push to device";
+    // Ask: files or folder?
+    // 0 = cancelled, 1 = files, 2 = folder
+    int choice = 0;
+    {
+        struct ImportChoiceData { int *result; };
+        ImportChoiceData icd = { &choice };
 
-    if (!GetOpenFileNameA(&ofn)) return;
+        static bool reg_imp = false;
+        if (!reg_imp) {
+            WNDCLASSEXW wc = {};
+            wc.cbSize = sizeof(wc);
+            wc.lpfnWndProc = [](HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
+                auto *icd = reinterpret_cast<ImportChoiceData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+                switch (msg) {
+                case WM_CREATE: {
+                    auto *cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+                    icd = reinterpret_cast<ImportChoiceData*>(cs->lpCreateParams);
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)icd);
 
-    // Parse multi-select result
-    std::string dir = file_buf;
-    std::vector<std::string> files;
-    char *p = file_buf + ofn.nFileOffset;
-    if (*p == '\0') {
-        // Single file
-        files.push_back(dir);
-    } else {
-        // Multiple files
-        while (*p) {
-            files.push_back(dir + "\\" + p);
-            p += strlen(p) + 1;
+                    CreateWindowW(L"STATIC", L"Import:",
+                        WS_CHILD | WS_VISIBLE, 12, 14, 200, 18, hwnd, NULL, cs->hInstance, NULL);
+                    CreateWindowW(L"BUTTON", L"Folder",
+                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
+                        30, 44, 100, 28, hwnd, (HMENU)1001, cs->hInstance, NULL);
+                    CreateWindowW(L"BUTTON", L"Files",
+                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                        150, 44, 100, 28, hwnd, (HMENU)1002, cs->hInstance, NULL);
+
+                    HFONT hf = CreateFontW(16, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                                            DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+                    SendMessageW(hwnd, WM_SETFONT, (WPARAM)hf, TRUE);
+                    EnumChildWindows(hwnd, [](HWND child, LPARAM lp) -> BOOL {
+                        SendMessageW(child, WM_SETFONT, (WPARAM)lp, TRUE); return TRUE;
+                    }, (LPARAM)hf);
+                    SetPropW(hwnd, L"ic_font", (HANDLE)hf);
+                    return 0;
+                }
+                case WM_COMMAND:
+                    if (LOWORD(wp) == 1001) { *icd->result = 2; PostMessageW(hwnd, WM_CLOSE, 0, 0); }
+                    else if (LOWORD(wp) == 1002) { *icd->result = 1; PostMessageW(hwnd, WM_CLOSE, 0, 0); }
+                    return 0;
+                case WM_CLOSE:
+                    DestroyWindow(hwnd);
+                    return 0;
+                case WM_DESTROY: {
+                    HFONT hf = (HFONT)GetPropW(hwnd, L"ic_font");
+                    if (hf) { DeleteObject(hf); RemovePropW(hwnd, L"ic_font"); }
+                    break;
+                }
+                }
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            };
+            wc.hInstance = g_inst;
+            wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+            wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+            wc.lpszClassName = L"HScrcpyImportChoiceDlg";
+            RegisterClassExW(&wc);
+            reg_imp = true;
         }
+
+        RECT orr;
+        GetWindowRect(g_hwnd, &orr);
+        HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+            L"HScrcpyImportChoiceDlg", L"Import to Device",
+            WS_POPUP | WS_CAPTION,
+            orr.left + (orr.right - orr.left - 280) / 2,
+            orr.top + (orr.bottom - orr.top - 120) / 2,
+            280, 120, g_parent, NULL, g_inst, &icd);
+
+        EnableWindow(g_hwnd, FALSE);
+        ShowWindow(dlg, SW_SHOW);
+        UpdateWindow(dlg);
+        MSG m;
+        while (IsWindow(dlg) && GetMessageW(&m, NULL, 0, 0)) {
+            if (!IsWindow(dlg)) break;
+            if (!IsDialogMessageW(dlg, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+        }
+        EnableWindow(g_hwnd, TRUE);
+        SetFocus(g_hwnd);
+    }
+
+    if (choice == 0) return;
+
+    std::vector<std::string> files;
+
+    if (choice == 1) {
+        // Select files via IFileOpenDialog
+        CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        IFileOpenDialog *pfd = nullptr;
+        HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER,
+                                      IID_PPV_ARGS(&pfd));
+        if (SUCCEEDED(hr) && pfd) {
+            DWORD flags;
+            pfd->GetOptions(&flags);
+            pfd->SetOptions(flags | FOS_ALLOWMULTISELECT | FOS_FILEMUSTEXIST);
+            pfd->SetTitle(L"Select files to push to device");
+
+            if (SUCCEEDED(pfd->Show(g_parent))) {
+                IShellItemArray *pItems = nullptr;
+                if (SUCCEEDED(pfd->GetResults(&pItems)) && pItems) {
+                    DWORD count = 0;
+                    pItems->GetCount(&count);
+                    for (DWORD i = 0; i < count; i++) {
+                        IShellItem *pItem = nullptr;
+                        if (SUCCEEDED(pItems->GetItemAt(i, &pItem)) && pItem) {
+                            LPWSTR pPath = nullptr;
+                            if (SUCCEEDED(pItem->GetDisplayName(SIGDN_FILESYSPATH, &pPath)) && pPath) {
+                                char mb[MAX_PATH] = {};
+                                WideCharToMultiByte(CP_ACP, 0, pPath, -1, mb, MAX_PATH, NULL, NULL);
+                                files.push_back(mb);
+                                CoTaskMemFree(pPath);
+                            }
+                            pItem->Release();
+                        }
+                    }
+                    pItems->Release();
+                }
+            }
+            pfd->Release();
+        }
+        CoUninitialize();
+    } else {
+        // Select folder
+        BROWSEINFOA bi = {};
+        bi.hwndOwner = g_parent;
+        bi.lpszTitle = "Select folder to push to device";
+        bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+        LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
+        if (!pidl) return;
+        char folder_buf[MAX_PATH] = {};
+        SHGetPathFromIDListA(pidl, folder_buf);
+        CoTaskMemFree(pidl);
+        std::string folder = folder_buf;
+        if (folder.empty()) return;
+        files.push_back(folder);
     }
 
     if (files.empty()) return;
@@ -791,27 +1278,83 @@ void FileManagerWindow::import_files() {
             if (bs != std::string::npos) name = name.substr(bs + 1);
 
             std::string remote = ensure_dir_sep(remote_dir) + name;
-            if (g_on_push(local, remote)) {
-                g_on_shell("chmod 644 " + shell_escape(remote), nullptr, 5);
+            std::string push_output;
+            bool pushed = g_on_push(local, remote, &push_output);
+            // hdc may return exit code 0 even on failure, check output too
+            if (pushed && !shell_output_has_error(push_output)) {
+                // Set permissions: 755 for directories, 644 for files
+                DWORD attrs = GetFileAttributesA(local.c_str());
+                if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                    g_on_shell("chmod -R 755 " + shell_escape(remote), nullptr, 10);
+                } else {
+                    g_on_shell("chmod 644 " + shell_escape(remote), nullptr, 5);
+                }
                 ok++;
             } else {
                 fail++;
                 if (!errors.empty()) errors += "\n";
-                errors += "Failed: " + name;
+                std::string reason = push_output.empty() ? "transfer failed" : push_output.substr(0, 120);
+                errors += "Failed: " + name + " (" + reason + ")";
             }
         }
 
         delete data;
 
-        static std::string s_last_error;
         s_last_error = errors;
-        static int s_last_ok, s_last_fail;
-        s_last_ok = ok;
-        s_last_fail = fail;
 
-        PostMessageW(g_hwnd, WM_USER + 201, s_last_ok, s_last_fail);
+        PostMessageW(g_hwnd, WM_USER + 201, ok, fail);
         return 0;
     }, new std::pair<std::vector<std::string>, std::string>(std::move(local_files), std::move(remote_dir)), 0, &tid);
+}
+
+void FileManagerWindow::import_folder() {
+    if (!g_on_push || !g_on_shell) return;
+
+    // Folder browser dialog
+    BROWSEINFOA bi = {};
+    bi.hwndOwner = g_parent;
+    bi.lpszTitle = "Select folder to push to device";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
+    if (!pidl) return;
+    char folder_buf[MAX_PATH] = {};
+    SHGetPathFromIDListA(pidl, folder_buf);
+    CoTaskMemFree(pidl);
+    std::string folder = folder_buf;
+    if (folder.empty()) return;
+
+    g_busy = true;
+    if (g_on_busy) g_on_busy(true);
+    if (g_status_label) SetWindowTextW(g_status_label, L"Importing folder...");
+
+    auto local_folder = folder;
+    auto remote_dir = g_current_dir;
+
+    DWORD tid;
+    CreateThread(NULL, 0, [](LPVOID param) -> DWORD {
+        auto *data = reinterpret_cast<std::pair<std::string, std::string>*>(param);
+        auto &local = data->first;
+        auto &remote_dir = data->second;
+
+        std::string name = local;
+        auto bs = name.find_last_of("\\/");
+        if (bs != std::string::npos) name = name.substr(bs + 1);
+
+        std::string remote = ensure_dir_sep(remote_dir) + name;
+        std::string push_output;
+        bool ok = g_on_push(local, remote, &push_output);
+        if (ok && !shell_output_has_error(push_output)) {
+            g_on_shell("chmod -R 755 " + shell_escape(remote), nullptr, 10);
+        } else {
+            ok = false;
+        }
+
+        delete data;
+
+        s_last_error = ok ? "" : ("Failed: " + name + (push_output.empty() ? "" : " (" + push_output.substr(0, 120) + ")"));
+        PostMessageW(g_hwnd, WM_USER + 201, ok ? 1 : 0, ok ? 0 : 1);
+        return 0;
+    }, new std::pair<std::string, std::string>(std::move(local_folder), std::move(remote_dir)), 0, &tid);
 }
 
 void FileManagerWindow::export_files() {
@@ -838,18 +1381,41 @@ void FileManagerWindow::export_files() {
         }
     }
 
-    // Select local destination folder
+    // Select local destination folder — default to Windows Downloads
     char folder_buf[MAX_PATH] = {};
+    // Try Downloads folder via SHGetKnownFolderPath (Vista+)
+    PWSTR downloads_path = nullptr;
+    HRESULT hr = SHGetKnownFolderPath(FOLDERID_Downloads, 0, NULL, &downloads_path);
+    if (SUCCEEDED(hr) && downloads_path) {
+        WideCharToMultiByte(CP_ACP, 0, downloads_path, -1, folder_buf, MAX_PATH, NULL, NULL);
+        CoTaskMemFree(downloads_path);
+    } else {
+        // Fallback: USERPROFILE\Downloads
+        const char *userprofile = getenv("USERPROFILE");
+        if (userprofile) {
+            snprintf(folder_buf, MAX_PATH, "%s\\Downloads", userprofile);
+        }
+    }
+
     BROWSEINFOA bi = {};
-    bi.hwndOwner = g_hwnd;
+    bi.hwndOwner = g_parent;
     bi.lpszTitle = "Select destination folder on PC";
     bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    bi.lParam = (LPARAM)folder_buf;
+    // Set initial selection to Downloads
+    bi.lpfn = [](HWND hwnd, UINT uMsg, LPARAM lp, LPARAM pData) -> int {
+        if (uMsg == BFFM_INITIALIZED) {
+            SendMessageA(hwnd, BFFM_SETSELECTIONA, TRUE, pData);
+        }
+        return 0;
+    };
     LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
     if (!pidl) return;
-    SHGetPathFromIDListA(pidl, folder_buf);
+    char selected_buf[MAX_PATH] = {};
+    SHGetPathFromIDListA(pidl, selected_buf);
     CoTaskMemFree(pidl);
 
-    std::string local_dir = folder_buf;
+    std::string local_dir = selected_buf;
     if (local_dir.empty()) return;
 
     g_busy = true;
@@ -887,26 +1453,35 @@ void FileManagerWindow::export_files() {
                 errors += "Directory not supported: " + e.name;
                 continue;
             }
-            std::string remote = ensure_dir_sep(remote_dir) + e.name;
-            std::string local = local_dir + "\\" + e.name;
-            if (g_on_pull(remote, local)) {
+            // Search results have absolute paths; normal listings have relative names
+            std::string remote;
+            if (!e.name.empty() && e.name[0] == '/') {
+                remote = e.name;
+            } else {
+                remote = ensure_dir_sep(remote_dir) + e.name;
+            }
+            // Extract basename for local filename
+            std::string basename = e.name;
+            auto last_sep = basename.find_last_of('/');
+            if (last_sep != std::string::npos) basename = basename.substr(last_sep + 1);
+            std::string local = local_dir + "\\" + basename;
+            std::string pull_output;
+            bool pulled = g_on_pull(remote, local, &pull_output);
+            if (pulled && !shell_output_has_error(pull_output)) {
                 ok++;
             } else {
                 fail++;
                 if (!errors.empty()) errors += "\n";
-                errors += "Failed: " + e.name;
+                std::string reason = pull_output.empty() ? "transfer failed" : pull_output.substr(0, 120);
+                errors += "Failed: " + e.name + " (" + reason + ")";
             }
         }
 
         delete data;
 
-        static std::string s_pull_error;
         s_pull_error = errors;
-        static int s_pull_ok, s_pull_fail;
-        s_pull_ok = ok;
-        s_pull_fail = fail;
 
-        PostMessageW(g_hwnd, WM_USER + 202, s_pull_ok, s_pull_fail);
+        PostMessageW(g_hwnd, WM_USER + 202, ok, fail);
         return 0;
     }, pdata, 0, &tid);
 }
@@ -948,6 +1523,7 @@ void FileManagerWindow::new_item() {
                     EnumChildWindows(hwnd, [](HWND child, LPARAM lp) -> BOOL {
                         SendMessageW(child, WM_SETFONT, (WPARAM)lp, TRUE); return TRUE;
                     }, (LPARAM)hf);
+                    SetPropW(hwnd, L"ni_font", (HANDLE)hf);
                     return 0;
                 }
                 case WM_COMMAND:
@@ -957,6 +1533,11 @@ void FileManagerWindow::new_item() {
                 case WM_CLOSE:
                     DestroyWindow(hwnd);
                     return 0;
+                case WM_DESTROY: {
+                    HFONT hf = (HFONT)GetPropW(hwnd, L"ni_font");
+                    if (hf) { DeleteObject(hf); RemovePropW(hwnd, L"ni_font"); }
+                    break;
+                }
                 }
                 return DefWindowProcW(hwnd, msg, wp, lp);
             };
@@ -975,7 +1556,7 @@ void FileManagerWindow::new_item() {
             WS_POPUP | WS_CAPTION,
             orr.left + (orr.right - orr.left - 280) / 2,
             orr.top + (orr.bottom - orr.top - 120) / 2,
-            280, 120, g_hwnd, NULL, g_inst, &nd);
+            280, 120, g_parent, NULL, g_inst, &nd);
 
         EnableWindow(g_hwnd, FALSE);
         ShowWindow(dlg, SW_SHOW);
@@ -1081,7 +1662,13 @@ void FileManagerWindow::delete_selected() {
         int ok = 0, fail = 0;
         std::string errors;
         for (auto &e : entries) {
-            std::string remote = ensure_dir_sep(dir) + e.name;
+            // Search results have absolute paths; normal listings have relative names
+            std::string remote;
+            if (!e.name.empty() && e.name[0] == '/') {
+                remote = e.name;
+            } else {
+                remote = ensure_dir_sep(dir) + e.name;
+            }
             std::string cmd = e.is_dir() ? "rm -rf " + shell_escape(remote) : "rm " + shell_escape(remote);
             std::string output;
             bool ret = g_on_shell(cmd, &output, 30);
@@ -1102,13 +1689,9 @@ void FileManagerWindow::delete_selected() {
 
         delete data;
 
-        static std::string s_del_error;
         s_del_error = errors;
-        static int s_del_ok, s_del_fail;
-        s_del_ok = ok;
-        s_del_fail = fail;
 
-        PostMessageW(g_hwnd, WM_USER + 203, s_del_ok, s_del_fail);
+        PostMessageW(g_hwnd, WM_USER + 203, ok, fail);
         return 0;
     }, new std::pair<std::vector<FileEntry>, std::string>(std::move(to_delete), std::move(remote_dir)), 0, &tid);
 }
@@ -1157,8 +1740,18 @@ void FileManagerWindow::paste_clipboard() {
         std::string errors;
 
         for (auto &e : cb->entries) {
-            std::string src = ensure_dir_sep(cb->source_dir) + e.name;
-            std::string dst = ensure_dir_sep(cb->dest_dir) + e.name;
+            // Search results have absolute paths; normal listings have relative names
+            std::string src;
+            if (!e.name.empty() && e.name[0] == '/') {
+                src = e.name;
+            } else {
+                src = ensure_dir_sep(cb->source_dir) + e.name;
+            }
+            // Destination: always use basename + dest_dir
+            std::string basename = e.name;
+            auto last_sep = basename.find_last_of('/');
+            if (last_sep != std::string::npos) basename = basename.substr(last_sep + 1);
+            std::string dst = ensure_dir_sep(cb->dest_dir) + basename;
 
             std::string cmd;
             if (cb->action == FileClipAction::Move) {
@@ -1192,13 +1785,9 @@ void FileManagerWindow::paste_clipboard() {
 
         delete cb;
 
-        static std::string s_paste_error;
         s_paste_error = errors;
-        static int s_paste_ok, s_paste_fail;
-        s_paste_ok = ok;
-        s_paste_fail = fail;
 
-        PostMessageW(g_hwnd, WM_USER + 204, s_paste_ok, s_paste_fail);
+        PostMessageW(g_hwnd, WM_USER + 204, ok, fail);
         return 0;
     }, new FileClipboard(clipboard_copy), 0, &tid);
 }
@@ -1218,19 +1807,31 @@ void FileManagerWindow::rename_selected() {
         return;
     }
 
-    // Input dialog for new name
-    std::wstring value = utf8_to_wide(e.name);
+    // Input dialog for new name — use basename for search results
+    std::string basename = e.name;
+    auto last_sep_pos = basename.find_last_of('/');
+    if (last_sep_pos != std::string::npos) basename = basename.substr(last_sep_pos + 1);
+    std::wstring value = utf8_to_wide(basename);
     if (!show_input_dialog(L"Rename", L"New name:", value)) return;
     std::string new_name = wide_to_utf8(value);
 
-    if (new_name == e.name) return;
+    if (new_name == basename) return;
     if (new_name.find('/') != std::string::npos || new_name.find('\\') != std::string::npos) {
         msg_box("Invalid Name", "Name cannot contain / or \\");
         return;
     }
 
-    std::string old_path = ensure_dir_sep(g_current_dir) + e.name;
-    std::string new_path = ensure_dir_sep(g_current_dir) + new_name;
+    std::string old_path;
+    if (!e.name.empty() && e.name[0] == '/') {
+        old_path = e.name;
+    } else {
+        old_path = ensure_dir_sep(g_current_dir) + e.name;
+    }
+    std::string dir_of_old = old_path;
+    auto sep2 = dir_of_old.find_last_of('/');
+    if (sep2 != std::string::npos) dir_of_old = dir_of_old.substr(0, sep2 + 1);
+    else dir_of_old = "/";
+    std::string new_path = dir_of_old + new_name;
 
     std::string output;
     bool ret = g_on_shell("mv " + shell_escape(old_path) + " " + shell_escape(new_path), &output, 10);
@@ -1257,13 +1858,18 @@ void FileManagerWindow::show_context_menu(POINT pt) {
     if (has_sel && sel < (int)g_entries.size()) {
         const FileEntry &e = g_entries[sel];
         if (e.is_dir()) AppendMenuW(hMenu, MF_STRING, IDM_OPEN, L"Open");
+        // "Open Containing Folder" only for search results with absolute paths
+        if (!e.name.empty() && e.name[0] == '/') {
+            AppendMenuW(hMenu, MF_STRING, IDM_OPEN_CONTAINING_FOLDER, L"Open Containing Folder");
+        }
         AppendMenuW(hMenu, MF_STRING, IDM_PULL, L"Export to PC...");        AppendMenuW(hMenu, MF_STRING, IDM_COPY, L"Copy");
         AppendMenuW(hMenu, MF_STRING, IDM_RENAME, L"Rename");
         AppendMenuW(hMenu, MF_STRING, IDM_DELETE, L"Delete");
         AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
         AppendMenuW(hMenu, MF_STRING, IDM_PROPERTIES, L"Properties");
     } else {
-        AppendMenuW(hMenu, MF_STRING, IDM_PUSH, L"Import from PC...");
+        AppendMenuW(hMenu, MF_STRING, IDM_PUSH, L"Import Files from PC...");
+        AppendMenuW(hMenu, MF_STRING, IDM_PUSH_FOLDER, L"Import Folder from PC...");
         AppendMenuW(hMenu, MF_STRING, IDM_NEWFOLDER, L"New Item...");
         if (!g_clipboard.entries.empty()) {
             AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
@@ -1287,7 +1893,13 @@ void FileManagerWindow::show_properties() {
     if (sel < 0 || sel >= (int)g_entries.size()) return;
 
     const FileEntry &e = g_entries[sel];
-    std::string path = ensure_dir_sep(g_current_dir) + e.name;
+    // Search results have absolute paths; normal listings have relative names
+    std::string path;
+    if (!e.name.empty() && e.name[0] == '/') {
+        path = e.name;
+    } else {
+        path = ensure_dir_sep(g_current_dir) + e.name;
+    }
 
     // Get detailed stat info
     std::string stat_output;
@@ -1307,7 +1919,7 @@ void FileManagerWindow::show_properties() {
     if (e.is_link()) info += "Target: " + e.link_target + "\n";
     if (!stat_output.empty()) info += "\n--- stat ---\n" + stat_output;
 
-    MessageBoxW(g_hwnd, utf8_to_wide(info).c_str(), utf8_to_wide("Properties - " + e.name).c_str(), MB_OK | MB_ICONINFORMATION);
+    show_custom_dialog(utf8_to_wide("Properties - " + e.name), utf8_to_wide(info), false);
 }
 
 // ── Status / messages ────────────────────────────────────
@@ -1333,7 +1945,7 @@ void FileManagerWindow::msg_box(const char *title, const char *fmt, ...) {
     char buf[1024];
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    MessageBoxW(g_hwnd, utf8_to_wide(buf).c_str(), utf8_to_wide(title).c_str(), MB_OK | MB_ICONWARNING);
+    show_custom_dialog(utf8_to_wide(title), utf8_to_wide(buf), false);
 }
 
 bool FileManagerWindow::confirm(const char *title, const char *fmt, ...) {
@@ -1342,8 +1954,7 @@ bool FileManagerWindow::confirm(const char *title, const char *fmt, ...) {
     char buf[1024];
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    return MessageBoxW(g_hwnd, utf8_to_wide(buf).c_str(), utf8_to_wide(title).c_str(),
-                       MB_YESNO | MB_ICONQUESTION) == IDYES;
+    return show_custom_dialog(utf8_to_wide(title), utf8_to_wide(buf), true);
 }
 
 // ── Toast notification ───────────────────────────────────
@@ -1851,7 +2462,20 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         case IDC_RENAME_BTN: rename_selected(); break;
         // Context menu commands
         case IDM_OPEN: enter_selected(); break;
+        case IDM_OPEN_CONTAINING_FOLDER: {
+            int sel = ListView_GetNextItem(g_file_list, -1, LVNI_SELECTED);
+            if (sel >= 0 && sel < (int)g_entries.size()) {
+                const FileEntry &e = g_entries[sel];
+                if (!e.name.empty() && e.name[0] == '/') {
+                    auto last_sep = e.name.find_last_of('/');
+                    std::string parent = (last_sep != std::string::npos) ? e.name.substr(0, last_sep + 1) : "/";
+                    navigate(parent);
+                }
+            }
+            break;
+        }
         case IDM_PUSH: import_files(); break;
+        case IDM_PUSH_FOLDER: import_folder(); break;
         case IDM_PULL: export_files(); break;
         case IDM_COPY: copy_selected(); break;
         case IDM_PASTE: paste_clipboard(); break;
@@ -1918,12 +2542,20 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         g_busy = false;
         if (g_on_busy) g_on_busy(false);
         {
-            char buf[128];
-            if ((int)lp > 0) {
-                snprintf(buf, sizeof(buf), "Pushed %d, failed %d", (int)wp, (int)lp);
+            int n_ok = (int)wp, n_fail = (int)lp;
+            if (n_fail > 0 && n_ok > 0) {
+                // Partial failure: toast + detail dialog
+                char buf[128];
+                snprintf(buf, sizeof(buf), "Pushed %d, failed %d", n_ok, n_fail);
                 show_toast(buf, false);
-            } else if ((int)wp > 0) {
-                snprintf(buf, sizeof(buf), "Pushed %d file(s)", (int)wp);
+                msg_box("Import Result", "Pushed %d item(s), %d failed.\n\n%s",
+                        n_ok, n_fail, s_last_error.c_str());
+            } else if (n_fail > 0) {
+                msg_box("Import Failed", "All %d item(s) failed.\n\n%s",
+                        n_fail, s_last_error.c_str());
+            } else if (n_ok > 0) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "Pushed %d item(s)", n_ok);
                 show_toast(buf, true);
             } else {
                 show_toast("Push failed", false);
@@ -1937,13 +2569,20 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         g_busy = false;
         if (g_on_busy) g_on_busy(false);
         {
-            char buf[128];
-            if ((int)wp > 0 && (int)lp == 0) {
-                snprintf(buf, sizeof(buf), "Pulled %d file(s)", (int)wp);
-                show_toast(buf, true);
-            } else if ((int)wp > 0 && (int)lp > 0) {
-                snprintf(buf, sizeof(buf), "Pulled %d, failed %d", (int)wp, (int)lp);
+            int n_ok = (int)wp, n_fail = (int)lp;
+            if (n_fail > 0 && n_ok > 0) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "Pulled %d, failed %d", n_ok, n_fail);
                 show_toast(buf, false);
+                msg_box("Export Result", "Pulled %d file(s), %d failed.\n\n%s",
+                        n_ok, n_fail, s_pull_error.c_str());
+            } else if (n_fail > 0) {
+                msg_box("Export Failed", "All %d file(s) failed.\n\n%s",
+                        n_fail, s_pull_error.c_str());
+            } else if (n_ok > 0) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "Pulled %d file(s)", n_ok);
+                show_toast(buf, true);
             } else {
                 show_toast("Pull failed", false);
             }
@@ -1956,12 +2595,19 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         g_busy = false;
         if (g_on_busy) g_on_busy(false);
         {
-            char buf[128];
-            if ((int)lp > 0) {
-                snprintf(buf, sizeof(buf), "Deleted %d, failed %d", (int)wp, (int)lp);
+            int n_ok = (int)wp, n_fail = (int)lp;
+            if (n_fail > 0 && n_ok > 0) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "Deleted %d, failed %d", n_ok, n_fail);
                 show_toast(buf, false);
-            } else if ((int)wp > 0) {
-                snprintf(buf, sizeof(buf), "Deleted %d item(s)", (int)wp);
+                msg_box("Delete Result", "Deleted %d item(s), %d failed.\n\n%s",
+                        n_ok, n_fail, s_del_error.c_str());
+            } else if (n_fail > 0) {
+                msg_box("Delete Failed", "All %d item(s) failed.\n\n%s",
+                        n_fail, s_del_error.c_str());
+            } else if (n_ok > 0) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "Deleted %d item(s)", n_ok);
                 show_toast(buf, true);
             } else {
                 show_toast("Delete failed", false);
@@ -1975,18 +2621,37 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         g_busy = false;
         if (g_on_busy) g_on_busy(false);
         {
-            char buf[128];
-            if ((int)lp > 0) {
-                snprintf(buf, sizeof(buf), "Pasted %d, failed %d", (int)wp, (int)lp);
+            int n_ok = (int)wp, n_fail = (int)lp;
+            if (n_fail > 0 && n_ok > 0) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "Pasted %d, failed %d", n_ok, n_fail);
                 show_toast(buf, false);
-            } else if ((int)wp > 0) {
-                snprintf(buf, sizeof(buf), "Pasted %d item(s)", (int)wp);
+                msg_box("Paste Result", "Pasted %d item(s), %d failed.\n\n%s",
+                        n_ok, n_fail, s_paste_error.c_str());
+            } else if (n_fail > 0) {
+                msg_box("Paste Failed", "All %d item(s) failed.\n\n%s",
+                        n_fail, s_paste_error.c_str());
+            } else if (n_ok > 0) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "Pasted %d item(s)", n_ok);
                 show_toast(buf, true);
             } else {
                 show_toast("Paste failed", false);
             }
         }
         refresh_list();
+        break;
+    }
+    case WM_USER + 205: {
+        // File content loaded — show text viewer
+        g_busy = false;
+        if (g_on_busy) g_on_busy(false);
+        if (g_status_label) SetWindowTextW(g_status_label, L"File Manager");
+        auto *result = reinterpret_cast<std::pair<std::string, std::wstring>*>(lp);
+        if (result) {
+            show_text_viewer(utf8_to_wide(result->first), result->second);
+            delete result;
+        }
         break;
     }
 

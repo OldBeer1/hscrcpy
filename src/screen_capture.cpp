@@ -216,11 +216,14 @@ std::string ScreenCapture::build_extension_cmd() const {
     char cmd[512];
     // Always include -p 5000: some devices (API 24+) require it for the extension to start,
     // even when using abstract socket. HOScrcpy also uses both simultaneously.
+    // Trailing '&' runs uitest in background on the device, matching HOScrcpy behavior.
+    // Without '&', hdc shell waits for the command and our 5s timeout may kill the
+    // host-side hdc process, which can also terminate the device-side uitest extension.
     if (use_abstract_socket_) {
         snprintf(cmd, sizeof(cmd),
                  "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so "
                  "-scale %d -frameRate %d -bitRate %d -p 5000 %s -screenId 0 -encodeType 0 "
-                 "-iFrameInterval %d -repeatInterval %d",
+                 "-iFrameInterval %d -repeatInterval %d &",
                  config_.scale, config_.frame_rate, config_.bit_rate,
                  kGrpcSocketName, config_.iframe_interval,
                  1000 / config_.frame_rate);
@@ -228,7 +231,7 @@ std::string ScreenCapture::build_extension_cmd() const {
         snprintf(cmd, sizeof(cmd),
                  "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so "
                  "-scale %d -frameRate %d -bitRate %d -p 5000 -screenId 0 -encodeType 0 "
-                 "-iFrameInterval %d -repeatInterval %d",
+                 "-iFrameInterval %d -repeatInterval %d &",
                  config_.scale, config_.frame_rate, config_.bit_rate,
                  config_.iframe_interval,
                  1000 / config_.frame_rate);
@@ -355,53 +358,64 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
     LOGI("Device SO md5: %s, Local SO md5: %s, up_to_date: %s",
          device_md5.c_str(), local_md5.c_str(), so_up_to_date ? "true" : "false");
 
-    if (extension_running && !pids.empty()) {
-        LOGI("Killing existing uitest extension (%zu process(es))", pids.size());
-        std::string kill_cmd = "kill -9";
-        for (auto &p : pids) kill_cmd += " " + p;
-        hdc_.shell_command(kill_cmd, nullptr, 3);
-        Sleep(500);
-    } else if (extension_running) {
-        LOGI("Extension running but PID not found, killing by name");
-        hdc_.shell_command("pkill -9 -f extension-name", nullptr, 3);
-        Sleep(500);
-    }
+    // HOScrcpy behavior: if extension is already running and SO is up to date,
+    // reuse the existing extension instead of killing and restarting.
+    // This avoids the daemon getting into a bad state after extension kill/restart.
+    bool extension_reused = false;
+    if (extension_running && !pids.empty() && so_up_to_date && !force_restart) {
+        LOGI("Extension already running with matching SO (%zu process(es)), reusing",
+             pids.size());
+        extension_reused = true;
+    } else {
+        if (extension_running && !pids.empty()) {
+            LOGI("Killing existing uitest extension (%zu process(es))", pids.size());
+            std::string kill_cmd = "kill -9";
+            for (auto &p : pids) kill_cmd += " " + p;
+            hdc_.shell_command(kill_cmd, nullptr, 3);
+            Sleep(500);
+        } else if (extension_running) {
+            LOGI("Extension running but PID not found, killing by name");
+            hdc_.shell_command("pkill -9 -f extension-name", nullptr, 3);
+            Sleep(500);
+        }
 
-    std::string daemon_check;
-    hdc_.shell_command("ps -ef", &daemon_check, 3);
-    bool daemon_running = false;
-    {
-        std::istringstream iss(daemon_check);
-        std::string line;
-        while (std::getline(iss, line)) {
-            if (line.find("uitest") != std::string::npos &&
-                line.find("start-daemon") != std::string::npos &&
-                line.find("grep") == std::string::npos &&
-                line.find("extension-name") == std::string::npos) {
-                daemon_running = true;
-                break;
+        std::string daemon_check;
+        hdc_.shell_command("ps -ef", &daemon_check, 3);
+        bool daemon_running = false;
+        {
+            std::istringstream iss(daemon_check);
+            std::string line;
+            while (std::getline(iss, line)) {
+                if (line.find("uitest") != std::string::npos &&
+                    line.find("start-daemon") != std::string::npos &&
+                    line.find("grep") == std::string::npos &&
+                    line.find("extension-name") == std::string::npos) {
+                    daemon_running = true;
+                    break;
+                }
             }
         }
-    }
-    if (!daemon_running) {
-        LOGI("uitest main daemon not running, starting...");
-        hdc_.shell_command("uitest start-daemon singleness", nullptr, 5);
-        Sleep(500);
-    } else {
-        LOGI("uitest main daemon already running");
+        if (!daemon_running) {
+            LOGI("uitest main daemon not running, starting...");
+            hdc_.shell_command("uitest start-daemon singleness", nullptr, 5);
+            Sleep(500);
+        } else {
+            LOGI("uitest main daemon already running");
+        }
+
+        LOGI("Pushing %s to %s (md5_match=%s)", local_so.c_str(), kDeviceSoPath, so_up_to_date ? "yes" : "no");
+        if (!hdc_.push_file(local_so, kDeviceSoPath)) {
+            LOGE("Failed to push server SO");
+            return false;
+        }
+
+        std::string cmd = build_extension_cmd();
+        LOGI("Starting uitest extension: %s", cmd.c_str());
+        hdc_.shell_command(cmd, nullptr, 5);
     }
 
-    LOGI("Pushing %s to %s (md5_match=%s)", local_so.c_str(), kDeviceSoPath, so_up_to_date ? "yes" : "no");
-    if (!hdc_.push_file(local_so, kDeviceSoPath)) {
-        LOGE("Failed to push server SO");
-        return false;
-    }
-
-    std::string cmd = build_extension_cmd();
-    LOGI("Starting uitest extension: %s", cmd.c_str());
-    hdc_.shell_command(cmd, nullptr, 5);
-
-    bool extension_ready = false;
+    bool extension_ready = extension_reused;
+    if (!extension_ready) {
     for (int i = 0; i < 30; i++) {
         Sleep(100);
         std::string check;
@@ -421,6 +435,7 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
             }
         }
     }
+    } // end if (!extension_reused)
 
     if (!extension_ready) {
         LOGE("uitest extension failed to start (%s not listening after 3s)",

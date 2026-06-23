@@ -314,6 +314,8 @@ void LayoutWindow::copy_list_property(HWND hwnd, int item_idx) {
 
 void LayoutWindow::refresh_layout() {
     if (!g_on_refresh) return;
+    g_has_hl = false;
+    if (g_on_select) g_on_select(0, 0, 0, 0);
     if (g_status_label) SetWindowTextW(g_status_label, L"Loading...");
     DWORD tid;
     CreateThread(NULL, 0, DumpThreadProc, NULL, 0, &tid);
@@ -423,6 +425,7 @@ LRESULT CALLBACK LayoutWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         SendMessageW(g_list, LVM_INSERTCOLUMNW, 1, (LPARAM)&col);
 
         HFONT hf = CreateFontW(16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+        SetPropW(hwnd, L"LayoutFont", hf);
         SendMessageW(g_tree, WM_SETFONT, (WPARAM)hf, TRUE);
         SendMessageW(g_list, WM_SETFONT, (WPARAM)hf, TRUE);
         SendMessageW(g_search_edit, WM_SETFONT, (WPARAM)hf, TRUE);
@@ -519,7 +522,9 @@ LRESULT CALLBACK LayoutWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             if (g_status_label) SetWindowTextW(g_status_label, L"Failed to load layout");
         }
         break;
-    case WM_DESTROY:
+    case WM_DESTROY: {
+        HFONT hf = (HFONT)GetPropW(hwnd, L"LayoutFont");
+        if (hf) { DeleteObject(hf); RemovePropW(hwnd, L"LayoutFont"); }
         g_hwnd = nullptr;
         g_tree = nullptr;
         g_list = nullptr;
@@ -527,6 +532,7 @@ LRESULT CALLBACK LayoutWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         g_has_hl = false;
         if (g_on_select) g_on_select(0, 0, 0, 0);
         break;
+    }
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
