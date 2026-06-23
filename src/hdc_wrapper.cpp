@@ -326,8 +326,14 @@ bool HdcWrapper::forward_remove(uint16_t local_port, bool is_abstract, const std
         if (pos == std::string::npos) pos = line.find("localabstract:");
         if (pos == std::string::npos) continue;
         std::string entry = line.substr(pos);
+        // Strip trailing whitespace, \r\n, and the "[Forward]" suffix
         while (!entry.empty() && (entry.back() == '\r' || entry.back() == '\n' || entry.back() == ' '))
             entry.pop_back();
+        auto bracket = entry.find('[');
+        if (bracket != std::string::npos) {
+            while (bracket > 0 && entry[bracket - 1] == ' ') bracket--;
+            entry = entry.substr(0, bracket);
+        }
         std::string rm_cmd = "fport rm " + entry;
         return run_process(build_hdc_cmd(rm_cmd), nullptr, 5000) == 0;
     }
@@ -344,8 +350,14 @@ bool HdcWrapper::forward_remove_all() {
         auto pos = line.find("tcp:");
         if (pos == std::string::npos) continue;
         std::string entry = line.substr(pos);
+        // Strip trailing whitespace, \r\n, and the "[Forward]" suffix
         while (!entry.empty() && (entry.back() == '\r' || entry.back() == '\n' || entry.back() == ' '))
             entry.pop_back();
+        auto bracket = entry.find('[');
+        if (bracket != std::string::npos) {
+            while (bracket > 0 && entry[bracket - 1] == ' ') bracket--;
+            entry = entry.substr(0, bracket);
+        }
         std::string rm_cmd = "fport rm " + entry;
         if (run_process(build_hdc_cmd(rm_cmd), nullptr, 5000) == 0) {
             any_removed = true;
@@ -376,8 +388,14 @@ bool HdcWrapper::cleanup_stale_forwards(const std::vector<uint16_t> &our_ports) 
         auto pos = line.find("tcp:");
         if (pos == std::string::npos) continue;
         std::string entry = line.substr(pos);
+        // Strip trailing whitespace, \r\n, and the "[Forward]" suffix
         while (!entry.empty() && (entry.back() == '\r' || entry.back() == '\n' || entry.back() == ' '))
             entry.pop_back();
+        auto bracket = entry.find('[');
+        if (bracket != std::string::npos) {
+            while (bracket > 0 && entry[bracket - 1] == ' ') bracket--;
+            entry = entry.substr(0, bracket);
+        }
 
         bool should_remove = false;
         if (!our_ports.empty()) {

@@ -358,64 +358,57 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
     LOGI("Device SO md5: %s, Local SO md5: %s, up_to_date: %s",
          device_md5.c_str(), local_md5.c_str(), so_up_to_date ? "true" : "false");
 
-    // HOScrcpy behavior: if extension is already running and SO is up to date,
-    // reuse the existing extension instead of killing and restarting.
-    // This avoids the daemon getting into a bad state after extension kill/restart.
-    bool extension_reused = false;
-    if (extension_running && !pids.empty() && so_up_to_date && !force_restart) {
-        LOGI("Extension already running with matching SO (%zu process(es)), reusing",
-             pids.size());
-        extension_reused = true;
-    } else {
-        if (extension_running && !pids.empty()) {
-            LOGI("Killing existing uitest extension (%zu process(es))", pids.size());
-            std::string kill_cmd = "kill -9";
-            for (auto &p : pids) kill_cmd += " " + p;
-            hdc_.shell_command(kill_cmd, nullptr, 3);
-            Sleep(500);
-        } else if (extension_running) {
-            LOGI("Extension running but PID not found, killing by name");
-            hdc_.shell_command("pkill -9 -f extension-name", nullptr, 3);
-            Sleep(500);
-        }
-
-        std::string daemon_check;
-        hdc_.shell_command("ps -ef", &daemon_check, 3);
-        bool daemon_running = false;
-        {
-            std::istringstream iss(daemon_check);
-            std::string line;
-            while (std::getline(iss, line)) {
-                if (line.find("uitest") != std::string::npos &&
-                    line.find("start-daemon") != std::string::npos &&
-                    line.find("grep") == std::string::npos &&
-                    line.find("extension-name") == std::string::npos) {
-                    daemon_running = true;
-                    break;
-                }
-            }
-        }
-        if (!daemon_running) {
-            LOGI("uitest main daemon not running, starting...");
-            hdc_.shell_command("uitest start-daemon singleness", nullptr, 5);
-            Sleep(500);
-        } else {
-            LOGI("uitest main daemon already running");
-        }
-
-        LOGI("Pushing %s to %s (md5_match=%s)", local_so.c_str(), kDeviceSoPath, so_up_to_date ? "yes" : "no");
-        if (!hdc_.push_file(local_so, kDeviceSoPath)) {
-            LOGE("Failed to push server SO");
-            return false;
-        }
-
-        std::string cmd = build_extension_cmd();
-        LOGI("Starting uitest extension: %s", cmd.c_str());
-        hdc_.shell_command(cmd, nullptr, 5);
+    // Always kill and restart the extension on a new connection.
+    // Reusing a stale extension leads to gRPC connection succeeding but
+    // receiving no frames (the extension accepts TCP but doesn't stream).
+    // The uitest daemon itself is never killed — only the extension process.
+    if (extension_running && !pids.empty()) {
+        LOGI("Killing existing uitest extension (%zu process(es))", pids.size());
+        std::string kill_cmd = "kill -9";
+        for (auto &p : pids) kill_cmd += " " + p;
+        hdc_.shell_command(kill_cmd, nullptr, 3);
+        Sleep(500);
+    } else if (extension_running) {
+        LOGI("Extension running but PID not found, killing by name");
+        hdc_.shell_command("pkill -9 -f extension-name", nullptr, 3);
+        Sleep(500);
     }
 
-    bool extension_ready = extension_reused;
-    if (!extension_ready) {
+    std::string daemon_check;
+    hdc_.shell_command("ps -ef", &daemon_check, 3);
+    bool daemon_running = false;
+    {
+        std::istringstream iss(daemon_check);
+        std::string line;
+        while (std::getline(iss, line)) {
+            if (line.find("uitest") != std::string::npos &&
+                line.find("start-daemon") != std::string::npos &&
+                line.find("grep") == std::string::npos &&
+                line.find("extension-name") == std::string::npos) {
+                daemon_running = true;
+                break;
+            }
+        }
+    }
+    if (!daemon_running) {
+        LOGI("uitest main daemon not running, starting...");
+        hdc_.shell_command("uitest start-daemon singleness", nullptr, 5);
+        Sleep(500);
+    } else {
+        LOGI("uitest main daemon already running");
+    }
+
+    LOGI("Pushing %s to %s (md5_match=%s)", local_so.c_str(), kDeviceSoPath, so_up_to_date ? "yes" : "no");
+    if (!hdc_.push_file(local_so, kDeviceSoPath)) {
+        LOGE("Failed to push server SO");
+        return false;
+    }
+
+    std::string cmd = build_extension_cmd();
+    LOGI("Starting uitest extension: %s", cmd.c_str());
+    hdc_.shell_command(cmd, nullptr, 5);
+
+    bool extension_ready = false;
     for (int i = 0; i < 30; i++) {
         Sleep(100);
         std::string check;
@@ -435,7 +428,6 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
             }
         }
     }
-    } // end if (!extension_reused)
 
     if (!extension_ready) {
         LOGE("uitest extension failed to start (%s not listening after 3s)",
@@ -736,6 +728,10 @@ bool ScreenCapture::reconnect_grpc_stream() {
     grpc_client_.disconnect();
     Sleep(500);
 
+    // Save ports before clearing so cleanup can identify our forwards
+    uint16_t old_video_port = local_video_port_;
+    uint16_t old_control_port = local_control_port_;
+
     if (local_video_port_ > 0) {
         hdc_.forward_remove(local_video_port_, use_abstract_socket_,
                             use_abstract_socket_ ? kGrpcSocketName : "");
@@ -747,9 +743,11 @@ bool ScreenCapture::reconnect_grpc_stream() {
         local_control_port_ = 0;
     }
 
-    hdc_.cleanup_stale_forwards({local_video_port_, local_control_port_});
+    hdc_.cleanup_stale_forwards({old_video_port, old_control_port});
     Sleep(300);
 
+    // Kill and restart extension (same as fresh connection)
+    kill_uitest_extension();
     hdc_.shell_command(build_extension_cmd(), nullptr, 5);
     Sleep(500);
 
