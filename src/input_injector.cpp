@@ -120,12 +120,10 @@ bool InputInjector::ensure_uitest_agent() {
             return true;
         }
 
-        hdc_.shell_command("netstat -an", &output, 3);
-        if (output.find("8012") != std::string::npos && output.find("LISTEN") != std::string::npos) {
-            LOGI("uitest agent listening on TCP port 8012 (check %d)", i + 1);
-            use_abstract_control_ = false;
-            return true;
-        }
+        // TCP port 8012 detection disabled: port 8012 is not reliably uitest agent.
+        // On some devices (e.g. cloud phones with uitest 5.0.x), port 8012 is a system service.
+        // Only abstract socket mode is reliable for socket-based input injection.
+        // Fall through to start uitest daemon and retry abstract socket detection.
 
         if (i == 0) {
             LOGI("uitest agent not found yet, starting uitest daemon...");
@@ -134,7 +132,7 @@ bool InputInjector::ensure_uitest_agent() {
         Sleep(300);
     }
 
-    LOGW("uitest agent still not available after checks");
+    LOGW("uitest agent still not available after checks (no abstract socket found)");
     return false;
 }
 
@@ -243,7 +241,6 @@ bool InputInjector::send_to_socket(const std::string &json) {
     std::lock_guard<std::mutex> lock(socket_mutex_);
     int sock = control_sock_.load();
     if (sock < 0) {
-        consecutive_send_failures_++;
         return false;
     }
 
@@ -266,7 +263,6 @@ bool InputInjector::send_to_socket(const std::string &json) {
             LOGW("send to socket: connection closed");
             CLOSE_SOCKET(static_cast<socket_t>(sock));
             control_sock_.store(-1);
-            consecutive_send_failures_++;
             return false;
         }
 
@@ -276,18 +272,17 @@ bool InputInjector::send_to_socket(const std::string &json) {
             Sleep(1);
             continue;
         }
-        LOGW("send to socket failed (err=%d)", err);
+        // Connection abort/reset (10053/10054) — close socket so reconnect_loop can fix it.
+        // Individual inject methods will fall back to shell commands immediately.
+        LOGW("send to socket failed (err=%d), closing socket for reconnect", err);
         CLOSE_SOCKET(static_cast<socket_t>(sock));
         control_sock_.store(-1);
-        consecutive_send_failures_++;
         return false;
     }
 
     if (remaining == 0) {
-        consecutive_send_failures_ = 0;
         return true;
     }
-    consecutive_send_failures_++;
     return false;
 }
 
@@ -304,7 +299,7 @@ bool InputInjector::inject_click(uint32_t x, uint32_t y) {
                  "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
                  "\"params\":{\"api\":\"touchUp\",\"args\":{\"x\":%u,\"y\":%u}}}",
                  x, y);
-        return send_to_socket(json);
+        if (send_to_socket(json)) return true;
     }
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "uitest uiInput click %u %u", x, y);
@@ -324,7 +319,7 @@ bool InputInjector::inject_long_click(uint32_t x, uint32_t y) {
                  "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
                  "\"params\":{\"api\":\"touchUp\",\"args\":{\"x\":%u,\"y\":%u}}}",
                  x, y);
-        return send_to_socket(json);
+        if (send_to_socket(json)) return true;
     }
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "uitest uiInput longClick %u %u", x, y);
@@ -332,6 +327,8 @@ bool InputInjector::inject_long_click(uint32_t x, uint32_t y) {
 }
 
 bool InputInjector::inject_touch_down(uint32_t x, uint32_t y) {
+    last_touch_x_.store(x);
+    last_touch_y_.store(y);
     if (use_socket_mode_) {
         char json[512];
         snprintf(json, sizeof(json),
@@ -339,13 +336,11 @@ bool InputInjector::inject_touch_down(uint32_t x, uint32_t y) {
                  "\"params\":{\"api\":\"touchDown\",\"args\":{\"x\":%u,\"y\":%u}}}",
                  x, y);
         if (send_to_socket(json)) return true;
-        // Only fall back if socket is dead (real failure, not transient buffer full)
         if (control_sock_.load() >= 0) return false;
-        LOGW("touch_down socket dead, fallback to shell");
     }
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "uitest uiInput click %u %u", x, y);
-    return hdc_.shell_command(cmd, nullptr, 5);
+    snprintf(cmd, sizeof(cmd), "uinput -T -d %u %u", x, y);
+    return hdc_.shell_command(cmd, nullptr, 3);
 }
 
 bool InputInjector::inject_touch_move(uint32_t x, uint32_t y) {
@@ -355,9 +350,20 @@ bool InputInjector::inject_touch_move(uint32_t x, uint32_t y) {
                  "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
                  "\"params\":{\"api\":\"touchMove\",\"args\":{\"x\":%u,\"y\":%u}}}",
                  x, y);
-        if (send_to_socket(json)) return true;
+        if (send_to_socket(json)) {
+            last_touch_x_.store(x);
+            last_touch_y_.store(y);
+            return true;
+        }
+        if (control_sock_.load() >= 0) return false;
     }
-    return true;
+    // Shell fallback: uinput -T -m needs from/to coordinates
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "uinput -T -m %u %u %u %u",
+             last_touch_x_.load(), last_touch_y_.load(), x, y);
+    last_touch_x_.store(x);
+    last_touch_y_.store(y);
+    return hdc_.shell_command(cmd, nullptr, 3);
 }
 
 bool InputInjector::inject_touch_up(uint32_t x, uint32_t y) {
@@ -368,8 +374,11 @@ bool InputInjector::inject_touch_up(uint32_t x, uint32_t y) {
                  "\"params\":{\"api\":\"touchUp\",\"args\":{\"x\":%u,\"y\":%u}}}",
                  x, y);
         if (send_to_socket(json)) return true;
+        if (control_sock_.load() >= 0) return false;
     }
-    return true;
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "uinput -T -u %u %u", x, y);
+    return hdc_.shell_command(cmd, nullptr, 3);
 }
 
 void InputInjector::queue_touch_down(uint32_t x, uint32_t y) {
@@ -579,37 +588,7 @@ void InputInjector::reconnect_loop() {
         Sleep(2000);
         if (!reconnect_running_) break;
 
-        // Check if uitest daemon is stuck: socket connects but sends keep failing
-        int send_fails = consecutive_send_failures_.load();
-        if (send_fails >= 5 && control_sock_.load() >= 0) {
-            LOGW("uitest daemon appears stuck (%d consecutive send failures), killing and restarting", send_fails);
-            int old_sock = control_sock_.exchange(-1);
-            if (old_sock >= 0) CLOSE_SOCKET(static_cast<socket_t>(old_sock));
-            if (local_control_port_ > 0) {
-                hdc_.forward_remove(local_control_port_, use_abstract_control_,
-                                    use_abstract_control_ ? kUitestSocketName : "");
-                local_control_port_ = 0;
-            }
-            hdc_.shell_command("pkill -9 -f uitest", nullptr, 3);
-            Sleep(1000);
-            hdc_.shell_command("uitest start-daemon singleness", nullptr, 5);
-            Sleep(500);
-            consecutive_send_failures_ = 0;
-            consecutive_failures = 0;
-            continue;
-        }
-
         if (control_sock_.load() >= 0) {
-            consecutive_failures = 0;
-            continue;
-        }
-
-        if (consecutive_failures >= 5) {
-            LOGW("Control socket reconnect failed %d times, killing uitest and restarting", consecutive_failures);
-            hdc_.shell_command("pkill -9 -f uitest", nullptr, 3);
-            Sleep(1000);
-            hdc_.shell_command("uitest start-daemon singleness", nullptr, 5);
-            Sleep(500);
             consecutive_failures = 0;
             continue;
         }
@@ -619,6 +598,14 @@ void InputInjector::reconnect_loop() {
         if (!ensure_uitest_agent()) {
             LOGW("Reconnect: uitest agent not available");
             consecutive_failures++;
+            if (consecutive_failures >= 5) {
+                LOGW("uitest agent unavailable %d times, killing and restarting", consecutive_failures);
+                hdc_.shell_command("pkill -9 -f uitest", nullptr, 3);
+                Sleep(1000);
+                hdc_.shell_command("uitest start-daemon singleness", nullptr, 5);
+                Sleep(500);
+                consecutive_failures = 0;
+            }
             continue;
         }
 
@@ -640,6 +627,14 @@ void InputInjector::reconnect_loop() {
         } else {
             LOGW("Reconnect: setup_control_port failed");
             consecutive_failures++;
+            if (consecutive_failures >= 5) {
+                LOGW("Control socket reconnect failed %d times, killing uitest and restarting", consecutive_failures);
+                hdc_.shell_command("pkill -9 -f uitest", nullptr, 3);
+                Sleep(1000);
+                hdc_.shell_command("uitest start-daemon singleness", nullptr, 5);
+                Sleep(500);
+                consecutive_failures = 0;
+            }
         }
     }
     LOGI("Reconnect loop ended");
