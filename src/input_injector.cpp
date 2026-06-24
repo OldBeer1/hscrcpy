@@ -301,9 +301,12 @@ bool InputInjector::inject_click(uint32_t x, uint32_t y) {
                  x, y);
         if (send_to_socket(json)) return true;
     }
+    // Shell fallback: uinput -T down+up
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "uitest uiInput click %u %u", x, y);
-    return hdc_.shell_command(cmd, nullptr, 5);
+    snprintf(cmd, sizeof(cmd), "uinput -T -d %u %u", x, y);
+    hdc_.shell_command(cmd, nullptr, 3);
+    snprintf(cmd, sizeof(cmd), "uinput -T -u %u %u", x, y);
+    return hdc_.shell_command(cmd, nullptr, 3);
 }
 
 bool InputInjector::inject_long_click(uint32_t x, uint32_t y) {
@@ -321,9 +324,13 @@ bool InputInjector::inject_long_click(uint32_t x, uint32_t y) {
                  x, y);
         if (send_to_socket(json)) return true;
     }
+    // Shell fallback: uinput -T down + delay + up
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "uitest uiInput longClick %u %u", x, y);
-    return hdc_.shell_command(cmd, nullptr, 5);
+    snprintf(cmd, sizeof(cmd), "uinput -T -d %u %u", x, y);
+    hdc_.shell_command(cmd, nullptr, 3);
+    Sleep(500);
+    snprintf(cmd, sizeof(cmd), "uinput -T -u %u %u", x, y);
+    return hdc_.shell_command(cmd, nullptr, 3);
 }
 
 bool InputInjector::inject_touch_down(uint32_t x, uint32_t y) {

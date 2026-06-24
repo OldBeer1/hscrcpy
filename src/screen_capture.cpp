@@ -111,60 +111,80 @@ std::string ScreenCapture::get_local_so_md5(const std::string &filepath) {
 }
 
 std::string ScreenCapture::find_matching_so_with_md5(const std::string &device_md5) {
-    bool old_version = version_compare_result(uitest_version_, "6.0.2.1") == "less";
+    // HOScrcpy: isUseSecSo = compareUitestVersion("6.0.2.1", uitestVersion) < 0
+    // i.e. uitest >= 6.0.2.1 → sec SO (unix_6.*) → abstract socket
+    //      uitest < 6.0.2.1 → normal SO (server0-3, 5.10) → TCP port 5000
+    // We follow the same logic, with cross-list fallback in case the primary
+    // list's SOs are all incompatible (e.g. sec SOs fail on some uitest 5.x).
+    bool prefer_sec = version_compare_result(uitest_version_, "6.0.2.1") != "less";
 
-    std::vector<std::string> candidates;
-    if (old_version) {
-        candidates = {
-            "libscrcpy_server1.z.so",
-            "libscrcpy_server0.z.so",
-            "libscrcpy_server2.z.so",
-            "libscrcpy_server3.z.so",
-        };
-    } else {
-        // For uitest >= 6.0.2.1, always prefer the latest SO version first.
-        // MD5 match is unreliable because the device may have an old incompatible SO
-        // from a previous session (e.g. 6.3.1 SO cannot start extension on uitest 6.0.2.x).
-        candidates = {
+    // Primary list: matches HOScrcpy's version-based selection
+    // Fallback list: the other category, tried if primary list is empty
+    std::vector<std::string> primary = prefer_sec
+        ? std::vector<std::string>{
             "libscrcpy_server_unix_6.6-20260418.z.so",
             "libscrcpy_server_unix_6.5-20260313.z.so",
             "libscrcpy_server_unix_6.4-20260113.z.so",
             "libscrcpy_server_unix_6.3.1-20260113.z.so",
+        }
+        : std::vector<std::string>{
+            "libscrcpy_server1.z.so",
+            "libscrcpy_server2.z.so",
+            "libscrcpy_server3.z.so",
             "libscrcpy_server_5.10-20260114.z.so",
         };
-    }
 
-    // Select by version priority (highest first).
-    // Use MD5 only to skip re-pushing if the device already has the exact same file.
-    for (auto &name : candidates) {
-        std::string path = server_dir_ + "\\" + name;
-        if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            std::string local_md5 = get_local_so_md5(path);
-            if (!device_md5.empty() && local_md5 == device_md5) {
-                LOGI("Selected server SO: %s (device already has this version, skip push)", name.c_str());
-            } else {
-                LOGI("Selected server SO: %s (by version priority)", name.c_str());
+    std::vector<std::string> fallback = prefer_sec
+        ? std::vector<std::string>{
+            "libscrcpy_server1.z.so",
+            "libscrcpy_server0.z.so",
+            "libscrcpy_server2.z.so",
+            "libscrcpy_server3.z.so",
+        }
+        : std::vector<std::string>{
+            "libscrcpy_server_unix_6.6-20260418.z.so",
+            "libscrcpy_server_unix_6.5-20260313.z.so",
+            "libscrcpy_server_unix_6.4-20260113.z.so",
+            "libscrcpy_server_unix_6.3.1-20260113.z.so",
+        };
+
+    // First pass: MD5 match (device already has a working SO from a previous session).
+    // HOScrcpy also checks MD5 first and overrides isUseSecSo based on which map matches.
+    // Check primary list first, then fallback list.
+    for (auto &list : {primary, fallback}) {
+        for (auto &name : list) {
+            std::string path = server_dir_ + "\\" + name;
+            if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                std::string local_md5 = get_local_so_md5(path);
+                if (!device_md5.empty() && local_md5 == device_md5) {
+                    LOGI("Selected server SO: %s (MD5 match, skip push)", name.c_str());
+                    return path;
+                }
             }
-            return path;
         }
     }
 
+    // Second pass: pick first available from primary list, then fallback list
+    for (auto &list : {primary, fallback}) {
+        for (auto &name : list) {
+            std::string path = server_dir_ + "\\" + name;
+            if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                LOGI("Selected server SO: %s (by priority, no MD5 match)", name.c_str());
+                return path;
+            }
+        }
+    }
+
+    // Last resort: find any .z.so file in server directory
     WIN32_FIND_DATAA fd;
     std::string pattern = server_dir_ + "\\*.z.so";
     HANDLE hFind = FindFirstFileA(pattern.c_str(), &fd);
     if (hFind != INVALID_HANDLE_VALUE) {
         std::string result;
         do {
-            if (old_version) {
-                if (strstr(fd.cFileName, "unix") == nullptr && strstr(fd.cFileName, "emulator") == nullptr) {
-                    result = server_dir_ + "\\" + fd.cFileName;
-                    break;
-                }
-            } else {
-                if (strstr(fd.cFileName, "unix") != nullptr) {
-                    result = server_dir_ + "\\" + fd.cFileName;
-                    break;
-                }
+            if (strstr(fd.cFileName, "emulator") == nullptr) {
+                result = server_dir_ + "\\" + fd.cFileName;
+                break;
             }
         } while (FindNextFileA(hFind, &fd));
         FindClose(hFind);
@@ -214,28 +234,18 @@ std::string ScreenCapture::find_matching_agent_so() {
 
 std::string ScreenCapture::build_extension_cmd() const {
     char cmd[512];
-    // Always include -p 5000: some devices (API 24+) require it for the extension to start,
-    // even when using abstract socket. HOScrcpy also uses both simultaneously.
+    // HOScrcpy behavior: always use "-p 5000" only. The sec SO (for uitest < 6.0.2.1)
+    // automatically creates the scrcpy_grpc_socket abstract socket; no need to pass it
+    // as a command-line argument. Passing it explicitly can cause the extension to fail
+    // to create the abstract socket on some 5.x devices.
     // Trailing '&' runs uitest in background on the device, matching HOScrcpy behavior.
-    // Without '&', hdc shell waits for the command and our 5s timeout may kill the
-    // host-side hdc process, which can also terminate the device-side uitest extension.
-    if (use_abstract_socket_) {
-        snprintf(cmd, sizeof(cmd),
-                 "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so "
-                 "-scale %d -frameRate %d -bitRate %d -p 5000 %s -screenId 0 -encodeType 0 "
-                 "-iFrameInterval %d -repeatInterval %d &",
-                 config_.scale, config_.frame_rate, config_.bit_rate,
-                 kGrpcSocketName, config_.iframe_interval,
-                 1000 / config_.frame_rate);
-    } else {
-        snprintf(cmd, sizeof(cmd),
-                 "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so "
-                 "-scale %d -frameRate %d -bitRate %d -p 5000 -screenId 0 -encodeType 0 "
-                 "-iFrameInterval %d -repeatInterval %d &",
-                 config_.scale, config_.frame_rate, config_.bit_rate,
-                 config_.iframe_interval,
-                 1000 / config_.frame_rate);
-    }
+    snprintf(cmd, sizeof(cmd),
+             "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so "
+             "-scale %d -frameRate %d -bitRate %d -p 5000 -screenId 0 -encodeType 0 "
+             "-iFrameInterval %d -repeatInterval %d &",
+             config_.scale, config_.frame_rate, config_.bit_rate,
+             config_.iframe_interval,
+             1000 / config_.frame_rate);
     return cmd;
 }
 
@@ -318,16 +328,9 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
 
     LOGI("uitest version: '%s', device_md5: '%s'", uitest_version_.c_str(), device_md5.c_str());
 
-    use_abstract_socket_ = version_compare_result(uitest_version_, "6.0.2.1") != "less";
-    if (!use_abstract_socket_ && uitest_version_.empty()) {
-        std::string check;
-        hdc_.shell_command("cat /proc/net/unix", &check, 3);
-        if (check.find("scrcpy_grpc_socket") != std::string::npos) {
-            use_abstract_socket_ = true;
-            LOGI("uitest version unknown but abstract socket found, using abstract socket mode");
-        }
-    }
-    LOGI("use_abstract_socket: %s", use_abstract_socket_ ? "true" : "false");
+    // use_abstract_socket_ will be set after SO selection based on which SO is deployed.
+    // HOScrcpy determines socket mode by the actual SO type, not just uitest version:
+    // sec SO (unix_6.*) → abstract socket, normal SO (server0-3, 5.10) → TCP port 5000.
 
     bool extension_running = false;
     std::vector<std::string> pids;
@@ -352,6 +355,29 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
         return false;
     }
     LOGI("Using server SO: %s", local_so.c_str());
+
+    // HOScrcpy overrides isUseSecSo based on which SO is actually deployed:
+    // sec SO (unix_6.*) creates abstract socket, normal SO (server0-3, 5.10) uses TCP.
+    // When MD5 matches a normal SO on a uitest < 6.0.2.1 device, HOScrcpy switches
+    // to TCP mode — the SO variant determines the socket mode, not just uitest version.
+    bool is_sec_so = local_so.find("unix_6") != std::string::npos;
+    use_abstract_socket_ = is_sec_so;
+
+    // Fallback: if uitest version is unknown but the device already has an abstract
+    // socket from a previous session, prefer abstract socket mode. This handles the
+    // case where the local server directory lacks the sec SO file (MD5 match failed)
+    // but the device is already running with sec SO.
+    if (!use_abstract_socket_ && uitest_version_.empty() && !extension_running) {
+        std::string check;
+        hdc_.shell_command("cat /proc/net/unix", &check, 3);
+        if (check.find(kGrpcSocketName) != std::string::npos) {
+            use_abstract_socket_ = true;
+            LOGI("uitest version unknown but abstract socket found, using abstract socket mode");
+        }
+    }
+
+    LOGI("use_abstract_socket: %s (based on SO type: %s)", use_abstract_socket_ ? "true" : "false",
+         is_sec_so ? "sec SO (abstract socket)" : "normal SO (TCP)");
 
     std::string local_md5 = get_local_so_md5(local_so);
     bool so_up_to_date = !device_md5.empty() && (local_md5 == device_md5);
