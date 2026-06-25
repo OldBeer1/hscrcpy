@@ -29,6 +29,7 @@ public:
     bool decode(const uint8_t *h264_data, size_t h264_size);
     const DecodedImage &image() const { return image_; }
     DecodedImage &image_ref() { return image_; }
+    void rebind_rgb_pointer();
     bool is_initialized() const { return initialized_; }
 
 private:

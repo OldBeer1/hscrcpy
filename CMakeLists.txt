@@ -4,7 +4,7 @@ project(hscrcpy CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -msse2")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -msse2 -DUNICODE -D_UNICODE")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O2 -msse2")
 
 add_executable(hscrcpy WIN32
@@ -20,6 +20,7 @@ add_executable(hscrcpy WIN32
     src/config.cpp
     src/layout_window.cpp
     src/file_manager_window.cpp
+    src/cph_window.cpp
 )
 
 # ============================================

@@ -1,0 +1,1373 @@
+#include "cph_window.h"
+#include "log.h"
+#include <windowsx.h>
+#include <commctrl.h>
+#include <uxtheme.h>
+#include <commdlg.h>
+#include <cstdio>
+#include <cstdarg>
+#include <cstring>
+#include <sstream>
+#include <algorithm>
+#include <cctype>
+#include <thread>
+#include <atomic>
+
+namespace hscrcpy {
+
+// ── Static member definitions ──────────────────────────────
+
+HWND CphWindow::g_hwnd = nullptr;
+HINSTANCE CphWindow::g_inst = nullptr;
+HWND CphWindow::g_parent = nullptr;
+int CphWindow::g_panel_w = 460;
+
+HWND CphWindow::g_tab = nullptr;
+
+HWND CphWindow::g_gnss_lat_edit = nullptr;
+HWND CphWindow::g_gnss_lng_edit = nullptr;
+HWND CphWindow::g_gnss_alt_edit = nullptr;
+HWND CphWindow::g_gnss_speed_edit = nullptr;
+HWND CphWindow::g_gnss_bearing_edit = nullptr;
+HWND CphWindow::g_gnss_hacc_edit = nullptr;
+HWND CphWindow::g_gnss_vacc_edit = nullptr;
+HWND CphWindow::g_gnss_sacc_edit = nullptr;
+HWND CphWindow::g_gnss_bacc_edit = nullptr;
+HWND CphWindow::g_gnss_inject_btn = nullptr;
+HWND CphWindow::g_gnss_refresh_btn = nullptr;
+HWND CphWindow::g_gnss_current_label = nullptr;
+
+HWND CphWindow::g_gnss_traj_edit = nullptr;
+HWND CphWindow::g_gnss_traj_browse_btn = nullptr;
+HWND CphWindow::g_gnss_traj_start_btn = nullptr;
+HWND CphWindow::g_gnss_traj_stop_btn = nullptr;
+
+HWND CphWindow::g_bat_capacity_edit = nullptr;
+HWND CphWindow::g_bat_temp_edit = nullptr;
+HWND CphWindow::g_bat_voltage_edit = nullptr;
+HWND CphWindow::g_bat_voltage_max_edit = nullptr;
+HWND CphWindow::g_bat_current_edit = nullptr;
+HWND CphWindow::g_bat_current_avg_edit = nullptr;
+HWND CphWindow::g_bat_current_max_edit = nullptr;
+HWND CphWindow::g_bat_health_combo = nullptr;
+HWND CphWindow::g_bat_present_combo = nullptr;
+HWND CphWindow::g_bat_total_energy_edit = nullptr;
+HWND CphWindow::g_bat_technology_edit = nullptr;
+HWND CphWindow::g_bat_plugged_combo = nullptr;
+HWND CphWindow::g_bat_charger_combo = nullptr;
+HWND CphWindow::g_bat_chargestate_combo = nullptr;
+HWND CphWindow::g_bat_inject_btn = nullptr;
+HWND CphWindow::g_bat_reset_btn = nullptr;
+HWND CphWindow::g_bat_refresh_btn = nullptr;
+HWND CphWindow::g_bat_current_label = nullptr;
+HWND CphWindow::g_bat_scene_combo = nullptr;
+HWND CphWindow::g_bat_scene_btn = nullptr;
+
+HWND CphWindow::g_status_label = nullptr;
+
+HWND CphWindow::g_tab_pages[TAB_COUNT] = {};
+
+CphWindow::OnShellCommand CphWindow::g_on_shell;
+CphWindow::OnPushFile CphWindow::g_on_push;
+CphWindow::OnBusy CphWindow::g_on_busy;
+int CphWindow::g_current_tab = TAB_GNSS;
+bool CphWindow::g_traj_running = false;
+std::atomic<bool> CphWindow::g_async_busy{false};
+UINT_PTR CphWindow::g_refresh_timer = 0;
+
+// Timer ID for auto-refresh
+static const int CPH_REFRESH_TIMER_ID = 2001;
+static const int CPH_REFRESH_INTERVAL_MS = 5000;
+
+// Flag: Refresh button should fill edit controls
+static bool s_refresh_fill_edits = false;
+
+// Consecutive refresh failure counter - stop auto-refresh after 3 failures
+static int s_refresh_fail_count = 0;
+static const int MAX_REFRESH_FAILS = 3;
+
+// Custom message for async operation completion
+static const UINT WM_CPH_ASYNC_DONE = RegisterWindowMessageW(L"HScrcpyCphAsyncDone");
+// Custom message for retrying a busy async operation
+static const UINT WM_CPH_RETRY_ASYNC = RegisterWindowMessageW(L"HScrcpyCphRetryAsync");
+
+HWND CphWindow::g_toast_hwnd = nullptr;
+
+static const wchar_t CPH_CLASS_W[] = L"HScrcpyCphClass";
+static const wchar_t CPH_PAGE_W[] = L"HScrcpyCphPageClass";
+
+// Page WndProc: forward WM_COMMAND to the CPH main window
+static LRESULT CALLBACK CphPageWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_COMMAND) {
+        HWND cph_hwnd = GetParent(GetParent(hwnd));  // page -> tab -> cph window
+        if (cph_hwnd) SendMessageW(cph_hwnd, WM_COMMAND, wp, lp);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// Register the page class once (with background brush to prevent overlap bleed)
+static void ensure_page_class_registered(HINSTANCE inst) {
+    static bool reg = false;
+    if (reg) return;
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = CphPageWndProc;
+    wc.hInstance = inst;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = CPH_PAGE_W;
+    RegisterClassExW(&wc);
+    reg = true;
+}
+
+// ── Cloud phone detection ──────────────────────────────────
+
+bool CphWindow::is_cloud_phone(OnShellCommand on_shell) {
+    auto shell = on_shell ? on_shell : g_on_shell;
+    if (!shell) { LOGE("CPH is_cloud_phone: no shell callback"); return false; }
+    std::string output;
+    // Cloud phone detection: /system/bin/cmd exists (even if CPH libraries are missing)
+    bool ok = shell("cmd", &output, 5);
+    LOGE("CPH is_cloud_phone: shell ok=%d output=[%.300s]", ok, output.c_str());
+    if (!ok) return false;
+    // If cmd is not found at all, it's not a cloud phone
+    if (output.find("not found") != std::string::npos ||
+        output.find("No such file") != std::string::npos) return false;
+    // If cmd produced any output (including CPH library errors), it's a cloud phone
+    // /system/bin/cmd exists only on cloud phone devices
+    return !output.empty();
+}
+
+// ── Toast notification ─────────────────────────────────────
+
+static LRESULT CALLBACK CphToastWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_CREATE) {
+        auto *cs = reinterpret_cast<CREATESTRUCTW *>(lp);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+        SetTimer(hwnd, 1, 2000, nullptr);
+        return 0;
+    }
+    if (msg == WM_TIMER) {
+        KillTimer(hwnd, 1);
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        auto *text = reinterpret_cast<const wchar_t *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        SetBkMode(hdc, TRANSPARENT);
+        HFONT hf = CreateFontW(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+        HFONT old = (HFONT)SelectObject(hdc, hf);
+        DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(hdc, old);
+        DeleteObject(hf);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+void CphWindow::show_toast(const char *text, bool success) {
+    if (!g_hwnd) return;
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = CphToastWndProc;
+        wc.hInstance = g_inst;
+        wc.hbrBackground = CreateSolidBrush(success ? RGB(102, 187, 106) : RGB(239, 154, 154));
+        wc.lpszClassName = L"HScrcpyCphToastClass";
+        RegisterClassExW(&wc);
+        reg = true;
+    }
+    if (g_toast_hwnd && IsWindow(g_toast_hwnd)) DestroyWindow(g_toast_hwnd);
+    int len = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
+    auto *wtext = new wchar_t[len];
+    MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, len);
+    // Calculate width based on text length
+    HDC dc = GetDC(g_hwnd);
+    HFONT hf = CreateFontW(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    HFONT old = (HFONT)SelectObject(dc, hf);
+    SIZE sz;
+    GetTextExtentPoint32W(dc, wtext, len - 1, &sz);
+    SelectObject(dc, old);
+    DeleteObject(hf);
+    ReleaseDC(g_hwnd, dc);
+    int tw = sz.cx + 24;
+    if (tw < 160) tw = 160;
+    if (tw > 420) tw = 420;
+    // Center toast on current tab page area
+    RECT prc;
+    if (g_tab && g_current_tab >= 0 && g_current_tab < TAB_COUNT && g_tab_pages[g_current_tab]) {
+        GetClientRect(g_tab_pages[g_current_tab], &prc);
+        POINT pt = {0, 0};
+        ClientToScreen(g_tab_pages[g_current_tab], &pt);
+        ScreenToClient(g_hwnd, &pt);
+        prc.left = pt.x;
+        prc.top = pt.y;
+        prc.right = pt.x + prc.right;
+        prc.bottom = pt.y + prc.bottom;
+    } else {
+        GetClientRect(g_hwnd, &prc);
+    }
+    g_toast_hwnd = CreateWindowExW(0, L"HScrcpyCphToastClass", L"",
+                                    WS_CHILD | WS_VISIBLE,
+                                    (prc.left + prc.right) / 2 - tw / 2,
+                                    (prc.top + prc.bottom) / 2 - 15,
+                                    tw, 30,
+                                    g_hwnd, nullptr, g_inst, wtext);
+    SetWindowPos(g_toast_hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+// Hook to center MessageBox on CPH window
+static HWND s_msgbox_parent = nullptr;
+static LRESULT CALLBACK MsgBoxCenterHook(int nCode, WPARAM wp, LPARAM lp) {
+    if (nCode == HCBT_CREATEWND && s_msgbox_parent) {
+        HWND mb = (HWND)wp;
+        RECT prc, mrc;
+        GetWindowRect(s_msgbox_parent, &prc);
+        GetWindowRect(mb, &mrc);
+        int mw = mrc.right - mrc.left, mh = mrc.bottom - mrc.top;
+        int x = prc.left + (prc.right - prc.left - mw) / 2;
+        int y = prc.top + (prc.bottom - prc.top - mh) / 2;
+        MoveWindow(mb, x, y, mw, mh, FALSE);
+    }
+    return CallNextHookEx(NULL, nCode, wp, lp);
+}
+
+void CphWindow::msg_box(const char *title, const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    s_msgbox_parent = g_hwnd;
+    HHOOK hook = SetWindowsHookExW(WH_CBT, MsgBoxCenterHook, NULL, GetCurrentThreadId());
+    MessageBoxA(g_hwnd, buf, title, MB_OK);
+    if (hook) UnhookWindowsHookEx(hook);
+    s_msgbox_parent = nullptr;
+}
+
+void CphWindow::set_status(const char *text) {
+    if (g_status_label) SetWindowTextA(g_status_label, text);
+}
+
+// ── UI helpers ─────────────────────────────────────────────
+
+static HFONT g_cph_font = nullptr;
+
+static HWND make_label(HWND parent, const wchar_t *text, int x, int y, int w, int h) {
+    HWND hw = CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_RIGHT,
+                             x, y, w, h, parent, nullptr, nullptr, nullptr);
+    if (g_cph_font) SendMessageW(hw, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+    return hw;
+}
+
+static HWND make_label_left(HWND parent, const wchar_t *text, int x, int y, int w, int h) {
+    HWND hw = CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_LEFT,
+                             x, y, w, h, parent, nullptr, nullptr, nullptr);
+    if (g_cph_font) SendMessageW(hw, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+    return hw;
+}
+
+static HWND make_edit(HWND parent, int id, const wchar_t *def, int x, int y, int w, int h) {
+    HWND hw = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", def ? def : L"",
+                               WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                               x, y, w, h, parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
+    if (g_cph_font) SendMessageW(hw, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+    return hw;
+}
+
+static HWND make_btn(HWND parent, const wchar_t *text, int id, int x, int y, int w, int h) {
+    HWND hw = CreateWindowW(L"BUTTON", text,
+                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                             x, y, w, h, parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
+    if (g_cph_font) SendMessageW(hw, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+    SetWindowTheme(hw, L"", L"");
+    return hw;
+}
+
+static HWND make_combo(HWND parent, int id, int x, int y, int w, int h) {
+    HWND hw = CreateWindowW(L"COMBOBOX", L"",
+                             WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+                             x, y, w, h, parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
+    if (g_cph_font) SendMessageW(hw, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+    return hw;
+}
+
+static HWND make_group(HWND parent, const wchar_t *text, int x, int y, int w, int h) {
+    HWND hw = CreateWindowW(L"BUTTON", text,
+                             WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
+                             x, y, w, h, parent, nullptr, nullptr, nullptr);
+    if (g_cph_font) SendMessageW(hw, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+    return hw;
+}
+
+// ── Public API ─────────────────────────────────────────────
+
+void CphWindow::create(HINSTANCE inst, HWND parent, int width) {
+    g_inst = inst;
+    g_parent = parent;
+    g_panel_w = width;
+
+    static bool registered = false;
+    if (!registered) {
+        INITCOMMONCONTROLSEX icex = {sizeof(icex), ICC_TAB_CLASSES};
+        InitCommonControlsEx(&icex);
+
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = WndProc;
+        wc.hInstance = inst;
+        wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = CPH_CLASS_W;
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+}
+
+void CphWindow::show(OnShellCommand on_shell, OnPushFile on_push, OnBusy on_busy) {
+    g_on_shell = on_shell;
+    g_on_push = on_push;
+    g_on_busy = on_busy;
+
+    if (!g_hwnd) {
+        g_hwnd = CreateWindowExW(0, CPH_CLASS_W, L"",
+                                  WS_CHILD | WS_BORDER | WS_CLIPCHILDREN | WS_VSCROLL,
+                                  0, 0, g_panel_w, 100, g_parent, nullptr, g_inst, nullptr);
+    }
+    ShowWindow(g_hwnd, SW_SHOW);
+    InvalidateRect(g_hwnd, nullptr, TRUE);
+    // Start auto-refresh timer (1 second)
+    if (g_refresh_timer) KillTimer(g_hwnd, CPH_REFRESH_TIMER_ID);
+    g_refresh_timer = SetTimer(g_hwnd, CPH_REFRESH_TIMER_ID, CPH_REFRESH_INTERVAL_MS, nullptr);
+    // Initial refresh
+    if (g_current_tab == TAB_GNSS) refresh_gnss();
+    else if (g_current_tab == TAB_BATTERY) { s_refresh_fill_edits = true; refresh_battery(); }
+}
+
+void CphWindow::hide() {
+    if (g_hwnd) {
+        if (g_refresh_timer) { KillTimer(g_hwnd, CPH_REFRESH_TIMER_ID); g_refresh_timer = 0; }
+        ShowWindow(g_hwnd, SW_HIDE);
+    }
+}
+
+void CphWindow::destroy() {
+    if (g_hwnd) {
+        DestroyWindow(g_hwnd);
+        g_hwnd = nullptr;
+    }
+}
+
+bool CphWindow::is_visible() {
+    return g_hwnd && IsWindowVisible(g_hwnd);
+}
+
+HWND CphWindow::hwnd() { return g_hwnd; }
+int CphWindow::panel_width() { return g_panel_w; }
+void CphWindow::set_panel_width(int w) { g_panel_w = w; }
+
+void CphWindow::reposition(int x, int y, int w, int h) {
+    if (!g_hwnd) return;
+    MoveWindow(g_hwnd, x, y, w, h, TRUE);
+    // Resize tab control to fill the panel
+    if (g_tab) {
+        int tw = w - MARGIN * 2;
+        MoveWindow(g_tab, MARGIN, HEADER_H, tw, 800, TRUE);
+        // Resize tab pages
+        RECT tab_rc = {0, 0, tw, 800};
+        TabCtrl_AdjustRect(g_tab, FALSE, &tab_rc);
+        int pw = tab_rc.right - tab_rc.left;
+        int ph = tab_rc.bottom - tab_rc.top;
+        for (int i = 0; i < TAB_COUNT; i++) {
+            if (g_tab_pages[i])
+                MoveWindow(g_tab_pages[i], tab_rc.left, tab_rc.top, pw, ph, TRUE);
+        }
+    }
+}
+
+// ── Tab page switching ─────────────────────────────────────
+
+void CphWindow::on_tab_change() {
+    if (!g_tab) return;
+    int sel = TabCtrl_GetCurSel(g_tab);
+    if (sel >= 0 && sel < TAB_COUNT) {
+        show_tab_page(sel);
+        if (sel == TAB_GNSS) refresh_gnss();
+        else if (sel == TAB_BATTERY) refresh_battery();
+    }
+}
+
+void CphWindow::show_tab_page(int page) {
+    g_current_tab = page;
+    for (int i = 0; i < TAB_COUNT; i++) {
+        if (g_tab_pages[i])
+            ShowWindow(g_tab_pages[i], i == page ? SW_SHOW : SW_HIDE);
+    }
+}
+
+// ── Async shell runner ─────────────────────────────────────
+
+void CphWindow::run_async(AsyncOp op, const std::string &cmd) {
+    if (!g_on_shell || !g_hwnd) return;
+    // Inject/reset/scene operations take priority over refresh
+    bool is_refresh = (op == ASYNC_REFRESH_GNSS || op == ASYNC_REFRESH_BATTERY);
+    if (g_async_busy.exchange(true)) {
+        if (!is_refresh) {
+            // For user-initiated actions, try once more without blocking UI
+            // The pending async will complete and post WM_CPH_ASYNC_DONE
+            LOGE("CPH run_async: op=%d queued (busy), will retry", (int)op);
+            // Post a retry message to the UI thread after a short delay
+            std::string *cmd_copy = new std::string(cmd);
+            int op_int = (int)op;
+            std::thread([hwnd = g_hwnd, op_int, cmd_copy]() {
+                Sleep(500);
+                PostMessageW(hwnd, WM_CPH_RETRY_ASYNC, (WPARAM)op_int, (LPARAM)cmd_copy);
+            }).detach();
+        }
+        return;  // Don't block UI thread
+    }
+
+    std::string shell_cmd = cmd;
+    auto on_shell = g_on_shell;
+    auto hwnd = g_hwnd;
+
+    std::thread([hwnd, op, shell_cmd, on_shell]() {
+        AsyncResult *r = new AsyncResult{op, false, "", shell_cmd};
+        int timeout = (op == ASYNC_REFRESH_GNSS || op == ASYNC_REFRESH_BATTERY) ? 5 : 10;
+        if (op == ASYNC_INJECT_SCENE) timeout = 3;
+        r->ok = on_shell(shell_cmd, &r->output, timeout);
+        LOGE("CPH async result: op=%d ok=%d cmd=[%s] output=[%s]", (int)op, r->ok, shell_cmd.c_str(), r->output.c_str());
+        PostMessageW(hwnd, WM_CPH_ASYNC_DONE, 0, reinterpret_cast<LPARAM>(r));
+    }).detach();
+}
+
+void CphWindow::handle_async_done(AsyncResult *r) {
+    g_async_busy = false;
+
+    switch (r->op) {
+    case ASYNC_REFRESH_GNSS: {
+        // Case-insensitive error detection
+        std::string lower_out = r->output;
+        for (auto &c : lower_out) c = (char)tolower((unsigned char)c);
+        if (r->ok && lower_out.find("error") == std::string::npos &&
+            lower_out.find("failed") == std::string::npos &&
+            lower_out.find("not found") == std::string::npos) {
+            s_refresh_fail_count = 0;
+            parse_gnss_location(r->output, s_refresh_fill_edits);
+            s_refresh_fill_edits = false;
+            set_status("GNSS location refreshed");
+        } else {
+            s_refresh_fail_count++;
+            if (lower_out.find("error") != std::string::npos ||
+                lower_out.find("failed") != std::string::npos ||
+                lower_out.find("not found") != std::string::npos) {
+                // Error output - show in current label
+                SetWindowTextA(g_gnss_current_label, r->output.c_str());
+                set_status(r->output.c_str());
+            } else if (r->output.find("position switch") != std::string::npos ||
+                       r->output.find("gnss server") != std::string::npos) {
+                // GNSS server unavailable - could be switch off or server crashed
+                set_status("GNSS server unavailable (check location switch in settings)");
+            }
+        }
+        break;
+    }
+
+    case ASYNC_INJECT_GNSS:
+        if (r->ok && r->output.find("Success") != std::string::npos) {
+            show_toast("GNSS location injected", true);
+            set_status("GNSS location injected");
+            refresh_gnss();
+        } else {
+            // cmd returned error (e.g. missing latitude/longitude, position switch off)
+            std::string err = r->output.empty() ? "Unknown error" : r->output;
+            while (!err.empty() && (err.back() == '\n' || err.back() == '\r')) err.pop_back();
+            msg_box("GNSS Inject", "Inject failed:\n%s", err.c_str());
+            set_status(err.c_str());
+        }
+        // Resume auto-refresh timer after inject
+        if (g_hwnd && !g_refresh_timer) {
+            g_refresh_timer = SetTimer(g_hwnd, CPH_REFRESH_TIMER_ID, CPH_REFRESH_INTERVAL_MS, nullptr);
+        }
+        break;
+
+    case ASYNC_START_TRAJ:
+        if (r->ok && r->output.find("error:") == std::string::npos) {
+            g_traj_running = true;
+            show_toast("Trajectory playback started", true);
+            set_status(r->cmd.c_str());
+            EnableWindow(g_gnss_traj_start_btn, FALSE);
+            EnableWindow(g_gnss_traj_stop_btn, TRUE);
+        } else {
+            std::string err = r->output.empty() ? "Unknown error" : r->output;
+            while (!err.empty() && (err.back() == '\n' || err.back() == '\r')) err.pop_back();
+            msg_box("Trajectory", "Trajectory start failed:\n%s", err.c_str());
+            set_status(err.c_str());
+        }
+        break;
+
+    case ASYNC_STOP_TRAJ:
+        // Stop may return "gnss server response timeout" even when successfully stopped
+        if (r->ok && (r->output.find("error:") == std::string::npos ||
+                      r->output.find("timeout") != std::string::npos)) {
+            g_traj_running = false;
+            show_toast("Trajectory playback stopped", true);
+            set_status("Trajectory stopped");
+            EnableWindow(g_gnss_traj_start_btn, TRUE);
+            EnableWindow(g_gnss_traj_stop_btn, FALSE);
+        } else {
+            std::string err = r->output.empty() ? "Unknown error" : r->output;
+            while (!err.empty() && (err.back() == '\n' || err.back() == '\r')) err.pop_back();
+            msg_box("Trajectory", "Trajectory stop failed:\n%s", err.c_str());
+        }
+        break;
+
+    case ASYNC_REFRESH_BATTERY:
+        if (r->ok) {
+            s_refresh_fail_count = 0;
+            parse_battery_info(r->output, s_refresh_fill_edits);
+            s_refresh_fill_edits = false;
+            set_status("Battery info refreshed");
+        } else {
+            s_refresh_fail_count++;
+        }
+        break;
+
+    case ASYNC_INJECT_BATTERY:
+        if (r->ok) {
+            show_toast("Battery info injected", true);
+            set_status(r->cmd.c_str());
+            refresh_battery();
+        } else {
+            if (r->output.find("invalid parameter") != std::string::npos) {
+                show_toast("Invalid parameter - check values", false);
+            } else {
+                show_toast("Battery injection failed", false);
+            }
+            set_status(r->output.c_str());
+        }
+        break;
+
+    case ASYNC_RESET_BATTERY:
+        if (r->ok) {
+            show_toast("Battery reset to default", true);
+            set_status("cmd battery info -r");
+            s_refresh_fill_edits = true;
+            refresh_battery();
+        } else {
+            show_toast("Battery reset failed", false);
+        }
+        break;
+
+    case ASYNC_INJECT_SCENE:
+        if (r->output.find("Start Charge Scene") != std::string::npos ||
+            r->output.find("Success") != std::string::npos) {
+            show_toast("Charge scene started", true);
+            set_status(r->cmd.c_str());
+        } else {
+            show_toast("Charge scene failed", false);
+            set_status(r->output.empty() ? "No response" : r->output.c_str());
+        }
+        break;
+    }
+
+    delete r;
+}
+
+// ── GNSS: Parse current location from -l output ────────────
+
+void CphWindow::parse_gnss_location(const std::string &output, bool fill_edits) {
+    // Parse all key=value pairs from "  key=value" lines
+    auto parse_val = [&](const char *key) -> std::string {
+        std::string search = std::string("  ") + key + "=";
+        auto pos = output.find(search);
+        if (pos == std::string::npos) return "";
+        auto start = pos + search.size();
+        auto end = output.find('\n', start);
+        return output.substr(start, end == std::string::npos ? end : end - start);
+    };
+
+    // All GNSS fields from cmd gnss location -l
+    struct Field { const char *key; const char *display; };
+    Field fields[] = {
+        {"latitude", "latitude"}, {"longitude", "longitude"}, {"altitude", "altitude"},
+        {"speed", "speed"}, {"bearing", "bearing"},
+        {"horizontalAccuracy", "horizontalAccuracy"}, {"verticalAccuracy", "verticalAccuracy"},
+        {"speedAccuracy", "speedAccuracy"}, {"bearingAccuracy", "bearingAccuracy"},
+        {"timeForFix", "timeForFix"}, {"timeSinceBoot", "timeSinceBoot"},
+        {"timeUncertainty", "timeUncertainty"}, {"fieldValidity", "fieldValidity"},
+    };
+
+    // Fill inject edit controls on first parse or when Refresh button clicked
+    static bool inject_filled = false;
+    if (!inject_filled || fill_edits) {
+        const char *edit_ids[] = {"latitude", "longitude", "altitude", "speed", "bearing",
+                                   "horizontalAccuracy", "verticalAccuracy", "speedAccuracy", "bearingAccuracy"};
+        HWND edit_hwnds[] = {g_gnss_lat_edit, g_gnss_lng_edit, g_gnss_alt_edit,
+                              g_gnss_speed_edit, g_gnss_bearing_edit, g_gnss_hacc_edit, g_gnss_vacc_edit,
+                              g_gnss_sacc_edit, g_gnss_bacc_edit};
+        bool has_data = false;
+        for (int i = 0; i < 9; i++) {
+            std::string val = parse_val(edit_ids[i]);
+            if (!val.empty()) { SetWindowTextA(edit_hwnds[i], val.c_str()); has_data = true; }
+        }
+        if (has_data) inject_filled = true;
+    }
+
+    // Build current display - all 13 fields, one per line, left-aligned
+    std::string cur;
+    for (int i = 0; i < 13; i++) {
+        std::string val = parse_val(fields[i].key);
+        // Trim trailing whitespace from value
+        while (!val.empty() && (val.back() == '\n' || val.back() == '\r' || val.back() == ' '))
+            val.pop_back();
+        if (i > 0) cur += "\n";
+        cur += fields[i].display;
+        cur += "=";
+        cur += val.empty() ? "?" : val;
+    }
+    SetWindowTextA(g_gnss_current_label, cur.c_str());
+}
+
+void CphWindow::refresh_gnss() {
+    s_refresh_fill_edits = false;
+    s_refresh_fail_count = 0;  // Reset on manual refresh
+    run_async(ASYNC_REFRESH_GNSS, "cmd gnss location -l");
+}
+
+void CphWindow::refresh_gnss_fill_edits() {
+    s_refresh_fill_edits = true;
+    s_refresh_fail_count = 0;  // Reset on manual refresh
+    run_async(ASYNC_REFRESH_GNSS, "cmd gnss location -l");
+}
+
+// ── GNSS: Inject location ──────────────────────────────────
+// cmd gnss location -p 'latitude=XX:longitude=XX:altitude=XX:speed=XX:bearing=XX:...'
+
+void CphWindow::inject_gnss() {
+    if (!g_on_shell) { msg_box("Error", "Shell command not available"); return; }
+
+    char lat[64], lng[64], alt[64], spd[64], brg[64], hacc[64], vacc[64], sacc[64], bacc[64];
+    GetWindowTextA(g_gnss_lat_edit, lat, sizeof(lat));
+    GetWindowTextA(g_gnss_lng_edit, lng, sizeof(lng));
+    GetWindowTextA(g_gnss_alt_edit, alt, sizeof(alt));
+    GetWindowTextA(g_gnss_speed_edit, spd, sizeof(spd));
+    GetWindowTextA(g_gnss_bearing_edit, brg, sizeof(brg));
+    GetWindowTextA(g_gnss_hacc_edit, hacc, sizeof(hacc));
+    GetWindowTextA(g_gnss_vacc_edit, vacc, sizeof(vacc));
+    GetWindowTextA(g_gnss_sacc_edit, sacc, sizeof(sacc));
+    GetWindowTextA(g_gnss_bacc_edit, bacc, sizeof(bacc));
+
+    if (!lat[0] || !lng[0]) {
+        msg_box("GNSS", "Latitude and Longitude are required");
+        return;
+    }
+
+    // Validate ranges per API spec
+    double d_lat = atof(lat), d_lng = atof(lng);
+    if (d_lat < -90 || d_lat > 90) { msg_box("GNSS", "Latitude must be -90 to 90"); return; }
+    if (d_lng < -180 || d_lng > 180) { msg_box("GNSS", "Longitude must be -180 to 180"); return; }
+    if (brg[0]) { double d = atof(brg); if (d < 0 || d > 360) { msg_box("GNSS", "Bearing must be 0 to 360"); return; } }
+
+    // Build param string: latitude and longitude are required, others optional
+    // Only include non-zero optional params to avoid "invalid location coordinate data" error
+    std::string params;
+    params += "latitude=";
+    params += lat;
+    params += ":longitude=";
+    params += lng;
+
+    auto append_if_nonzero = [&](const char *key, const char *val) {
+        if (!val[0]) return;
+        // Skip default value 0 for optional params
+        double d = atof(val);
+        if (d == 0.0) return;
+        params += ":";
+        params += key;
+        params += "=";
+        params += val;
+    };
+    append_if_nonzero("altitude", alt);
+    append_if_nonzero("speed", spd);
+    append_if_nonzero("bearing", brg);
+    append_if_nonzero("horizontalAccuracy", hacc);
+    append_if_nonzero("verticalAccuracy", vacc);
+    append_if_nonzero("speedAccuracy", sacc);
+    append_if_nonzero("bearingAccuracy", bacc);
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "cmd gnss location -p %s", params.c_str());
+    LOGE("CPH inject_gnss: cmd=[%s]", cmd);
+    // Pause auto-refresh during inject to avoid interference
+    if (g_refresh_timer) { KillTimer(g_hwnd, CPH_REFRESH_TIMER_ID); g_refresh_timer = 0; }
+    run_async(ASYNC_INJECT_GNSS, cmd);
+}
+
+// ── GNSS: Trajectory ───────────────────────────────────────
+// cmd gnss trajectory -p /data/local/tmp/test.gpx  (start)
+// cmd gnss trajectory -d  (stop)
+
+void CphWindow::start_trajectory() {
+    if (!g_on_shell) { msg_box("Error", "Shell command not available"); return; }
+
+    char path[512];
+    GetWindowTextA(g_gnss_traj_edit, path, sizeof(path));
+
+    if (!path[0]) {
+        msg_box("Trajectory", "Please browse a GPX trajectory file first");
+        return;
+    }
+
+    char cmd[600];
+    snprintf(cmd, sizeof(cmd), "cmd gnss trajectory -p '%s'", path);
+    run_async(ASYNC_START_TRAJ, cmd);
+}
+
+void CphWindow::stop_trajectory() {
+    run_async(ASYNC_STOP_TRAJ, "cmd gnss trajectory -d");
+}
+
+// ── Battery: Parse current info from -l output ─────────────
+
+void CphWindow::parse_battery_info(const std::string &output, bool fill_edits) {
+    auto parse_val = [&](const char *key) -> std::string {
+        // Try "[A] key=" first, then "    key="
+        std::string search1 = std::string("[A] ") + key + "=";
+        std::string search2 = std::string("    ") + key + "=";
+        auto pos = output.find(search1);
+        if (pos == std::string::npos) pos = output.find(search2);
+        if (pos == std::string::npos) return "";
+        auto eq = output.find('=', pos);
+        if (eq == std::string::npos) return "";
+        auto start = eq + 1;
+        auto end = output.find('\n', start);
+        return output.substr(start, end == std::string::npos ? end : end - start);
+    };
+
+    // All battery fields from cmd battery info -l
+    const char *all_fields[] = {
+        "capacity", "pluggedType", "chargerType", "chargeState",
+        "voltage", "voltageMax", "current", "currentAverage",
+        "currentMax", "temperature", "healthState", "present",
+        "totalEnergy", "technology",
+    };
+
+    // Fill inject controls only on first parse or when Refresh button clicked
+    static bool inject_filled = false;
+    if (!inject_filled || fill_edits) {
+        std::string cap = parse_val("capacity");
+        std::string temp = parse_val("temperature");
+        std::string plugged = parse_val("pluggedType");
+        std::string charger = parse_val("chargerType");
+        std::string state = parse_val("chargeState");
+        std::string voltage = parse_val("voltage");
+        std::string voltage_max = parse_val("voltageMax");
+        std::string current = parse_val("current");
+        std::string current_avg = parse_val("currentAverage");
+        std::string current_max = parse_val("currentMax");
+        std::string health = parse_val("healthState");
+        std::string present = parse_val("present");
+        std::string total_energy = parse_val("totalEnergy");
+        std::string tech = parse_val("technology");
+
+        if (!cap.empty()) SetWindowTextA(g_bat_capacity_edit, cap.c_str());
+        if (!temp.empty()) SetWindowTextA(g_bat_temp_edit, temp.c_str());
+        if (!voltage.empty()) SetWindowTextA(g_bat_voltage_edit, voltage.c_str());
+        if (!voltage_max.empty()) SetWindowTextA(g_bat_voltage_max_edit, voltage_max.c_str());
+        if (!current.empty()) SetWindowTextA(g_bat_current_edit, current.c_str());
+        if (!current_avg.empty()) SetWindowTextA(g_bat_current_avg_edit, current_avg.c_str());
+        if (!current_max.empty()) SetWindowTextA(g_bat_current_max_edit, current_max.c_str());
+        if (!total_energy.empty()) SetWindowTextA(g_bat_total_energy_edit, total_energy.c_str());
+        if (!tech.empty()) SetWindowTextA(g_bat_technology_edit, tech.c_str());
+
+        auto set_combo_by_val = [](HWND combo, const std::string &val, const int *map, int map_size) {
+            for (int i = 0; i < map_size; i++) {
+                if (val == std::to_string(map[i])) {
+                    SendMessageW(combo, CB_SETCURSEL, i, 0);
+                    return;
+                }
+            }
+            SendMessageW(combo, CB_SETCURSEL, 0, 0);
+        };
+        int plugged_map[] = {0, 1, 2, 3};
+        set_combo_by_val(g_bat_plugged_combo, plugged, plugged_map, 4);
+        int charger_map[] = {0, 1, 2, 3, 4, 5, 6};
+        set_combo_by_val(g_bat_charger_combo, charger, charger_map, 7);
+        int state_map[] = {0, 1, 2, 3};
+        set_combo_by_val(g_bat_chargestate_combo, state, state_map, 4);
+        int health_map[] = {0, 1, 2, 3, 4, 5};
+        set_combo_by_val(g_bat_health_combo, health, health_map, 6);
+        int present_map[] = {0, 1};
+        set_combo_by_val(g_bat_present_combo, present, present_map, 2);
+
+        bool has_data = !cap.empty();
+        if (has_data) inject_filled = true;
+    }
+
+    // Build current display - all 14 fields, one per line, left-aligned
+    std::string cur;
+    for (int i = 0; i < 14; i++) {
+        std::string val = parse_val(all_fields[i]);
+        // Trim trailing whitespace from value
+        while (!val.empty() && (val.back() == '\n' || val.back() == '\r' || val.back() == ' '))
+            val.pop_back();
+        if (i > 0) cur += "\n";
+        cur += all_fields[i];
+        cur += "=";
+        cur += val.empty() ? "?" : val;
+    }
+    SetWindowTextA(g_bat_current_label, cur.c_str());
+}
+
+void CphWindow::refresh_battery() {
+    run_async(ASYNC_REFRESH_BATTERY, "cmd battery info -l");
+}
+
+// ── Battery: Inject ────────────────────────────────────────
+// cmd battery info -p 'capacity=90:temperature=222:pluggedType=1:chargerType=1:chargeState=1'
+
+void CphWindow::inject_battery() {
+    if (!g_on_shell) { msg_box("Error", "Shell command not available"); return; }
+
+    char capacity[32], temp[32], voltage[32], voltage_max[32];
+    char current_val[32], current_avg[32], current_max[32];
+    char total_energy[32], technology[32];
+    GetWindowTextA(g_bat_capacity_edit, capacity, sizeof(capacity));
+    GetWindowTextA(g_bat_temp_edit, temp, sizeof(temp));
+    GetWindowTextA(g_bat_voltage_edit, voltage, sizeof(voltage));
+    GetWindowTextA(g_bat_voltage_max_edit, voltage_max, sizeof(voltage_max));
+    GetWindowTextA(g_bat_current_edit, current_val, sizeof(current_val));
+    GetWindowTextA(g_bat_current_avg_edit, current_avg, sizeof(current_avg));
+    GetWindowTextA(g_bat_current_max_edit, current_max, sizeof(current_max));
+    GetWindowTextA(g_bat_total_energy_edit, total_energy, sizeof(total_energy));
+    GetWindowTextA(g_bat_technology_edit, technology, sizeof(technology));
+
+    // Association constraint: pluggedType, chargerType, chargeState, capacity must all be present or all absent
+    // capacity is the key indicator - if set, the other 3 must also be set
+    bool has_assoc = capacity[0] != '\0';
+    if (has_assoc) {
+        int cap_val = atoi(capacity);
+        if (cap_val < 0 || cap_val > 100) {
+            msg_box("Battery", "Capacity must be 0 to 100");
+            return;
+        }
+    }
+
+    // Get combo values
+    int plugged_sel = (int)SendMessageW(g_bat_plugged_combo, CB_GETCURSEL, 0, 0);
+    int charger_sel = (int)SendMessageW(g_bat_charger_combo, CB_GETCURSEL, 0, 0);
+    int state_sel = (int)SendMessageW(g_bat_chargestate_combo, CB_GETCURSEL, 0, 0);
+    int health_sel = (int)SendMessageW(g_bat_health_combo, CB_GETCURSEL, 0, 0);
+    int present_sel = (int)SendMessageW(g_bat_present_combo, CB_GETCURSEL, 0, 0);
+
+    // Map combo selections to values
+    int plugged_map[] = {0, 1, 2, 3};
+    int charger_map[] = {0, 1, 2, 3, 4, 5, 6};
+    int state_map[] = {0, 1, 2, 3};
+    int health_map[] = {0, 1, 2, 3, 4, 5};
+    int present_map[] = {0, 1};
+
+    std::string params;
+
+    // Association group: capacity + pluggedType + chargerType + chargeState (all or none)
+    if (has_assoc) {
+        params += "capacity=";
+        params += capacity;
+        params += ":pluggedType=";
+        params += std::to_string(plugged_map[plugged_sel]);
+        params += ":chargerType=";
+        params += std::to_string(charger_map[charger_sel]);
+        params += ":chargeState=";
+        params += std::to_string(state_map[state_sel]);
+    }
+
+    // Independent optional params
+    auto append_if = [&](const char *key, const char *val) {
+        if (!val[0]) return;
+        params += ":";
+        params += key;
+        params += "=";
+        params += val;
+    };
+    auto append_int = [&](const char *key, int val) {
+        params += ":";
+        params += key;
+        params += "=";
+        params += std::to_string(val);
+    };
+    append_if("temperature", temp);
+    append_if("voltage", voltage);
+    append_if("voltageMax", voltage_max);
+    append_if("current", current_val);
+    append_if("currentAverage", current_avg);
+    append_if("currentMax", current_max);
+    append_int("healthState", health_map[health_sel]);
+    append_int("present", present_map[present_sel]);
+    append_if("totalEnergy", total_energy);
+    append_if("technology", technology);
+
+    if (params.empty()) { msg_box("Battery", "No parameters to inject"); return; }
+
+    // Remove leading ':' if association group was empty
+    if (params[0] == ':') params = params.substr(1);
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "cmd battery info -p '%s'", params.c_str());
+    run_async(ASYNC_INJECT_BATTERY, cmd);
+}
+
+void CphWindow::reset_battery() {
+    run_async(ASYNC_RESET_BATTERY, "cmd battery info -r");
+}
+
+void CphWindow::inject_charge_scene() {
+    if (!g_on_shell) { msg_box("Error", "Shell command not available"); return; }
+
+    int sel = (int)SendMessageW(g_bat_scene_combo, CB_GETCURSEL, 0, 0);
+    if (sel == CB_ERR) {
+        msg_box("Charge Scene", "Please select a charge scene");
+        return;
+    }
+
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "cmd battery charge-scene -i %d", sel);
+    run_async(ASYNC_INJECT_SCENE, cmd);
+}
+
+// ── WndProc ────────────────────────────────────────────────
+
+LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_CPH_ASYNC_DONE) {
+        auto *r = reinterpret_cast<AsyncResult *>(lp);
+        handle_async_done(r);
+        return 0;
+    }
+    if (msg == WM_CPH_RETRY_ASYNC) {
+        auto *cmd = reinterpret_cast<std::string *>(lp);
+        AsyncOp op = static_cast<AsyncOp>((int)wp);
+        std::string cmd_str = *cmd;
+        delete cmd;
+        // Retry the async operation
+        run_async(op, cmd_str);
+        return 0;
+    }
+
+    switch (msg) {
+    case WM_CREATE: {
+        g_cph_font = CreateFontW(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+
+        // Header
+        HWND title = CreateWindowW(L"STATIC", L"Cloud Phone (CPH) Simulation",
+                                    WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                    MARGIN, 6, 300, 20, hwnd, nullptr, nullptr, nullptr);
+        SendMessageW(title, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+
+        // Tab control
+        g_tab = CreateWindowW(WC_TABCONTROLW, L"",
+                               WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_FIXEDWIDTH,
+                               MARGIN, HEADER_H, g_panel_w - MARGIN * 2, 800,
+                               hwnd, (HMENU)IDC_TAB, nullptr, nullptr);
+        SendMessageW(g_tab, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+
+        TCITEMW tie = {};
+        tie.mask = TCIF_TEXT;
+        tie.pszText = const_cast<LPWSTR>(L"GNSS");
+        TabCtrl_InsertItem(g_tab, TAB_GNSS, &tie);
+        tie.pszText = const_cast<LPWSTR>(L"Battery");
+        TabCtrl_InsertItem(g_tab, TAB_BATTERY, &tie);
+        // Force tab item width to fit text
+        SendMessageW(g_tab, TCM_SETITEMSIZE, 0, MAKELPARAM(80, 24));
+
+        // Get tab display area to position child pages correctly
+        RECT tab_rc = {0, 0, g_panel_w - MARGIN * 2, 800};
+        TabCtrl_AdjustRect(g_tab, FALSE, &tab_rc);
+
+        // Page position relative to the tab control
+        int px = tab_rc.left;
+        int py = tab_rc.top;
+        int pw = tab_rc.right - tab_rc.left;
+        int ph = tab_rc.bottom - tab_rc.top;
+        int row_h = EDIT_H + ROW_GAP;
+        int label_x = MARGIN + 4;          // label left edge
+        int edit_x = label_x + LABEL_W + 6; // edit left edge (after label + gap)
+        int edit_w = pw - edit_x - MARGIN - 4; // edit width (fill to right margin)
+        int grp_x = MARGIN;
+        int grp_w = pw - MARGIN * 2;
+
+        // ── GNSS page ─────────────────────────────────────
+        {
+            ensure_page_class_registered(g_inst);
+            HWND page = CreateWindowW(CPH_PAGE_W, L"",
+                                       WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+                                       px, py, pw, ph,
+                                       g_tab, nullptr, nullptr, nullptr);
+            g_tab_pages[TAB_GNSS] = page;
+            int y = 6;
+
+            // Current location display - multi-line (13 fields)
+            make_group(page, L"Current Location", grp_x, y, grp_w, 215);
+            g_gnss_current_label = CreateWindowW(L"STATIC", L"--",
+                                                   WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX | SS_EDITCONTROL,
+                                                   grp_x + 10, y + 16, grp_w - 20, 195,
+                                                   page, (HMENU)IDC_GNSS_CURRENT_LABEL, nullptr, nullptr);
+            SendMessageW(g_gnss_current_label, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+            y += 221;
+
+            // Location inject group
+            make_group(page, L"Inject Location (WGS84)", grp_x, y, grp_w, 319);
+            int iy = y + 20;
+
+            make_label(page, L"Latitude *:", label_x, iy + 3, LABEL_W, 18);
+            g_gnss_lat_edit = make_edit(page, IDC_GNSS_LAT_EDIT, L"39.9042", edit_x, iy, edit_w, EDIT_H);
+            iy += row_h;
+            make_label(page, L"Longitude *:", label_x, iy + 3, LABEL_W, 18);
+            g_gnss_lng_edit = make_edit(page, IDC_GNSS_LNG_EDIT, L"116.4074", edit_x, iy, edit_w, EDIT_H);
+            iy += row_h;
+            make_label(page, L"Altitude:", label_x, iy + 3, LABEL_W, 18);
+            g_gnss_alt_edit = make_edit(page, IDC_GNSS_ALT_EDIT, L"", edit_x, iy, edit_w, EDIT_H);
+            iy += row_h;
+            make_label(page, L"Speed (m/s):", label_x, iy + 3, LABEL_W, 18);
+            g_gnss_speed_edit = make_edit(page, IDC_GNSS_SPEED_EDIT, L"", edit_x, iy, edit_w, EDIT_H);
+            iy += row_h;
+            make_label(page, L"Bearing:", label_x, iy + 3, LABEL_W, 18);
+            g_gnss_bearing_edit = make_edit(page, IDC_GNSS_BEARING_EDIT, L"", edit_x, iy, edit_w, EDIT_H);
+            iy += row_h;
+            make_label(page, L"H-Accuracy:", label_x, iy + 3, LABEL_W, 18);
+            g_gnss_hacc_edit = make_edit(page, IDC_GNSS_HACC_EDIT, L"", edit_x, iy, edit_w, EDIT_H);
+            iy += row_h;
+            make_label(page, L"V-Accuracy:", label_x, iy + 3, LABEL_W, 18);
+            g_gnss_vacc_edit = make_edit(page, IDC_GNSS_VACC_EDIT, L"", edit_x, iy, edit_w, EDIT_H);
+            iy += row_h;
+            make_label(page, L"S-Accuracy:", label_x, iy + 3, LABEL_W, 18);
+            g_gnss_sacc_edit = make_edit(page, IDC_GNSS_SACC_EDIT, L"", edit_x, iy, edit_w, EDIT_H);
+            iy += row_h;
+            make_label(page, L"B-Accuracy:", label_x, iy + 3, LABEL_W, 18);
+            g_gnss_bacc_edit = make_edit(page, IDC_GNSS_BACC_EDIT, L"", edit_x, iy, edit_w, EDIT_H);
+            iy += row_h + 6;
+
+            // Inject + Refresh buttons
+            g_gnss_inject_btn = make_btn(page, L"Inject", IDC_GNSS_INJECT_BTN,
+                                          edit_x, iy, 90, BTN_H);
+            g_gnss_refresh_btn = make_btn(page, L"Refresh", IDC_GNSS_REFRESH_BTN,
+                                           edit_x + 98, iy, 90, BTN_H);
+            y += 325;
+
+            // Trajectory group
+            make_group(page, L"Trajectory Playback", grp_x, y, grp_w, 95);
+            int ty = y + 20;
+            make_label(page, L"GPX/XML:", label_x, ty + 3, LABEL_W, 18);
+            int browse_w = 50;
+            g_gnss_traj_edit = make_edit(page, IDC_GNSS_TRAJ_EDIT, L"/data/local/tmp/",
+                                          edit_x, ty, edit_w - browse_w - 4, EDIT_H);
+            g_gnss_traj_browse_btn = make_btn(page, L"...", IDC_GNSS_TRAJ_BROWSE_BTN,
+                                               edit_x + edit_w - browse_w, ty, browse_w, EDIT_H);
+            ty += row_h + 8;
+            g_gnss_traj_start_btn = make_btn(page, L"Start", IDC_GNSS_TRAJ_START_BTN,
+                                              edit_x, ty, 90, BTN_H);
+            g_gnss_traj_stop_btn = make_btn(page, L"Stop", IDC_GNSS_TRAJ_STOP_BTN,
+                                             edit_x + 98, ty, 90, BTN_H);
+            EnableWindow(g_gnss_traj_stop_btn, FALSE);
+        }
+
+        // ── Battery page ──────────────────────────────────
+        {
+            ensure_page_class_registered(g_inst);
+            HWND page = CreateWindowW(CPH_PAGE_W, L"",
+                                       WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+                                       px, py, pw, ph,
+                                       g_tab, nullptr, nullptr, nullptr);
+            g_tab_pages[TAB_BATTERY] = page;
+            int y = 6;
+
+            // Current battery display - multi-line (14 fields)
+            make_group(page, L"Current Battery Info", grp_x, y, grp_w, 231);
+            g_bat_current_label = CreateWindowW(L"STATIC", L"--",
+                                                 WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX | SS_EDITCONTROL,
+                                                 grp_x + 10, y + 16, grp_w - 20, 210,
+                                                 page, (HMENU)IDC_BAT_CURRENT_LABEL, nullptr, nullptr);
+            SendMessageW(g_bat_current_label, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+            y += 237;
+
+            // Inject group
+            make_group(page, L"Inject Battery Info", grp_x, y, grp_w, 370);
+            int iy = y + 20;
+            // Two-column layout: each column = label + edit, equal edit widths
+            int col2_label_w = 42;       // right-side label width
+            int col2_x = edit_x + edit_w / 2 + 4;  // right column start
+            int col2_edit_x = col2_x + col2_label_w + 4;  // right edit start
+            int col1_w = edit_w / 2 - 2;             // left edit width
+            int col2_w = edit_w - (col2_edit_x - edit_x) - 2;  // right edit width (match left)
+
+            // Row 1: Capacity + Temp
+            make_label(page, L"Capacity %:", label_x, iy + 3, LABEL_W, 18);
+            g_bat_capacity_edit = make_edit(page, IDC_BAT_CAPACITY_EDIT, L"100", edit_x, iy, col1_w, EDIT_H);
+            make_label(page, L"Temp:", col2_x, iy + 3, col2_label_w, 18);
+            g_bat_temp_edit = make_edit(page, IDC_BAT_TEMP_EDIT, L"222",
+                                         col2_edit_x, iy, col2_w, EDIT_H);
+            iy += row_h;
+
+            // Row 2: Voltage + VoltageMax
+            make_label(page, L"Voltage:", label_x, iy + 3, LABEL_W, 18);
+            g_bat_voltage_edit = make_edit(page, IDC_BAT_VOLTAGE_EDIT, L"", edit_x, iy, col1_w, EDIT_H);
+            make_label(page, L"V-Max:", col2_x, iy + 3, col2_label_w, 18);
+            g_bat_voltage_max_edit = make_edit(page, IDC_BAT_VOLTAGE_MAX_EDIT, L"-1",
+                                                col2_edit_x, iy, col2_w, EDIT_H);
+            iy += row_h;
+
+            // Row 3: Current + CurrentAvg
+            make_label(page, L"Current:", label_x, iy + 3, LABEL_W, 18);
+            g_bat_current_edit = make_edit(page, IDC_BAT_CURRENT_EDIT, L"", edit_x, iy, col1_w, EDIT_H);
+            make_label(page, L"I-Avg:", col2_x, iy + 3, col2_label_w, 18);
+            g_bat_current_avg_edit = make_edit(page, IDC_BAT_CURRENT_AVG_EDIT, L"",
+                                                col2_edit_x, iy, col2_w, EDIT_H);
+            iy += row_h;
+
+            // Row 4: CurrentMax + TotalEnergy
+            make_label(page, L"I-Max:", label_x, iy + 3, LABEL_W, 18);
+            g_bat_current_max_edit = make_edit(page, IDC_BAT_CURRENT_MAX_EDIT, L"-1",
+                                                edit_x, iy, col1_w, EDIT_H);
+            make_label(page, L"TotalE:", col2_x, iy + 3, col2_label_w, 18);
+            g_bat_total_energy_edit = make_edit(page, IDC_BAT_TOTAL_ENERGY_EDIT, L"",
+                                                 col2_edit_x, iy, col2_w, EDIT_H);
+            iy += row_h;
+
+            // Row 5: Technology
+            make_label(page, L"Technology:", label_x, iy + 3, LABEL_W, 18);
+            g_bat_technology_edit = make_edit(page, IDC_BAT_TECHNOLOGY_EDIT, L"Li-poly",
+                                               edit_x, iy, edit_w, EDIT_H);
+            iy += row_h;
+
+            // Row 6: Plugged combo
+            make_label(page, L"Plugged:", label_x, iy + 3, LABEL_W, 18);
+            g_bat_plugged_combo = make_combo(page, IDC_BAT_PLUGGED_COMBO,
+                                              edit_x, iy, edit_w, 200);
+            SendMessageW(g_bat_plugged_combo, CB_ADDSTRING, 0, (LPARAM)L"0: None");
+            SendMessageW(g_bat_plugged_combo, CB_ADDSTRING, 0, (LPARAM)L"1: AC");
+            SendMessageW(g_bat_plugged_combo, CB_ADDSTRING, 0, (LPARAM)L"2: USB");
+            SendMessageW(g_bat_plugged_combo, CB_ADDSTRING, 0, (LPARAM)L"3: Wireless");
+            SendMessageW(g_bat_plugged_combo, CB_SETCURSEL, 0, 0);
+            iy += row_h;
+
+            // Row 7: Charger combo (0-6)
+            make_label(page, L"Charger:", label_x, iy + 3, LABEL_W, 18);
+            g_bat_charger_combo = make_combo(page, IDC_BAT_CHARGER_COMBO,
+                                              edit_x, iy, edit_w, 200);
+            SendMessageW(g_bat_charger_combo, CB_ADDSTRING, 0, (LPARAM)L"0: None");
+            SendMessageW(g_bat_charger_combo, CB_ADDSTRING, 0, (LPARAM)L"1: AC slow");
+            SendMessageW(g_bat_charger_combo, CB_ADDSTRING, 0, (LPARAM)L"2: AC quick");
+            SendMessageW(g_bat_charger_combo, CB_ADDSTRING, 0, (LPARAM)L"3: AC super");
+            SendMessageW(g_bat_charger_combo, CB_ADDSTRING, 0, (LPARAM)L"4: AC turbo");
+            SendMessageW(g_bat_charger_combo, CB_ADDSTRING, 0, (LPARAM)L"5: Wireless slow");
+            SendMessageW(g_bat_charger_combo, CB_ADDSTRING, 0, (LPARAM)L"6: Wireless quick");
+            SendMessageW(g_bat_charger_combo, CB_SETCURSEL, 0, 0);
+            iy += row_h;
+
+            // Row 8: ChargeState combo
+            make_label(page, L"Chg State:", label_x, iy + 3, LABEL_W, 18);
+            g_bat_chargestate_combo = make_combo(page, IDC_BAT_CHARGESTATE_COMBO,
+                                                  edit_x, iy, edit_w, 200);
+            SendMessageW(g_bat_chargestate_combo, CB_ADDSTRING, 0, (LPARAM)L"0: Discharging");
+            SendMessageW(g_bat_chargestate_combo, CB_ADDSTRING, 0, (LPARAM)L"1: Charging");
+            SendMessageW(g_bat_chargestate_combo, CB_ADDSTRING, 0, (LPARAM)L"2: Not charging");
+            SendMessageW(g_bat_chargestate_combo, CB_ADDSTRING, 0, (LPARAM)L"3: Full");
+            SendMessageW(g_bat_chargestate_combo, CB_SETCURSEL, 0, 0);
+            iy += row_h;
+
+            // Row 9: Health + Present (side by side)
+            make_label(page, L"Health:", label_x, iy + 3, LABEL_W, 18);
+            g_bat_health_combo = make_combo(page, IDC_BAT_HEALTH_COMBO,
+                                             edit_x, iy, col1_w, 200);
+            SendMessageW(g_bat_health_combo, CB_ADDSTRING, 0, (LPARAM)L"0: Unknown");
+            SendMessageW(g_bat_health_combo, CB_ADDSTRING, 0, (LPARAM)L"1: Good");
+            SendMessageW(g_bat_health_combo, CB_ADDSTRING, 0, (LPARAM)L"2: Overheat");
+            SendMessageW(g_bat_health_combo, CB_ADDSTRING, 0, (LPARAM)L"3: Dead");
+            SendMessageW(g_bat_health_combo, CB_ADDSTRING, 0, (LPARAM)L"4: Over voltage");
+            SendMessageW(g_bat_health_combo, CB_ADDSTRING, 0, (LPARAM)L"5: Unspecified");
+            SendMessageW(g_bat_health_combo, CB_SETCURSEL, 1, 0);
+            make_label(page, L"Present:", col2_x, iy + 3, col2_label_w, 18);
+            g_bat_present_combo = make_combo(page, IDC_BAT_PRESENT_COMBO,
+                                              col2_edit_x, iy, col2_w, 200);
+            SendMessageW(g_bat_present_combo, CB_ADDSTRING, 0, (LPARAM)L"0: No");
+            SendMessageW(g_bat_present_combo, CB_ADDSTRING, 0, (LPARAM)L"1: Yes");
+            SendMessageW(g_bat_present_combo, CB_SETCURSEL, 1, 0);
+            iy += row_h + 8;
+
+            // Buttons
+            g_bat_inject_btn = make_btn(page, L"Inject", IDC_BAT_INJECT_BTN,
+                                         edit_x, iy, 80, BTN_H);
+            g_bat_reset_btn = make_btn(page, L"Reset", IDC_BAT_RESET_BTN,
+                                        edit_x + 88, iy, 80, BTN_H);
+            g_bat_refresh_btn = make_btn(page, L"Refresh", IDC_BAT_REFRESH_BTN,
+                                          edit_x + 176, iy, 80, BTN_H);
+            y += 378;
+
+            // Charge scene group
+            make_group(page, L"Charge Scene Simulation", grp_x, y, grp_w, 60);
+            int sy = y + 20;
+            g_bat_scene_combo = make_combo(page, IDC_BAT_SCENE_COMBO,
+                                            label_x, sy, edit_w - 90, 200);
+            SendMessageW(g_bat_scene_combo, CB_ADDSTRING, 0, (LPARAM)L"0: AC normal 27W");
+            SendMessageW(g_bat_scene_combo, CB_ADDSTRING, 0, (LPARAM)L"1: AC quick 40W");
+            SendMessageW(g_bat_scene_combo, CB_ADDSTRING, 0, (LPARAM)L"2: AC super 40W");
+            SendMessageW(g_bat_scene_combo, CB_ADDSTRING, 0, (LPARAM)L"3: AC super 66W");
+            SendMessageW(g_bat_scene_combo, CB_ADDSTRING, 0, (LPARAM)L"4: AC turbo 66W");
+            SendMessageW(g_bat_scene_combo, CB_ADDSTRING, 0, (LPARAM)L"5: Wireless 27W");
+            SendMessageW(g_bat_scene_combo, CB_ADDSTRING, 0, (LPARAM)L"6: Wireless 40W");
+            SendMessageW(g_bat_scene_combo, CB_ADDSTRING, 0, (LPARAM)L"7: Wireless 40W+");
+            SendMessageW(g_bat_scene_combo, CB_ADDSTRING, 0, (LPARAM)L"8: Wireless 50W");
+            SendMessageW(g_bat_scene_combo, CB_SETCURSEL, 0, 0);
+            g_bat_scene_btn = make_btn(page, L"Start", IDC_BAT_SCENE_BTN,
+                                        edit_x + edit_w - 82, sy, 80, BTN_H);
+        }
+
+        // Status label at bottom
+        g_status_label = CreateWindowW(L"STATIC", L"Ready",
+                                        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+                                        MARGIN, 575, g_panel_w - MARGIN * 2, 18,
+                                        hwnd, (HMENU)IDC_STATUS_LABEL, nullptr, nullptr);
+        SendMessageW(g_status_label, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+
+        show_tab_page(TAB_GNSS);
+
+        SetPropW(hwnd, L"cph_font", (HANDLE)g_cph_font);
+        return 0;
+    }
+
+    case WM_NOTIFY: {
+        auto *nm = reinterpret_cast<NMHDR *>(lp);
+        if (nm->idFrom == IDC_TAB && nm->code == TCN_SELCHANGE) {
+            on_tab_change();
+        }
+        return 0;
+    }
+
+    case WM_COMMAND: {
+        switch (LOWORD(wp)) {
+        case IDC_GNSS_INJECT_BTN:
+            inject_gnss();
+            break;
+        case IDC_GNSS_REFRESH_BTN:
+            refresh_gnss_fill_edits();
+            break;
+        case IDC_GNSS_TRAJ_BROWSE_BTN: {
+            char file[512] = {};
+            OPENFILENAMEA ofn = {};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = hwnd;
+            ofn.lpstrFilter = "GPX/XML Files\0*.gpx;*.xml\0All Files\0*.*\0";
+            ofn.lpstrFile = file;
+            ofn.nMaxFile = sizeof(file);
+            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+            if (GetOpenFileNameA(&ofn)) {
+                // Check file extension (.gpx or .xml, case-insensitive)
+                std::string local_path = file;
+                auto dot = local_path.find_last_of('.');
+                if (dot == std::string::npos) {
+                    msg_box("Trajectory", "Only .gpx and .xml files are supported");
+                    break;
+                }
+                std::string ext = local_path.substr(dot);
+                for (auto &c : ext) c = tolower(c);
+                if (ext != ".gpx" && ext != ".xml") {
+                    msg_box("Trajectory", "Only .gpx and .xml files are supported");
+                    break;
+                }
+
+                auto sep = local_path.find_last_of("\\/");
+                std::string filename = (sep != std::string::npos) ? local_path.substr(sep + 1) : local_path;
+                std::string remote_path = std::string("/data/local/tmp/") + filename;
+
+                // Push file to device
+                if (g_on_push && g_on_push(local_path, remote_path)) {
+                    // Set read permission on pushed file
+                    std::string chmod_cmd = "chmod a+r '" + remote_path + "'";
+                    std::string chmod_out;
+                    if (g_on_shell) g_on_shell(chmod_cmd, &chmod_out, 5);
+                    SetWindowTextA(g_gnss_traj_edit, remote_path.c_str());
+                    show_toast("File pushed to device", true);
+                    set_status(remote_path.c_str());
+                } else {
+                    msg_box("Trajectory", "Failed to push file to device");
+                }
+            }
+            break;
+        }
+        case IDC_GNSS_TRAJ_START_BTN:
+            start_trajectory();
+            break;
+        case IDC_GNSS_TRAJ_STOP_BTN:
+            stop_trajectory();
+            break;
+        case IDC_BAT_INJECT_BTN:
+            inject_battery();
+            break;
+        case IDC_BAT_RESET_BTN:
+            reset_battery();
+            break;
+        case IDC_BAT_REFRESH_BTN:
+            s_refresh_fill_edits = true;
+            refresh_battery();
+            break;
+        case IDC_BAT_SCENE_BTN:
+            inject_charge_scene();
+            break;
+        }
+        return 0;
+    }
+
+    case WM_SIZE: {
+        int w = LOWORD(lp), h = HIWORD(lp);
+        if (g_tab) MoveWindow(g_tab, MARGIN, HEADER_H, w - MARGIN * 2, h - HEADER_H - 26, TRUE);
+        if (g_status_label) MoveWindow(g_status_label, MARGIN, h - 22, w - MARGIN * 2, 18, TRUE);
+        return 0;
+    }
+
+    case WM_TIMER:
+        if (wp == CPH_REFRESH_TIMER_ID) {
+            // Stop auto-refresh after consecutive failures to avoid overloading gnss HAL
+            if (s_refresh_fail_count >= MAX_REFRESH_FAILS) return 0;
+            // Auto-refresh current tab data (async, non-blocking)
+            if (g_current_tab == TAB_GNSS) refresh_gnss();
+            else if (g_current_tab == TAB_BATTERY) refresh_battery();
+            return 0;
+        }
+        break;
+
+    case WM_DESTROY: {
+        if (g_refresh_timer) { KillTimer(hwnd, CPH_REFRESH_TIMER_ID); g_refresh_timer = 0; }
+        if (g_cph_font) { DeleteObject(g_cph_font); g_cph_font = nullptr; }
+        RemovePropW(hwnd, L"cph_font");
+        g_hwnd = nullptr;
+        g_tab = nullptr;
+        g_gnss_lat_edit = g_gnss_lng_edit = g_gnss_alt_edit = nullptr;
+        g_gnss_speed_edit = g_gnss_bearing_edit = nullptr;
+        g_gnss_hacc_edit = g_gnss_vacc_edit = g_gnss_sacc_edit = g_gnss_bacc_edit = nullptr;
+        g_gnss_inject_btn = g_gnss_refresh_btn = nullptr;
+        g_gnss_current_label = nullptr;
+        g_gnss_traj_edit = nullptr;
+        g_gnss_traj_browse_btn = g_gnss_traj_start_btn = g_gnss_traj_stop_btn = nullptr;
+        g_bat_capacity_edit = g_bat_temp_edit = g_bat_voltage_edit = nullptr;
+        g_bat_voltage_max_edit = g_bat_current_edit = g_bat_current_avg_edit = nullptr;
+        g_bat_current_max_edit = g_bat_total_energy_edit = g_bat_technology_edit = nullptr;
+        g_bat_health_combo = g_bat_present_combo = nullptr;
+        g_bat_plugged_combo = g_bat_charger_combo = g_bat_chargestate_combo = nullptr;
+        g_bat_inject_btn = g_bat_reset_btn = g_bat_refresh_btn = nullptr;
+        g_bat_current_label = nullptr;
+        g_bat_scene_combo = g_bat_scene_btn = nullptr;
+        g_status_label = nullptr;
+        for (auto &p : g_tab_pages) p = nullptr;
+        return 0;
+    }
+    }
+
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+} // namespace hscrcpy

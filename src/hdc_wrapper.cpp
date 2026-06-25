@@ -16,6 +16,10 @@ HdcWrapper::HdcWrapper(const std::string &serial,
     : serial_(serial), ip_(ip), port_(port) {}
 
 HdcWrapper::~HdcWrapper() {
+    // Clean up our fport forwards on exit to avoid stale residue
+    if (is_tcp()) {
+        cleanup_stale_forwards({});
+    }
 }
 
 bool HdcWrapper::ensure_connected() {
@@ -245,17 +249,6 @@ int HdcWrapper::run_process(const std::string &cmd, std::string *output, int tim
     static std::string s_hdc_path;
     if (s_hdc_path.empty()) s_hdc_path = find_hdc_exe();
     bool ran_direct = false;
-    if (!s_hdc_path.empty() && cmd.find("hdc") == 0) {
-        full_cmd = s_hdc_path + " " + cmd.substr(4);
-        if (CreateProcessA(NULL, const_cast<char *>(full_cmd.c_str()),
-                            NULL, NULL, TRUE, CREATE_NO_WINDOW,
-                            NULL, NULL, &si, &pi)) {
-            ran_direct = true;
-        } else {
-            LOGD("Direct hdc failed (err=%lu), falling back to cmd.exe /C", GetLastError());
-        }
-    }
-
     if (!ran_direct) {
         full_cmd = "cmd.exe /C " + cmd;
         if (!CreateProcessA(NULL, const_cast<char *>(full_cmd.c_str()),

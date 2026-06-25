@@ -16,6 +16,7 @@
 #include "h264_decoder.h"
 #include "layout_window.h"
 #include "file_manager_window.h"
+#include "cph_window.h"
 #include "log.h"
 #include "version.h"
 #include <cmath>
@@ -50,10 +51,13 @@ static HWND g_btn_reboot_hwnd = nullptr;
 static HWND g_btn_quality_hwnd = nullptr;
 static HWND g_btn_layout_hwnd = nullptr;
 static HWND g_btn_fm_hwnd = nullptr;
+static HWND g_btn_cph_hwnd = nullptr;
 static HWND g_status_hwnd = nullptr;
 static HWND g_canvas_hwnd = nullptr;
 static bool g_layout_visible = false;
 static bool g_fm_visible = false;
+static bool g_cph_visible = false;
+static bool g_is_cloud_phone = false;
 
 // Splitter bar child window
 static HWND g_splitter_hwnd = nullptr;
@@ -93,6 +97,7 @@ static uint32_t g_device_screen_w = 0, g_device_screen_h = 0;
 #define ID_BTN_QUALITY 1011
 #define ID_BTN_LAYOUT  1012
 #define ID_BTN_FM      1013
+#define ID_BTN_CPH     1014
 
 static ULONG_PTR g_gdiplus_token = 0;
 
@@ -1219,6 +1224,19 @@ static void stop_mirroring() {
                      SWP_NOMOVE | SWP_NOZORDER);
     }
 
+    // Hide CPH panel on stop
+    if (g_cph_visible) {
+        CphWindow::hide();
+        ShowWindow(g_splitter_hwnd, SW_HIDE);
+        g_cph_visible = false;
+        RECT wr;
+        GetWindowRect(g_hwnd, &wr);
+        SetWindowPos(g_hwnd, NULL, 0, 0,
+                     wr.right - wr.left - CphWindow::panel_width(),
+                     wr.bottom - wr.top,
+                     SWP_NOMOVE | SWP_NOZORDER);
+    }
+
     InvalidateRect(g_canvas_hwnd, NULL, TRUE);
 
     auto *cap = g_capture;
@@ -1364,6 +1382,8 @@ static LRESULT CALLBACK SplitterWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
                 LayoutWindow::reposition(canvas_w, TOOLBAR_H, new_pw, client_h);
             } else if (g_fm_visible) {
                 FileManagerWindow::reposition(canvas_w, TOOLBAR_H, new_pw, client_h);
+            } else if (g_cph_visible) {
+                CphWindow::reposition(canvas_w, TOOLBAR_H, new_pw, client_h);
             }
             MoveWindow(g_splitter_hwnd, canvas_w - 2, TOOLBAR_H, 4, client_h, TRUE);
             MoveWindow(g_canvas_hwnd, 0, TOOLBAR_H, canvas_w, client_h, FALSE);
@@ -1386,6 +1406,10 @@ static LRESULT CALLBACK SplitterWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
                 RECT fr;
                 GetClientRect(FileManagerWindow::hwnd(), &fr);
                 FileManagerWindow::set_panel_width(fr.right);
+            } else if (g_cph_visible) {
+                RECT cr;
+                GetClientRect(CphWindow::hwnd(), &cr);
+                CphWindow::set_panel_width(cr.right);
             }
             return 0;
         }
@@ -1438,6 +1462,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_btn_quality_hwnd = mkbtn("res\\toolbar\\settings.png", ID_BTN_QUALITY);
         g_btn_layout_hwnd  = mkbtn("res\\toolbar\\layout.png", ID_BTN_LAYOUT);
         g_btn_fm_hwnd      = mkbtn("res\\toolbar\\file-manager.png", ID_BTN_FM);
+        g_btn_cph_hwnd     = mkbtn("res\\toolbar\\cloud-phone.png", ID_BTN_CPH);
         g_btn_back_hwnd    = mkbtn("res\\toolbar\\back.png", ID_BTN_BACK);
         g_btn_home_hwnd    = mkbtn("res\\toolbar\\home.png", ID_BTN_HOME);
         g_btn_recent_hwnd  = mkbtn("res\\toolbar\\recent.png", ID_BTN_RECENT);
@@ -1459,6 +1484,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         LayoutWindow::create(g_hInst, hwnd, 420);
         FileManagerWindow::create(g_hInst, hwnd, 420);
+        CphWindow::create(g_hInst, hwnd, 420);
 
         // Register and create splitter bar (hidden initially)
         {
@@ -1558,11 +1584,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                              wr.bottom - wr.top,
                              SWP_NOMOVE | SWP_NOZORDER);
             } else {
-                bool need_expand = !g_layout_visible && !g_fm_visible;
+                bool need_expand = !g_layout_visible && !g_fm_visible && !g_cph_visible;
                 // Hide FM panel if visible
                 if (g_fm_visible) {
                     FileManagerWindow::hide();
                     g_fm_visible = false;
+                }
+                // Hide CPH panel if visible
+                if (g_cph_visible) {
+                    CphWindow::hide();
+                    g_cph_visible = false;
                 }
                 LayoutWindow::show(
                     [](int left, int top, int right, int bottom) {
@@ -1604,11 +1635,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                              wr.bottom - wr.top,
                              SWP_NOMOVE | SWP_NOZORDER);
             } else {
-                bool need_expand = !g_layout_visible && !g_fm_visible;
+                bool need_expand = !g_layout_visible && !g_fm_visible && !g_cph_visible;
                 // Hide layout panel if visible
                 if (g_layout_visible) {
                     LayoutWindow::hide();
                     g_layout_visible = false;
+                }
+                // Hide CPH panel if visible
+                if (g_cph_visible) {
+                    CphWindow::hide();
+                    g_cph_visible = false;
                 }
                 FileManagerWindow::show(
                     [](const std::string &cmd, std::string *output, int timeout_sec) -> bool {
@@ -1641,6 +1677,59 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
             }
             break;
+        case ID_BTN_CPH:
+            if (!g_mirroring) {
+                center_msgbox("Start mirroring first to use cloud phone simulation.", "HScrcpy", MB_OK | MB_ICONINFORMATION);
+                break;
+            }
+            // Cloud phone detection: cached at mirroring start
+            {
+                if (!g_is_cloud_phone) {
+                    center_msgbox("This device does not support cloud phone simulation.", "HScrcpy", MB_OK | MB_ICONWARNING);
+                    break;
+                }
+            }
+            if (CphWindow::is_visible()) {
+                CphWindow::hide();
+                ShowWindow(g_splitter_hwnd, SW_HIDE);
+                g_cph_visible = false;
+                RECT wr;
+                GetWindowRect(hwnd, &wr);
+                SetWindowPos(hwnd, NULL, 0, 0,
+                             wr.right - wr.left - CphWindow::panel_width(),
+                             wr.bottom - wr.top,
+                             SWP_NOMOVE | SWP_NOZORDER);
+            } else {
+                bool need_expand = !g_layout_visible && !g_fm_visible && !g_cph_visible;
+                // Hide other panels
+                if (g_layout_visible) { LayoutWindow::hide(); g_layout_visible = false; }
+                if (g_fm_visible) { FileManagerWindow::hide(); g_fm_visible = false; }
+                CphWindow::show(
+                    [](const std::string &cmd, std::string *output, int timeout_sec) -> bool {
+                        if (!g_hdc) return false;
+                        return g_hdc->shell_command(cmd, output, timeout_sec);
+                    },
+                    [](const std::string &local_path, const std::string &remote_path) -> bool {
+                        if (!g_hdc) return false;
+                        return g_hdc->push_file(local_path, remote_path);
+                    },
+                    [](bool busy) {
+                    }
+                );
+                ShowWindow(g_splitter_hwnd, SW_SHOW);
+                g_cph_visible = true;
+                if (need_expand) {
+                    RECT wr;
+                    GetWindowRect(hwnd, &wr);
+                    SetWindowPos(hwnd, NULL, 0, 0,
+                                 wr.right - wr.left + CphWindow::panel_width(),
+                                 wr.bottom - wr.top,
+                                 SWP_NOMOVE | SWP_NOZORDER);
+                } else {
+                    SendMessageW(hwnd, WM_SIZE, 0, 0);
+                }
+            }
+            break;
         }
         break;
     case WM_SIZE: {
@@ -1661,6 +1750,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             canvas_w = client_w - pw;
             if (canvas_w < 100) { canvas_w = 100; pw = client_w - canvas_w; }
             FileManagerWindow::reposition(canvas_w, TOOLBAR_H, pw, client_h);
+            MoveWindow(g_splitter_hwnd, canvas_w - 2, TOOLBAR_H, 4, client_h, TRUE);
+        } else if (g_cph_visible && CphWindow::is_visible()) {
+            int pw = CphWindow::panel_width();
+            canvas_w = client_w - pw;
+            if (canvas_w < 100) { canvas_w = 100; pw = client_w - canvas_w; }
+            CphWindow::reposition(canvas_w, TOOLBAR_H, pw, client_h);
             MoveWindow(g_splitter_hwnd, canvas_w - 2, TOOLBAR_H, 4, client_h, TRUE);
         }
 
@@ -1760,6 +1855,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         });
 
         g_mirroring = true;
+        g_is_cloud_phone = g_hdc && g_hdc->is_tcp() && CphWindow::is_cloud_phone(
+            [](const std::string &cmd, std::string *output, int timeout_sec) -> bool {
+                if (!g_hdc) return false;
+                return g_hdc->shell_command(cmd, output, timeout_sec);
+            });
+        LOGE("Cloud phone detection: is_tcp=%d is_cloud_phone=%d serial=%s",
+             g_hdc ? g_hdc->is_tcp() : -1, g_is_cloud_phone,
+             g_hdc ? g_hdc->serial().c_str() : "null");
         g_capture->set_notify_hwnd(g_hwnd);
         {
             HICON hPrev = (HICON)SendMessageA(g_btn_start_hwnd, BM_GETIMAGE, IMAGE_ICON, 0);

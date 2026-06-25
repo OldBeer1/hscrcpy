@@ -1074,10 +1074,12 @@ void ScreenCapture::decode_loop() {
                          static_cast<size_t>(target), target);
                     h264_queue_.erase(h264_queue_.begin(), h264_queue_.begin() + target);
                 } else if (h264_queue_.size() > 5) {
-                    // No IDR found but queue is very backlogged - keep last frame only
-                    LOGI("Frame skip: no IDR found, dropping %zu queued frames",
-                         h264_queue_.size() - 1);
-                    h264_queue_.erase(h264_queue_.begin(), h264_queue_.end() - 1);
+                    // No IDR found but queue is very backlogged - drop all, request new IDR
+                    LOGI("Frame skip: no IDR found, dropping %zu queued frames, requesting IDR",
+                         h264_queue_.size());
+                    h264_queue_.clear();
+                    grpc_client_.request_idr_frame();
+                    continue;
                 }
             }
 
@@ -1099,6 +1101,8 @@ void ScreenCapture::decode_loop() {
                     frame = std::make_shared<DecodedImage>();
                 }
                 std::swap(*frame, decoder_.image_ref());
+                // After swap, decoder's internal frame_rgb_ pointer is stale - rebind it
+                decoder_.rebind_rgb_pointer();
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     latest_frame_ = frame;

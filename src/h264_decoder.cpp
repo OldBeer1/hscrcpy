@@ -240,7 +240,18 @@ bool H264Decoder::decode(const uint8_t *h264_data, size_t h264_size) {
         }
     }
 
-    return got_frame || data_accepted;
+    return got_frame;
+}
+
+void H264Decoder::rebind_rgb_pointer() {
+    // After std::swap(*frame, decoder_.image_ref()), image_.data is a new/different vector,
+    // but frame_rgb_->data[0] still points to the old swapped-out buffer.
+    // Re-bind frame_rgb_ arrays to the current image_.data.
+    if (sws_initialized_ && frame_rgb_ && !image_.data.empty()) {
+        av_image_fill_arrays(frame_rgb_->data, frame_rgb_->linesize,
+                             image_.data.data(), AV_PIX_FMT_BGRA,
+                             last_width_, last_height_, 1);
+    }
 }
 
 } // namespace hscrcpy
