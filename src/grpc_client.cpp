@@ -3,6 +3,7 @@
 #include "log.h"
 #include <cstring>
 #include <cstdio>
+#include <algorithm>
 
 #ifdef _WIN32
 using socket_t = SOCKET;
@@ -47,106 +48,6 @@ static bool send_all(int sock, const uint8_t *data, size_t len) {
     return true;
 }
 
-static void write_frame(std::vector<uint8_t> &out, uint8_t type, uint8_t flags,
-                        uint32_t stream_id, const uint8_t *payload, size_t len) {
-    out.push_back(static_cast<uint8_t>((len >> 16) & 0xFF));
-    out.push_back(static_cast<uint8_t>((len >> 8) & 0xFF));
-    out.push_back(static_cast<uint8_t>(len & 0xFF));
-    out.push_back(type);
-    out.push_back(flags);
-    out.push_back(static_cast<uint8_t>((stream_id >> 24) & 0xFF));
-    out.push_back(static_cast<uint8_t>((stream_id >> 16) & 0xFF));
-    out.push_back(static_cast<uint8_t>((stream_id >> 8) & 0xFF));
-    out.push_back(static_cast<uint8_t>(stream_id & 0xFF));
-    if (len > 0) out.insert(out.end(), payload, payload + len);
-}
-
-static void hpack_encode_literal_header_indexed_name(std::vector<uint8_t> &out,
-                                                      uint8_t index,
-                                                      const std::string &value) {
-    out.push_back(index);
-    uint32_t vlen = static_cast<uint32_t>(value.size());
-    if (vlen < 0x7F) {
-        out.push_back(static_cast<uint8_t>(vlen));
-    } else {
-        out.push_back(0x7F);
-        uint32_t rem = vlen - 0x7F;
-        while (rem >= 0x80) {
-            out.push_back(static_cast<uint8_t>((rem & 0x7F) | 0x80));
-            rem >>= 7;
-        }
-        out.push_back(static_cast<uint8_t>(rem));
-    }
-    out.insert(out.end(), value.begin(), value.end());
-}
-
-static void hpack_encode_literal_header_new_name(std::vector<uint8_t> &out,
-                                                  const std::string &name,
-                                                  const std::string &value) {
-    out.push_back(0x00);
-    uint32_t nlen = static_cast<uint32_t>(name.size());
-    if (nlen < 0x7F) out.push_back(static_cast<uint8_t>(nlen));
-    else { out.push_back(0x7F); uint32_t r = nlen - 0x7F; while (r >= 0x80) { out.push_back((r & 0x7F) | 0x80); r >>= 7; } out.push_back(r); }
-    out.insert(out.end(), name.begin(), name.end());
-    uint32_t vlen = static_cast<uint32_t>(value.size());
-    if (vlen < 0x7F) out.push_back(static_cast<uint8_t>(vlen));
-    else { out.push_back(0x7F); uint32_t r = vlen - 0x7F; while (r >= 0x80) { out.push_back((r & 0x7F) | 0x80); r >>= 7; } out.push_back(r); }
-    out.insert(out.end(), value.begin(), value.end());
-}
-
-static void build_grpc_headers(std::vector<uint8_t> &hpack_block,
-                                const std::string &path,
-                                const std::string &authority) {
-    hpack_block.push_back(0x83);
-    hpack_block.push_back(0x86);
-    hpack_encode_literal_header_indexed_name(hpack_block, 0x44, path);
-    hpack_encode_literal_header_indexed_name(hpack_block, 0x41, authority);
-    hpack_encode_literal_header_new_name(hpack_block, "content-type", "application/grpc");
-    hpack_encode_literal_header_new_name(hpack_block, "te", "trailers");
-    hpack_encode_literal_header_new_name(hpack_block, "user-agent", "grpc-java-netty/1.60.2");
-    hpack_encode_literal_header_new_name(hpack_block, "grpc-accept-encoding", "gzip");
-}
-
-static void send_settings_ack(int sock) {
-    uint8_t ack[9] = {0, 0, 0, 0x04, 0x01, 0, 0, 0, 0};
-    send_all(sock, ack, 9);
-}
-
-static void send_window_update(int sock, uint32_t stream_id, uint32_t increment) {
-    uint8_t payload[4];
-    payload[0] = static_cast<uint8_t>((increment >> 24) & 0x7F);
-    payload[1] = static_cast<uint8_t>((increment >> 16) & 0xFF);
-    payload[2] = static_cast<uint8_t>((increment >> 8) & 0xFF);
-    payload[3] = static_cast<uint8_t>(increment & 0xFF);
-    uint8_t frame[13];
-    frame[0] = 0; frame[1] = 0; frame[2] = 4;
-    frame[3] = 0x08; frame[4] = 0x00;
-    frame[5] = static_cast<uint8_t>((stream_id >> 24) & 0xFF);
-    frame[6] = static_cast<uint8_t>((stream_id >> 16) & 0xFF);
-    frame[7] = static_cast<uint8_t>((stream_id >> 8) & 0xFF);
-    frame[8] = static_cast<uint8_t>(stream_id & 0xFF);
-    memcpy(frame + 9, payload, 4);
-    send_all(sock, frame, 13);
-}
-
-static bool send_ping(int sock, uint64_t opaque) {
-    uint8_t frame[17];
-    frame[0] = 0; frame[1] = 0; frame[2] = 8;
-    frame[3] = 0x06; frame[4] = 0x00;  // PING, no ACK
-    frame[5] = 0; frame[6] = 0; frame[7] = 0; frame[8] = 0;
-    memcpy(frame + 9, &opaque, 8);
-    return send_all(sock, frame, 17);
-}
-
-static void send_ping_ack(int sock, const uint8_t *opaque_data) {
-    uint8_t frame[17];
-    frame[0] = 0; frame[1] = 0; frame[2] = 8;
-    frame[3] = 0x06; frame[4] = 0x01;
-    frame[5] = 0; frame[6] = 0; frame[7] = 0; frame[8] = 0;
-    memcpy(frame + 9, opaque_data, 8);
-    send_all(sock, frame, 17);
-}
-
 static int recv_with_timeout(int sock, uint8_t *buf, size_t len, int timeout_sec) {
     fd_set readfds;
     FD_ZERO(&readfds);
@@ -158,36 +59,10 @@ static int recv_with_timeout(int sock, uint8_t *buf, size_t len, int timeout_sec
                   static_cast<int>(len), 0);
 }
 
-struct Http2Settings {
-    uint32_t header_table_size = 4096;
-    bool enable_push = true;
-    uint32_t max_concurrent_streams = 0xFFFFFFFF;
-    uint32_t initial_window_size = 65535;
-    uint32_t max_frame_size = 16384;
-    uint32_t max_header_list_size = 0xFFFFFFFF;
-};
+// ============================================================
+// Zero-copy H264 extraction from gRPC protobuf
+// ============================================================
 
-static Http2Settings parse_settings(const uint8_t *payload, size_t len) {
-    Http2Settings s;
-    for (size_t i = 0; i + 5 <= len; i += 6) {
-        uint16_t id = (static_cast<uint16_t>(payload[i]) << 8) | payload[i + 1];
-        uint32_t val = (static_cast<uint32_t>(payload[i + 2]) << 24) |
-                       (static_cast<uint32_t>(payload[i + 3]) << 16) |
-                       (static_cast<uint32_t>(payload[i + 4]) << 8) |
-                       static_cast<uint32_t>(payload[i + 5]);
-        switch (id) {
-        case 1: s.header_table_size = val; break;
-        case 2: s.enable_push = val != 0; break;
-        case 3: s.max_concurrent_streams = val; break;
-        case 4: s.initial_window_size = val; break;
-        case 5: s.max_frame_size = val; break;
-        case 6: s.max_header_list_size = val; break;
-        }
-    }
-    return s;
-}
-
-// Zero-copy H264 extraction: returns pointer+length into the source buffer
 struct H264Ref { const uint8_t *data; size_t size; };
 
 static bool extract_h264_ref_from_payload_map(const uint8_t *map_data, size_t map_len, H264Ref &out) {
@@ -215,7 +90,6 @@ static bool extract_h264_ref_from_payload_map(const uint8_t *map_data, size_t ma
             pos += len;
 
             if (fnum == 2) {
-                // Parse ParamValue sub-message for field 5 (H264 data)
                 size_t vp = 0;
                 while (vp < len) {
                     uint8_t vtag = field_data[vp++];
@@ -238,7 +112,6 @@ static bool extract_h264_ref_from_payload_map(const uint8_t *map_data, size_t ma
                     else break;
                 }
             }
-            // fnum == 1 (ParamKey): skip
         } else if (wtype == 0) {
             read_varint();
         } else if (wtype == 1) { pos += 8; }
@@ -286,6 +159,309 @@ static bool extract_h264_ref_from_reply(const uint8_t *pb, size_t pb_len, H264Re
     return false;
 }
 
+// ============================================================
+// gRPC message parser reset
+// ============================================================
+
+void GrpcClient::reset_grpc_parser() {
+    grpc_consumed_ = 0;
+    grpc_buf_size_ = 0;
+    grpc_header_parsed_ = false;
+    grpc_expected_len_ = 0;
+}
+
+// ============================================================
+// Helper: build nghttp2_nv array
+// ============================================================
+
+static nghttp2_nv make_nv(const char *name, const char *value, bool no_copy = false) {
+    nghttp2_nv nv;
+    nv.name = reinterpret_cast<uint8_t *>(const_cast<char *>(name));
+    nv.value = reinterpret_cast<uint8_t *>(const_cast<char *>(value));
+    nv.namelen = strlen(name);
+    nv.valuelen = strlen(value);
+    nv.flags = no_copy ? NGHTTP2_NV_FLAG_NO_COPY_NAME | NGHTTP2_NV_FLAG_NO_COPY_VALUE
+                       : NGHTTP2_NV_FLAG_NONE;
+    return nv;
+}
+
+// ============================================================
+// nghttp2 callbacks
+// ============================================================
+
+nghttp2_ssize GrpcClient::send_callback(nghttp2_session *, const uint8_t *data,
+                                          size_t length, int, void *user_data) {
+    auto *self = static_cast<GrpcClient *>(user_data);
+    self->send_buf_.insert(self->send_buf_.end(), data, data + length);
+    return static_cast<nghttp2_ssize>(length);
+}
+
+int GrpcClient::on_begin_headers_callback(nghttp2_session *, const nghttp2_frame *frame,
+                                            void *user_data) {
+    auto *self = static_cast<GrpcClient *>(user_data);
+    if (frame->hd.stream_id == static_cast<int32_t>(self->active_stream_id_)) {
+        self->got_response_headers_ = true;
+    }
+    return 0;
+}
+
+int GrpcClient::on_header_callback(nghttp2_session *, const nghttp2_frame *frame,
+                                     const uint8_t *name, size_t namelen,
+                                     const uint8_t *value, size_t valuelen,
+                                     uint8_t, void *user_data) {
+    auto *self = static_cast<GrpcClient *>(user_data);
+    if (frame->hd.stream_id == static_cast<int32_t>(self->active_stream_id_) &&
+        frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
+        if (namelen == 11 && memcmp(name, "grpc-status", 11) == 0) {
+            LOGI("gRPC trailers: grpc-status=%.*s", (int)valuelen, value);
+        }
+    }
+    return 0;
+}
+
+int GrpcClient::on_data_chunk_recv_callback(nghttp2_session *, uint8_t,
+                                              int32_t stream_id,
+                                              const uint8_t *data, size_t len,
+                                              void *user_data) {
+    auto *self = static_cast<GrpcClient *>(user_data);
+
+    if (stream_id != static_cast<int32_t>(self->active_stream_id_)) {
+        return 0;
+    }
+
+    // Compact unconsumed data
+    if (self->grpc_consumed_ > 0) {
+        if (self->grpc_consumed_ < self->grpc_buf_size_) {
+            size_t remaining = self->grpc_buf_size_ - self->grpc_consumed_;
+            memmove(self->grpc_msg_buf_.data(), self->grpc_msg_buf_.data() + self->grpc_consumed_, remaining);
+            self->grpc_buf_size_ = remaining;
+        } else {
+            self->grpc_buf_size_ = 0;
+        }
+        self->grpc_consumed_ = 0;
+    }
+
+    // Append new data
+    size_t needed_size = self->grpc_buf_size_ + len;
+    if (needed_size > self->grpc_msg_buf_.size()) {
+        self->grpc_msg_buf_.resize(needed_size);
+    } else if (self->grpc_msg_buf_.size() > 512 * 1024 && needed_size < self->grpc_msg_buf_.size() / 2) {
+        self->grpc_msg_buf_.resize(needed_size);
+    }
+    memcpy(self->grpc_msg_buf_.data() + self->grpc_buf_size_, data, len);
+    self->grpc_buf_size_ += len;
+
+    // Parse gRPC messages: 5-byte header (1 flag + 4 length) + payload
+    while (true) {
+        size_t avail = self->grpc_buf_size_ - self->grpc_consumed_;
+        if (!self->grpc_header_parsed_ && avail >= 5) {
+            const uint8_t *hdr = self->grpc_msg_buf_.data() + self->grpc_consumed_;
+            self->grpc_expected_len_ = (static_cast<uint32_t>(hdr[1]) << 24) |
+                                       (static_cast<uint32_t>(hdr[2]) << 16) |
+                                       (static_cast<uint32_t>(hdr[3]) << 8) |
+                                       static_cast<uint32_t>(hdr[4]);
+            self->grpc_header_parsed_ = true;
+        }
+        if (!self->grpc_header_parsed_) break;
+
+        size_t needed = 5 + self->grpc_expected_len_;
+        if (avail < needed) break;
+
+        H264Ref h264_ref;
+        if (extract_h264_ref_from_reply(self->grpc_msg_buf_.data() + self->grpc_consumed_ + 5,
+                                         self->grpc_expected_len_, h264_ref)) {
+            if (h264_ref.size > 0 && self->on_frame_) {
+                self->on_frame_(h264_ref.data, h264_ref.size);
+                self->got_first_data_ = true;
+                self->consecutive_rst_on_idr_ = 0;
+                self->end_stream_retries_ = 0;
+            }
+        }
+
+        self->grpc_consumed_ += needed;
+        self->grpc_header_parsed_ = false;
+        self->grpc_expected_len_ = 0;
+    }
+
+    return 0;
+}
+
+int GrpcClient::on_stream_close_callback(nghttp2_session *, int32_t stream_id,
+                                           uint32_t error_code, void *user_data) {
+    auto *self = static_cast<GrpcClient *>(user_data);
+
+    if (stream_id == static_cast<int32_t>(self->active_stream_id_)) {
+        LOGI("Stream %u closed (error_code=%u), retries=%d",
+             self->active_stream_id_, error_code, self->end_stream_retries_);
+
+        static constexpr int kMaxEndStreamRetries = 500;
+        if (self->end_stream_retries_ < kMaxEndStreamRetries) {
+            self->end_stream_retries_++;
+            self->submit_onstart_request();
+            LOGI("New stream %u opened, continuing streaming", self->active_stream_id_);
+        } else {
+            LOGW("Max END_STREAM retries reached, stopping streaming");
+            self->streaming_ = false;
+        }
+    } else if (stream_id > 1 && (stream_id & 1)) {
+        self->consecutive_rst_on_idr_++;
+        if (self->consecutive_rst_on_idr_ <= 2) {
+            LOGI("RST_STREAM on client stream %d, retrying IDR (%d/2)",
+                 stream_id, self->consecutive_rst_on_idr_);
+            self->idr_pending_.store(true);
+        } else {
+            LOGW("RST_STREAM on client stream %d, %d consecutive failures",
+                 stream_id, self->consecutive_rst_on_idr_);
+        }
+    }
+
+    return 0;
+}
+
+int GrpcClient::on_frame_recv_callback(nghttp2_session *, const nghttp2_frame *frame,
+                                         void *user_data) {
+    auto *self = static_cast<GrpcClient *>(user_data);
+
+    switch (frame->hd.type) {
+    case NGHTTP2_SETTINGS:
+        // Either server's initial SETTINGS or SETTINGS ACK means handshake progress
+        // We consider connection established once we've received any SETTINGS frame
+        self->settings_ack_received_ = true;
+        LOGI("HTTP/2 SETTINGS received (flags=0x%02x, stream_id=%d)", frame->hd.flags, frame->hd.stream_id);
+        break;
+    case NGHTTP2_PING:
+        if (frame->hd.flags & NGHTTP2_FLAG_ACK) {
+            self->ping_sent_count_ = 0;
+            self->ping_fail_count_.store(0);
+            LOGI("Received PING ACK, connection alive");
+        }
+        break;
+    case NGHTTP2_GOAWAY:
+        LOGW("Received GOAWAY");
+        self->streaming_ = false;
+        break;
+    }
+
+    return 0;
+}
+
+// ============================================================
+// Flush nghttp2 pending output to socket
+// ============================================================
+
+bool GrpcClient::flush_nghttp2() {
+    send_buf_.clear();
+    const uint8_t *data_ptr = nullptr;
+    while (true) {
+        nghttp2_ssize n = nghttp2_session_mem_send2(session_, &data_ptr);
+        if (n <= 0) break;
+        send_buf_.insert(send_buf_.end(), data_ptr, data_ptr + n);
+    }
+    if (!send_buf_.empty()) {
+        if (!send_all(sock_, send_buf_.data(), send_buf_.size())) {
+            LOGE("Failed to send nghttp2 output (%zu bytes)", send_buf_.size());
+            return false;
+        }
+    }
+    return true;
+}
+
+// ============================================================
+// Data source callbacks for gRPC empty payload (5 bytes)
+// ============================================================
+
+static nghttp2_ssize grpc_empty_data_read_callback(nghttp2_session *, int32_t,
+                                                     uint8_t *buf, size_t length,
+                                                     uint32_t *data_flags,
+                                                     nghttp2_data_source *, void *) {
+    static const uint8_t grpc_empty[5] = {0, 0, 0, 0, 0};
+    size_t to_copy = (std::min)(length, static_cast<size_t>(5));
+    memcpy(buf, grpc_empty, to_copy);
+    *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+    return static_cast<nghttp2_ssize>(to_copy);
+}
+
+// ============================================================
+// Submit gRPC onStart request via nghttp2
+// ============================================================
+
+bool GrpcClient::submit_onstart_request() {
+    std::string authority = connected_host_ + ":" + std::to_string(connected_port_);
+
+    nghttp2_nv hdrs[] = {
+        make_nv(":method", "POST"),
+        make_nv(":path", "/ScrcpyService/onStart"),
+        make_nv(":scheme", "http"),
+        make_nv(":authority", authority.c_str()),
+        make_nv("content-type", "application/grpc"),
+        make_nv("te", "trailers"),
+        make_nv("grpc-accept-encoding", "gzip"),
+        make_nv("user-agent", "grpc-java-netty/1.60.2"),
+    };
+
+    nghttp2_data_provider2 dp;
+    dp.read_callback = grpc_empty_data_read_callback;
+
+    int32_t sid = nghttp2_submit_request2(session_, nullptr, hdrs,
+                                            sizeof(hdrs) / sizeof(hdrs[0]),
+                                            &dp, nullptr);
+    if (sid < 0) {
+        LOGE("nghttp2_submit_request2 failed: %s", nghttp2_strerror(sid));
+        return false;
+    }
+
+    active_stream_id_ = static_cast<uint32_t>(sid);
+    next_stream_id_ = active_stream_id_ + 2;
+    reset_grpc_parser();
+    got_response_headers_ = false;
+
+    if (!flush_nghttp2()) return false;
+
+    LOGI("Sent gRPC onStart request on stream %u", active_stream_id_);
+    return true;
+}
+
+// ============================================================
+// Submit gRPC onRequestIDRFrame via nghttp2
+// ============================================================
+
+bool GrpcClient::submit_idr_request() {
+    std::string authority = connected_host_ + ":" + std::to_string(connected_port_);
+
+    nghttp2_nv hdrs[] = {
+        make_nv(":method", "POST"),
+        make_nv(":path", "/ScrcpyService/onRequestIDRFrame"),
+        make_nv(":scheme", "http"),
+        make_nv(":authority", authority.c_str()),
+        make_nv("content-type", "application/grpc"),
+        make_nv("te", "trailers"),
+        make_nv("grpc-accept-encoding", "gzip"),
+        make_nv("user-agent", "grpc-java-netty/1.60.2"),
+    };
+
+    nghttp2_data_provider2 dp;
+    dp.read_callback = grpc_empty_data_read_callback;
+
+    int32_t sid = nghttp2_submit_request2(session_, nullptr, hdrs,
+                                            sizeof(hdrs) / sizeof(hdrs[0]),
+                                            &dp, nullptr);
+    if (sid < 0) {
+        LOGE("nghttp2_submit_request2 for IDR failed: %s", nghttp2_strerror(sid));
+        return false;
+    }
+
+    next_stream_id_ = static_cast<uint32_t>(sid) + 2;
+
+    if (!flush_nghttp2()) return false;
+
+    LOGI("Sent gRPC onRequestIDRFrame on stream %d", sid);
+    return true;
+}
+
+// ============================================================
+// connect() — TCP connect + nghttp2 handshake
+// ============================================================
+
 bool GrpcClient::connect(const std::string &host, uint16_t port) {
     if (connected_) disconnect();
 
@@ -294,6 +470,7 @@ bool GrpcClient::connect(const std::string &host, uint16_t port) {
 
     LOGI("GrpcClient::connect(%s, %u) starting", host.c_str(), port);
 
+    // TCP connect
     sock_ = static_cast<int>(socket(AF_INET, SOCK_STREAM, 0));
     if (sock_ == static_cast<int>(INVALID_SOCK)) {
         LOGE("socket creation failed");
@@ -303,8 +480,6 @@ bool GrpcClient::connect(const std::string &host, uint16_t port) {
     int flag = 1;
     setsockopt(static_cast<socket_t>(sock_), IPPROTO_TCP, TCP_NODELAY,
                reinterpret_cast<const char *>(&flag), sizeof(flag));
-
-    // Enable TCP keepalive to detect silently dropped connections (especially TCP devices over network)
     set_tcp_keepalive(sock_);
 
     struct sockaddr_in addr = {};
@@ -323,211 +498,181 @@ bool GrpcClient::connect(const std::string &host, uint16_t port) {
 
     LOGI("TCP connected to %s:%u", host.c_str(), port);
 
-    const char *preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-    if (!send_all(sock_, reinterpret_cast<const uint8_t *>(preface), strlen(preface))) {
+    // Create nghttp2 session
+    nghttp2_session_callbacks *cbs;
+    nghttp2_session_callbacks_new(&cbs);
+    nghttp2_session_callbacks_set_send_callback2(cbs, send_callback);
+    nghttp2_session_callbacks_set_on_begin_headers_callback(cbs, on_begin_headers_callback);
+    nghttp2_session_callbacks_set_on_header_callback(cbs, on_header_callback);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, on_data_chunk_recv_callback);
+    nghttp2_session_callbacks_set_on_stream_close_callback(cbs, on_stream_close_callback);
+    nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, on_frame_recv_callback);
+
+    int ret = nghttp2_session_client_new2(&session_, cbs, this, nullptr);
+    nghttp2_session_callbacks_del(cbs);
+
+    if (ret != 0) {
+        LOGE("nghttp2_session_client_new2 failed: %s", nghttp2_strerror(ret));
         CLOSE_SOCKET(static_cast<socket_t>(sock_));
         sock_ = -1;
         return false;
     }
 
-    uint8_t client_settings_payload[] = {
-        0x00, 0x01, 0x00, 0x00, 0x10, 0x00,
-        0x00, 0x03, 0x7F, 0xFF, 0xFF, 0xFF,
-        0x00, 0x04, 0x00, 0x40, 0x00, 0x00,
-        0x00, 0x05, 0x00, 0x01, 0x00, 0x00,
-    };
-    std::vector<uint8_t> client_settings_frame;
-    write_frame(client_settings_frame, 0x04, 0x00, 0, client_settings_payload, sizeof(client_settings_payload));
-    if (!send_all(sock_, client_settings_frame.data(), client_settings_frame.size())) {
+    // Submit client SETTINGS
+    nghttp2_submit_settings(session_, NGHTTP2_FLAG_NONE, nullptr, 0);
+
+    // Send connection preface (24 bytes + SETTINGS frame)
+    if (!flush_nghttp2()) {
+        LOGE("Failed to send HTTP/2 connection preface");
+        nghttp2_session_del(session_);
+        session_ = nullptr;
         CLOSE_SOCKET(static_cast<socket_t>(sock_));
         sock_ = -1;
         return false;
     }
 
-    std::vector<uint8_t> preface_buf(4096);
-    size_t buf_used = 0;
-    bool got_server_settings = false;
+    // Wait for server SETTINGS + SETTINGS ACK
+    settings_ack_received_ = false;
+    recv_buf_.resize(64 * 1024);
+    recv_used_ = 0;
+
     int attempts = 0;
-
-    while (attempts < 5 && !got_server_settings) {
-        int n = recv_with_timeout(sock_, preface_buf.data() + buf_used,
-                                  preface_buf.size() - buf_used, 2);
+    while (attempts < 10 && !settings_ack_received_) {
+        int n = recv_with_timeout(sock_, recv_buf_.data() + recv_used_,
+                                  recv_buf_.size() - recv_used_, 2);
         if (n <= 0) {
             attempts++;
             continue;
         }
-        buf_used += n;
+        recv_used_ += n;
 
-        size_t pos = 0;
-        while (pos + 9 <= buf_used) {
-            uint32_t frame_len = (static_cast<uint32_t>(preface_buf[pos]) << 16) |
-                                 (static_cast<uint32_t>(preface_buf[pos + 1]) << 8) |
-                                 static_cast<uint32_t>(preface_buf[pos + 2]);
-            uint8_t frame_type = preface_buf[pos + 3];
-            uint8_t flags = preface_buf[pos + 4];
-            uint32_t stream_id = (static_cast<uint32_t>(preface_buf[pos + 5]) << 24) |
-                                 (static_cast<uint32_t>(preface_buf[pos + 6]) << 16) |
-                                 (static_cast<uint32_t>(preface_buf[pos + 7]) << 8) |
-                                 static_cast<uint32_t>(preface_buf[pos + 8]);
-            stream_id &= 0x7FFFFFFF;
-
-            size_t total = 9 + frame_len;
-            if (pos + total > buf_used) break;
-
-            if (frame_type == 0x04 && !(flags & 0x01)) {
-                auto s = parse_settings(preface_buf.data() + pos + 9, frame_len);
-                server_window_size_ = s.initial_window_size;
-                send_settings_ack(sock_);
-                got_server_settings = true;
-            } else if (frame_type == 0x06 && !(flags & 0x01)) {
-                send_ping_ack(sock_, preface_buf.data() + pos + 9);
-            }
-            pos += total;
+        nghttp2_ssize processed = nghttp2_session_mem_recv2(session_,
+            recv_buf_.data(), recv_used_);
+        if (processed < 0) {
+            LOGE("nghttp2_session_mem_recv2 error: %s", nghttp2_strerror(static_cast<int>(processed)));
+            nghttp2_session_del(session_);
+            session_ = nullptr;
+            CLOSE_SOCKET(static_cast<socket_t>(sock_));
+            sock_ = -1;
+            return false;
         }
-        if (pos > 0 && pos < buf_used) memmove(preface_buf.data(), preface_buf.data() + pos, buf_used - pos);
-        buf_used -= pos;
+
+        size_t consumed = static_cast<size_t>(processed);
+        if (consumed < recv_used_) {
+            memmove(recv_buf_.data(), recv_buf_.data() + consumed, recv_used_ - consumed);
+        }
+        recv_used_ -= consumed;
+
+        // Flush any pending output (SETTINGS ACK, etc.)
+        flush_nghttp2();
     }
 
-    if (!got_server_settings) {
-        LOGE("Never received server SETTINGS");
+    if (!settings_ack_received_) {
+        LOGE("Never received server SETTINGS ACK");
+        nghttp2_session_del(session_);
+        session_ = nullptr;
         CLOSE_SOCKET(static_cast<socket_t>(sock_));
         sock_ = -1;
         return false;
     }
 
-    if (buf_used > 0) {
-        leftover_buf_.assign(preface_buf.begin(), preface_buf.begin() + buf_used);
-        LOGI("Saved %zu leftover bytes from connect phase", buf_used);
-    }
-
     connected_ = true;
-    LOGI("Connected to %s:%u (HTTP/2), server_window=%u", host.c_str(), port, server_window_size_);
+    LOGI("Connected to %s:%u (HTTP/2 via nghttp2)", host.c_str(), port);
     return true;
 }
 
+// ============================================================
+// disconnect()
+// ============================================================
+
 void GrpcClient::disconnect() {
     stop_streaming();
+    if (session_) {
+        nghttp2_session_del(session_);
+        session_ = nullptr;
+    }
     if (sock_ >= 0) {
         CLOSE_SOCKET(static_cast<socket_t>(sock_));
         sock_ = -1;
     }
     connected_ = false;
+    settings_ack_received_ = false;
+    recv_used_ = 0;
+    send_buf_.clear();
 }
 
-bool GrpcClient::send_onstart_request(uint32_t stream_id) {
-    std::vector<uint8_t> hpack_block;
-    std::string authority = connected_host_ + ":" + std::to_string(connected_port_);
-    build_grpc_headers(hpack_block, "/ScrcpyService/onStart", authority);
-
-    std::vector<uint8_t> headers_frame;
-    write_frame(headers_frame, 0x01, 0x04, stream_id,
-                hpack_block.data(), hpack_block.size());
-
-    if (!send_all(sock_, headers_frame.data(), headers_frame.size())) {
-        LOGE("Failed to send HEADERS frame on stream %u", stream_id);
-        return false;
-    }
-
-    uint8_t grpc_empty[5] = {0, 0, 0, 0, 0};
-    std::vector<uint8_t> data_frame;
-    write_frame(data_frame, 0x00, 0x01, stream_id, grpc_empty, 5);
-
-    if (!send_all(sock_, data_frame.data(), data_frame.size())) {
-        LOGE("Failed to send DATA frame on stream %u", stream_id);
-        return false;
-    }
-
-    LOGI("Sent gRPC onStart request on stream %u", stream_id);
-    return true;
-}
+// ============================================================
+// start_streaming()
+// ============================================================
 
 bool GrpcClient::start_streaming(const std::function<void(const uint8_t *, size_t)> &on_h264_frame) {
     if (streaming_) return true;
     if (!connected_) return false;
 
     on_frame_ = on_h264_frame;
+    grpc_msg_buf_.reserve(512 * 1024);
+    got_first_data_ = false;
+    end_stream_retries_ = 0;
+    stall_retries_ = 0;
+    consecutive_rst_on_idr_ = 0;
+    ping_sent_count_ = 0;
+    ping_fail_count_.store(0);
 
-    active_stream_id_ = 1;
-    if (!send_onstart_request(active_stream_id_)) {
+    if (!submit_onstart_request()) {
         return false;
     }
-
-    send_window_update(sock_, 0, 4194304 - 65535);
 
     streaming_ = true;
     stream_thread_ = std::thread(&GrpcClient::streaming_loop, this);
     return true;
 }
 
+// ============================================================
+// stop_streaming()
+// ============================================================
+
 void GrpcClient::stop_streaming() {
     streaming_ = false;
     if (stream_thread_.joinable()) stream_thread_.join();
 }
 
+// ============================================================
+// request_idr_frame() — thread-safe atomic flag
+// ============================================================
+
 bool GrpcClient::request_idr_frame() {
     if (!connected_) return false;
-
-    uint32_t sid = next_stream_id_;
-    next_stream_id_ += 2;
-
-    std::vector<uint8_t> hpack_block;
-    std::string authority = connected_host_ + ":" + std::to_string(connected_port_);
-    build_grpc_headers(hpack_block, "/ScrcpyService/onRequestIDRFrame", authority);
-
-    std::vector<uint8_t> headers_frame;
-    write_frame(headers_frame, 0x01, 0x04, sid,
-                hpack_block.data(), hpack_block.size());
-
-    if (!send_all(sock_, headers_frame.data(), headers_frame.size())) {
-        return false;
-    }
-
-    uint8_t grpc_empty[5] = {0, 0, 0, 0, 0};
-    std::vector<uint8_t> data_frame;
-    write_frame(data_frame, 0x00, 0x01, sid, grpc_empty, 5);
-
-    return send_all(sock_, data_frame.data(), data_frame.size());
+    idr_pending_.store(true);
+    return true;
 }
 
+// ============================================================
+// streaming_loop() — nghttp2 event loop
+// ============================================================
+
 void GrpcClient::streaming_loop() {
-    LOGI("Streaming loop started, sock=%d, streaming=%d, connected=%d", sock_, (int)streaming_.load(), (int)connected_.load());
+    LOGI("Streaming loop started (nghttp2), sock=%d", sock_);
 
-    if (recv_buffer_.size() < 256 * 1024)
-        recv_buffer_.resize(256 * 1024);
-    size_t buf_used = 0;
+    if (recv_buf_.size() < 256 * 1024)
+        recv_buf_.resize(256 * 1024);
+    recv_used_ = 0;
 
-    if (!leftover_buf_.empty()) {
-        size_t copy_len = std::min(leftover_buf_.size(), recv_buffer_.size());
-        memcpy(recv_buffer_.data(), leftover_buf_.data(), copy_len);
-        buf_used = copy_len;
-        leftover_buf_.clear();
-        LOGI("Preloaded %zu bytes from connect phase", copy_len);
-    }
-
-    bool got_first_data = false;
     int idle_count = 0;
-    int ping_sent_count = 0;  // consecutive PING sent without receiving any data/ACK
-    const int kPingIntervalSec = 15;  // send PING every 15s when idle
-    const int kMaxPingWithoutResponse = 3;  // after 3 unanswered PINGs (~45s), consider connection dead
-    uint32_t bytes_received_on_stream = 0;
-    uint32_t window_update_threshold = 262144;
-    int consecutive_rst_on_idr = 0;
-    int end_stream_retries = 0;
-    const int kMaxEndStreamRetries = 500;  // TCP devices need a new stream per frame; allow sustained streaming
-    int stall_retries = 0;
-    const int kMaxStallRetries = 10;  // Max consecutive stall recoveries without receiving data
-    const int kStallTimeoutSec = 30;  // Fallback: if no data for 30s, try new stream (END_STREAM recovery handles normal case)
-    bool got_response_headers = false;  // Did we receive HEADERS on active_stream_id_?
-    const int kNoResponseTimeoutSec = 5;  // If no response headers in 5s, retry
-
-    std::vector<uint8_t> grpc_msg_buf;
-    grpc_msg_buf.reserve(512 * 1024);
-    size_t grpc_consumed = 0;
-    size_t grpc_buf_size = 0;
-    uint32_t grpc_expected_len = 0;
-    bool grpc_header_parsed = false;
+    const int kPingIntervalSec = 15;
+    const int kMaxPingWithoutResponse = 3;
+    const int kMaxEndStreamRetries = 500;
+    const int kMaxStallRetries = 10;
+    const int kStallTimeoutSec = 30;
+    const int kNoResponseTimeoutSec = 5;
 
     while (streaming_ && connected_) {
+        // Check for pending IDR request (thread-safe)
+        if (idr_pending_.exchange(false)) {
+            if (!submit_idr_request()) {
+                LOGW("Failed to submit IDR request");
+            }
+        }
+
         fd_set readfds;
         FD_ZERO(&readfds);
         FD_SET(static_cast<socket_t>(sock_), &readfds);
@@ -538,356 +683,131 @@ void GrpcClient::streaming_loop() {
             connected_ = false;
             break;
         }
+
         if (sel == 0) {
             idle_count++;
 
-            // Send HTTP/2 PING to detect half-open connections when idle.
-            // This is critical for TCP devices where the connection can be silently
-            // dropped by NAT/firewall without any RST/FIN.
-            if (got_first_data && idle_count > 0 && (idle_count % (kPingIntervalSec * 2)) == 0) {
-                uint64_t ping_opaque = 0x6873637263707900ULL + static_cast<uint64_t>(ping_sent_count);
-                LOGI("Sending keepalive PING (idle=%ds, ping_sent=%d)", idle_count / 2, ping_sent_count + 1);
-                if (!send_ping(sock_, ping_opaque)) {
+            // Keepalive PING when idle
+            if (got_first_data_ && idle_count > 0 &&
+                (idle_count % (kPingIntervalSec * 2)) == 0) {
+                uint8_t opaque[8] = {0x68, 0x73, 0x63, 0x72, 0x63, 0x70, 0x79, 0x00};
+                opaque[7] = static_cast<uint8_t>(ping_sent_count_);
+                int ret = nghttp2_submit_ping(session_, NGHTTP2_FLAG_NONE, opaque);
+                if (ret != 0) {
+                    LOGW("nghttp2_submit_ping failed: %s", nghttp2_strerror(ret));
+                    connected_ = false;
+                    break;
+                }
+                if (!flush_nghttp2()) {
                     LOGW("Failed to send keepalive PING, connection is dead");
                     connected_ = false;
                     break;
                 }
-                ping_sent_count++;
-                ping_fail_count_.store(ping_sent_count);
-                if (ping_sent_count >= kMaxPingWithoutResponse) {
-                    LOGW("No response after %d keepalive PINGs (~%ds), connection is dead",
-                         ping_sent_count, ping_sent_count * kPingIntervalSec);
+                ping_sent_count_++;
+                ping_fail_count_.store(ping_sent_count_);
+                LOGI("Sent keepalive PING (idle=%ds, ping_sent=%d)", idle_count / 2, ping_sent_count_);
+
+                if (ping_sent_count_ >= kMaxPingWithoutResponse) {
+                    LOGW("No response after %d keepalive PINGs, connection is dead", ping_sent_count_);
                     connected_ = false;
                     break;
                 }
             }
 
-            // No response detection: if no HEADERS received on active stream within N seconds,
-            // the server is not processing our onStart request. Try opening a new stream.
-            if (!got_response_headers && idle_count >= kNoResponseTimeoutSec * 2) {
+            // No response headers timeout
+            if (!got_response_headers_ && idle_count >= kNoResponseTimeoutSec * 2) {
                 LOGW("No response headers on stream %u after %ds (retries=%d/%d)",
-                     active_stream_id_, kNoResponseTimeoutSec, end_stream_retries, kMaxEndStreamRetries);
-                if (end_stream_retries < kMaxEndStreamRetries) {
-                    end_stream_retries++;
-                    uint32_t new_stream_id = next_stream_id_;
-                    next_stream_id_ += 2;
-                    LOGI("Opening new stream %u for onStart (no response retry %d)", new_stream_id, end_stream_retries);
-                    if (send_onstart_request(new_stream_id)) {
-                        active_stream_id_ = new_stream_id;
-                        grpc_consumed = 0;
-                        grpc_buf_size = 0;
-                        grpc_header_parsed = false;
-                        grpc_expected_len = 0;
-                        bytes_received_on_stream = 0;
-                        idr_requested_ = false;
-                        idle_count = 0;
-                        got_response_headers = false;
-                        LOGI("New stream %u opened (no response retry), waiting for data", new_stream_id);
-                    } else {
-                        LOGW("Failed to open new stream, stopping");
-                        streaming_ = false;
-                        break;
-                    }
+                     active_stream_id_, kNoResponseTimeoutSec, end_stream_retries_, kMaxEndStreamRetries);
+                if (end_stream_retries_ < kMaxEndStreamRetries) {
+                    end_stream_retries_++;
+                    submit_onstart_request();
+                    LOGI("New stream %u opened (no response retry %d)", active_stream_id_, end_stream_retries_);
+                    idle_count = 0;
                 } else {
                     LOGW("Max no-response retries reached, stopping streaming");
                     streaming_ = false;
                     break;
                 }
             }
-            // Stream stall detection: if we've received data before but now no data for N seconds,
-            // the server has gone silent without sending END_STREAM. Try opening a new stream.
-            // Only trigger when PING keepalive is working — if PING is also failing, the PING
-            // loop above already handles the disconnect. Stall means: server is alive (PING OK)
-            // but not producing frames (uitest extension may have crashed on the device).
-            if (got_first_data && idle_count >= kStallTimeoutSec * 2 &&
-                ping_sent_count == 0) {
-                LOGW("Stream stalled: no data for %ds after first frame (stall_retries=%d/%d)",
-                     kStallTimeoutSec, stall_retries, kMaxStallRetries);
-                if (stall_retries < kMaxStallRetries) {
-                    stall_retries++;
-                    uint32_t new_stream_id = next_stream_id_;
-                    next_stream_id_ += 2;
-                    LOGI("Opening new stream %u after stall (retry %d)", new_stream_id, stall_retries);
-                    if (send_onstart_request(new_stream_id)) {
-                        active_stream_id_ = new_stream_id;
-                        grpc_consumed = 0;
-                        grpc_buf_size = 0;
-                        grpc_header_parsed = false;
-                        grpc_expected_len = 0;
-                        bytes_received_on_stream = 0;
-                        idr_requested_ = false;
-                        idle_count = 0;
-                        got_response_headers = false;
-                        got_first_data = false;  // Reset so stall detection doesn't re-trigger immediately
-                        LOGI("New stream %u opened after stall, waiting for data", new_stream_id);
-                        continue;
-                    } else {
-                        LOGW("Failed to open new stream after stall, stopping");
-                        streaming_ = false;
-                        break;
-                    }
+
+            // Stream stall detection
+            if (got_first_data_ && idle_count >= kStallTimeoutSec * 2 &&
+                ping_sent_count_ == 0) {
+                LOGW("Stream stalled: no data for %ds (stall_retries=%d/%d)",
+                     kStallTimeoutSec, stall_retries_, kMaxStallRetries);
+                if (stall_retries_ < kMaxStallRetries) {
+                    stall_retries_++;
+                    submit_onstart_request();
+                    got_first_data_ = false;
+                    idle_count = 0;
+                    LOGI("New stream %u opened after stall (retry %d)", active_stream_id_, stall_retries_);
+                    continue;
                 } else {
                     LOGW("Max stall retries reached, stopping streaming");
                     streaming_ = false;
                     break;
                 }
             }
-            // Idle timeout (fallback): if no data for the configured idle_timeout but
-            // PING keepalive is working, the server is alive but not producing frames.
-            // This catches cases where the uitest extension has crashed but the gRPC
-            // server is still responding. If PING is failing, the PING loop handles it.
-            if (got_first_data && idle_count >= idle_timeout_sec_ * 2 && ping_sent_count == 0) {
+
+            // Idle timeout
+            if (got_first_data_ && idle_count >= idle_timeout_sec_ * 2 && ping_sent_count_ == 0) {
                 LOGI("No data for %ds but PING alive, server stopped producing frames", idle_timeout_sec_);
                 connected_ = false;
                 break;
             }
             continue;
         }
+
+        // Data available
         idle_count = 0;
-        ping_sent_count = 0;
+        ping_sent_count_ = 0;
         ping_fail_count_.store(0);
 
         int n = ::recv(static_cast<socket_t>(sock_),
-                       reinterpret_cast<char *>(recv_buffer_.data() + buf_used),
-                       static_cast<int>(recv_buffer_.size() - buf_used), 0);
+                       reinterpret_cast<char *>(recv_buf_.data() + recv_used_),
+                       static_cast<int>(recv_buf_.size() - recv_used_), 0);
         if (n <= 0) {
             int err = WSAGetLastError();
-            LOGI("recv returned %d, wsa=%d, buf_used=%zu, exiting streaming loop", n, err, buf_used);
+            LOGI("recv returned %d, wsa=%d, recv_used=%zu, exiting streaming loop", n, err, recv_used_);
             connected_ = false;
             break;
         }
-        buf_used += n;
+        recv_used_ += n;
 
-        size_t pos = 0;
-        while (pos + 9 <= buf_used) {
-            uint32_t frame_len = (static_cast<uint32_t>(recv_buffer_[pos]) << 16) |
-                                 (static_cast<uint32_t>(recv_buffer_[pos + 1]) << 8) |
-                                 static_cast<uint32_t>(recv_buffer_[pos + 2]);
-            uint8_t frame_type = recv_buffer_[pos + 3];
-            uint8_t flags = recv_buffer_[pos + 4];
-            uint32_t stream_id = (static_cast<uint32_t>(recv_buffer_[pos + 5]) << 24) |
-                                 (static_cast<uint32_t>(recv_buffer_[pos + 6]) << 16) |
-                                 (static_cast<uint32_t>(recv_buffer_[pos + 7]) << 8) |
-                                 static_cast<uint32_t>(recv_buffer_[pos + 8]);
-            stream_id &= 0x7FFFFFFF;
-
-            size_t total = 9 + frame_len;
-            if (pos + total > buf_used) break;
-
-            // Log important HTTP2 frames only (END_STREAM, RST_STREAM, GOAWAY, SETTINGS)
-            if ((flags & 0x01) || frame_type == 0x03 || frame_type == 0x07) {
-                LOGI("HTTP2: type=%u flags=0x%02x stream=%u len=%u", frame_type, flags, stream_id, frame_len);
-            }
-
-            if (frame_type == 0x00) {
-                const uint8_t *payload = recv_buffer_.data() + pos + 9;
-                bytes_received_on_stream += frame_len;
-
-                if (stream_id == active_stream_id_) {
-                    if (!got_response_headers) {
-                        got_response_headers = true;
-                    }
-                    if (grpc_consumed > 0) {
-                        if (grpc_consumed < grpc_buf_size) {
-                            size_t remaining = grpc_buf_size - grpc_consumed;
-                            memmove(grpc_msg_buf.data(), grpc_msg_buf.data() + grpc_consumed, remaining);
-                            grpc_buf_size = remaining;
-                        } else {
-                            grpc_buf_size = 0;
-                        }
-                    }
-                    grpc_consumed = 0;
-                    size_t needed_size = grpc_buf_size + frame_len;
-                    if (needed_size > grpc_msg_buf.size()) {
-                        grpc_msg_buf.resize(needed_size);
-                    } else if (grpc_msg_buf.size() > 512 * 1024 && needed_size < grpc_msg_buf.size() / 2) {
-                        grpc_msg_buf.resize(needed_size);
-                    }
-                    memcpy(grpc_msg_buf.data() + grpc_buf_size, payload, frame_len);
-                    grpc_buf_size += frame_len;
-
-                    while (true) {
-                        size_t avail = grpc_buf_size - grpc_consumed;
-                        if (!grpc_header_parsed && avail >= 5) {
-                            const uint8_t *hdr = grpc_msg_buf.data() + grpc_consumed;
-                            grpc_expected_len = (static_cast<uint32_t>(hdr[1]) << 24) |
-                                                (static_cast<uint32_t>(hdr[2]) << 16) |
-                                                (static_cast<uint32_t>(hdr[3]) << 8) |
-                                                static_cast<uint32_t>(hdr[4]);
-                            grpc_header_parsed = true;
-                        }
-
-                        if (!grpc_header_parsed) break;
-
-                        size_t needed = 5 + grpc_expected_len;
-                        if (avail < needed) break;
-
-                        H264Ref h264_ref;
-                        if (extract_h264_ref_from_reply(grpc_msg_buf.data() + grpc_consumed + 5, grpc_expected_len, h264_ref)) {
-                            if (h264_ref.size > 0 && on_frame_) {
-                                on_frame_(h264_ref.data, h264_ref.size);
-                                got_first_data = true;
-                                consecutive_rst_on_idr = 0;
-                                end_stream_retries = 0;  // Data received, stream recovery working
-                                ping_sent_count = 0;  // Data flowing, no need for keepalive PING
-                                ping_fail_count_.store(0);
-                            }
-                        }
-
-                        grpc_consumed += needed;
-                        grpc_header_parsed = false;
-                        grpc_expected_len = 0;
-                    }
-                }
-
-                if (bytes_received_on_stream >= window_update_threshold) {
-                    send_window_update(sock_, stream_id, bytes_received_on_stream);
-                    send_window_update(sock_, 0, bytes_received_on_stream);
-                    bytes_received_on_stream = 0;
-                }
-
-                // Proactive WINDOW_UPDATE: send immediately after first DATA on active stream
-                // to signal the server we're consuming data. Some servers (uitest 5.0.1.2 on TCP)
-                // may stop streaming if they don't see WINDOW_UPDATE promptly.
-                if (stream_id == active_stream_id_ && bytes_received_on_stream > 0 &&
-                    bytes_received_on_stream < window_update_threshold) {
-                    send_window_update(sock_, stream_id, bytes_received_on_stream);
-                    send_window_update(sock_, 0, bytes_received_on_stream);
-                    bytes_received_on_stream = 0;
-                }
-
-                if (flags & 0x01) {
-                    if (stream_id == active_stream_id_) {
-                        LOGI("Server closed stream %u (END_STREAM), retries=%d/%d",
-                             active_stream_id_, end_stream_retries, kMaxEndStreamRetries);
-                        if (end_stream_retries < kMaxEndStreamRetries) {
-                            end_stream_retries++;
-                            uint32_t new_stream_id = next_stream_id_;
-                            next_stream_id_ += 2;
-                            LOGI("Opening new stream %u for onStart retry %d", new_stream_id, end_stream_retries);
-                            if (send_onstart_request(new_stream_id)) {
-                                active_stream_id_ = new_stream_id;
-                                grpc_consumed = 0;
-                                grpc_buf_size = 0;
-                                grpc_header_parsed = false;
-                                grpc_expected_len = 0;
-                                bytes_received_on_stream = 0;
-                                idr_requested_ = false;
-                                idle_count = 0;
-                                got_first_data = false;
-                                got_response_headers = false;
-                                LOGI("New stream %u opened, continuing streaming", new_stream_id);
-                            } else {
-                                LOGW("Failed to open new stream, stopping");
-                                streaming_ = false;
-                            }
-                        } else {
-                            LOGW("Max END_STREAM retries reached, stopping streaming");
-                            streaming_ = false;
-                        }
-                    }
-                }
-            } else if (frame_type == 0x01) {
-                if (stream_id == active_stream_id_) {
-                    if (!idr_requested_) {
-                        idr_requested_ = true;
-                    }
-                    if (!got_response_headers) {
-                        got_response_headers = true;
-                    }
-                    // gRPC trailers: HEADERS with END_STREAM flag closes the stream
-                    if (flags & 0x01) {
-                        LOGI("Server closed stream %u (trailers HEADERS with END_STREAM)", active_stream_id_);
-                        if (end_stream_retries < kMaxEndStreamRetries) {
-                            end_stream_retries++;
-                            uint32_t new_stream_id = next_stream_id_;
-                            next_stream_id_ += 2;
-                            LOGI("Opening new stream %u for onStart retry %d", new_stream_id, end_stream_retries);
-                            if (send_onstart_request(new_stream_id)) {
-                                active_stream_id_ = new_stream_id;
-                                grpc_consumed = 0;
-                                grpc_buf_size = 0;
-                                grpc_header_parsed = false;
-                                grpc_expected_len = 0;
-                                bytes_received_on_stream = 0;
-                                idr_requested_ = false;
-                                idle_count = 0;
-                                got_first_data = false;
-                                got_response_headers = false;
-                                LOGI("New stream %u opened after trailers, continuing streaming", new_stream_id);
-                            } else {
-                                LOGW("Failed to open new stream, stopping");
-                                streaming_ = false;
-                            }
-                        } else {
-                            LOGW("Max END_STREAM retries reached, stopping streaming");
-                            streaming_ = false;
-                        }
-                    }
-                }
-            } else if (frame_type == 0x04) {
-                if (!(flags & 0x01)) {
-                    auto s = parse_settings(recv_buffer_.data() + pos + 9, frame_len);
-                    server_window_size_ = s.initial_window_size;
-                    send_settings_ack(sock_);
-                }
-            } else if (frame_type == 0x06) {
-                if (!(flags & 0x01)) {
-                    // Server-initiated PING: send ACK
-                    send_ping_ack(sock_, recv_buffer_.data() + pos + 9);
-                } else {
-                    // PING ACK from our keepalive PING: connection is alive
-                    ping_sent_count = 0;
-                    ping_fail_count_.store(0);
-                    LOGI("Received PING ACK, connection alive");
-                }
-            } else if (frame_type == 0x07) {
-                LOGW("Received GOAWAY");
-                streaming_ = false;
-            } else if (frame_type == 0x03) {
-                LOGW("Received RST_STREAM on stream %u", stream_id);
-                if (stream_id == active_stream_id_) {
-                    streaming_ = false;
-                } else if (stream_id > 1 && (stream_id & 1)) {
-                    consecutive_rst_on_idr++;
-                    if (consecutive_rst_on_idr <= 2) {
-                        LOGI("RST_STREAM on client stream %u, retrying IDR (%d/2)", stream_id, consecutive_rst_on_idr);
-                        idr_requested_ = false;
-                        if (streaming_ && connected_) {
-                            request_idr_frame();
-                        }
-                    } else {
-                        LOGW("RST_STREAM on client stream %u, %d consecutive failures, stopping IDR retries",
-                             stream_id, consecutive_rst_on_idr);
-                    }
-                }
-            } else if (frame_type == 0x08) {
-            }
-
-            pos += total;
+        // Feed data to nghttp2
+        nghttp2_ssize processed = nghttp2_session_mem_recv2(session_,
+            recv_buf_.data(), recv_used_);
+        if (processed < 0) {
+            LOGE("nghttp2_session_mem_recv2 error: %s", nghttp2_strerror(static_cast<int>(processed)));
+            connected_ = false;
+            break;
         }
 
-        if (pos > 0) {
-            if (pos < buf_used) {
-                memmove(recv_buffer_.data(), recv_buffer_.data() + pos, buf_used - pos);
-            }
-            buf_used -= pos;
+        size_t consumed = static_cast<size_t>(processed);
+        if (consumed < recv_used_) {
+            memmove(recv_buf_.data(), recv_buf_.data() + consumed, recv_used_ - consumed);
+        }
+        recv_used_ -= consumed;
+
+        // Flush any pending nghttp2 output (WINDOW_UPDATE, PING ACK, etc.)
+        if (!flush_nghttp2()) {
+            connected_ = false;
+            break;
         }
 
-        // Grow recv buffer if nearly full (allow at least 64KB for next recv)
-        if (recv_buffer_.size() - buf_used < 64 * 1024) {
-            size_t new_size = recv_buffer_.size() * 2;
+        // Grow recv buffer if nearly full
+        if (recv_buf_.size() - recv_used_ < 64 * 1024) {
+            size_t new_size = recv_buf_.size() * 2;
             if (new_size > 4 * 1024 * 1024) new_size = 4 * 1024 * 1024;
-            if (new_size > recv_buffer_.size()) {
-                recv_buffer_.resize(new_size);
+            if (new_size > recv_buf_.size()) {
+                recv_buf_.resize(new_size);
             }
         }
     }
 
     streaming_ = false;
     LOGI("Streaming loop ended, got_data=%d, connected=%d, stall_retries=%d, end_stream_retries=%d",
-         got_first_data, (int)connected_.load(), stall_retries, end_stream_retries);
+         got_first_data_, (int)connected_.load(), stall_retries_, end_stream_retries_);
 }
 
 } // namespace hscrcpy
-

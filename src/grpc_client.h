@@ -6,6 +6,7 @@
 #include <ws2tcpip.h>
 #endif
 
+#include <nghttp2/nghttp2.h>
 #include <cstdint>
 #include <vector>
 #include <string>
@@ -15,12 +16,6 @@
 #include <mutex>
 
 namespace hscrcpy {
-
-struct GrpcReplyMessage {
-    std::string data;
-    int32_t reply_type = 0;
-    std::vector<uint8_t> raw_payload;
-};
 
 class GrpcClient {
 public:
@@ -40,11 +35,32 @@ public:
     void set_idle_timeout_sec(int sec) { idle_timeout_sec_ = sec; }
 
 private:
-    bool send_grpc_request(const std::string &path, const std::vector<uint8_t> &payload);
-    bool recv_grpc_response();
-    bool parse_reply_message(const uint8_t *data, size_t size, GrpcReplyMessage &msg);
     void streaming_loop();
-    bool send_onstart_request(uint32_t stream_id);
+    bool submit_onstart_request();
+    bool submit_idr_request();
+    bool flush_nghttp2();
+    void reset_grpc_parser();
+
+    // nghttp2 callbacks
+    static nghttp2_ssize send_callback(nghttp2_session *session, const uint8_t *data,
+                                        size_t length, int flags, void *user_data);
+    static int on_begin_headers_callback(nghttp2_session *session,
+                                          const nghttp2_frame *frame, void *user_data);
+    static int on_header_callback(nghttp2_session *session,
+                                   const nghttp2_frame *frame,
+                                   const uint8_t *name, size_t namelen,
+                                   const uint8_t *value, size_t valuelen,
+                                   uint8_t flags, void *user_data);
+    static int on_data_chunk_recv_callback(nghttp2_session *session,
+                                            uint8_t flags,
+                                            int32_t stream_id,
+                                            const uint8_t *data, size_t len,
+                                            void *user_data);
+    static int on_stream_close_callback(nghttp2_session *session,
+                                         int32_t stream_id,
+                                         uint32_t error_code, void *user_data);
+    static int on_frame_recv_callback(nghttp2_session *session,
+                                       const nghttp2_frame *frame, void *user_data);
 
     int sock_ = -1;
     std::string connected_host_;
@@ -54,15 +70,42 @@ private:
     std::thread stream_thread_;
     std::function<void(const uint8_t *, size_t)> on_frame_;
     std::mutex mutex_;
-    std::vector<uint8_t> recv_buffer_;
-    std::vector<uint8_t> leftover_buf_;
-    uint32_t server_window_size_ = 65535;
-    bool idr_requested_ = false;
-    uint32_t next_stream_id_ = 3;
+
+    // nghttp2 session
+    nghttp2_session *session_ = nullptr;
+
+    // Connection handshake
+    bool settings_ack_received_ = false;
+
+    // Stream management
     uint32_t active_stream_id_ = 1;
+    uint32_t next_stream_id_ = 3;
+    std::atomic<bool> idr_pending_{false};
+
+    // gRPC message parser state (per active stream)
+    std::vector<uint8_t> grpc_msg_buf_;
+    size_t grpc_consumed_ = 0;
+    size_t grpc_buf_size_ = 0;
+    uint32_t grpc_expected_len_ = 0;
+    bool grpc_header_parsed_ = false;
+
+    // Network buffers
+    std::vector<uint8_t> recv_buf_;
+    size_t recv_used_ = 0;
+    std::vector<uint8_t> send_buf_;
+
+    // Streaming state
+    bool got_first_data_ = false;
+    bool got_response_headers_ = false;
+    int end_stream_retries_ = 0;
+    int stall_retries_ = 0;
+    int consecutive_rst_on_idr_ = 0;
+
+    // Keepalive / idle detection
     int idle_timeout_sec_ = 300;
-    static constexpr int kPingFailThreshold = 2;  // Early warning: 2 unanswered PINGs
+    static constexpr int kPingFailThreshold = 2;
     std::atomic<int> ping_fail_count_{0};
+    int ping_sent_count_ = 0;
 };
 
 } // namespace hscrcpy

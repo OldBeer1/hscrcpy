@@ -84,6 +84,38 @@ else()
     endif()
 endif()
 
+# ============================================
+# nghttp2 (HTTP/2 framing for gRPC client)
+# ============================================
+set(NGHTTP2_ROOT "$ENV{MSYS2_ROOT}" CACHE PATH "MSYS2 root")
+if(NOT NGHTTP2_ROOT)
+    foreach(p "C:/msys64" "D:/msys64" "C:/tools/msys64" "D:/tools/msys64")
+        if(EXISTS "${p}/ucrt64/lib/libnghttp2.a")
+            set(NGHTTP2_ROOT "${p}")
+            break()
+        endif()
+    endforeach()
+endif()
+
+if(NGHTTP2_ROOT AND EXISTS "${NGHTTP2_ROOT}/ucrt64/lib/libnghttp2.a")
+    set(NGHTTP2_INCLUDE "${NGHTTP2_ROOT}/ucrt64/include")
+    set(NGHTTP2_LIB "${NGHTTP2_ROOT}/ucrt64/lib/libnghttp2.a")
+    message(STATUS "nghttp2: ${NGHTTP2_LIB}")
+else()
+    # Fallback: try pkg-config
+    find_package(PkgConfig)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(NGHTTP2 nghttp2)
+    endif()
+    if(NOT NGHTTP2_FOUND)
+        message(FATAL_ERROR "nghttp2 not found. Install: pacman -S mingw-w64-ucrt-x86_64-nghttp2")
+    endif()
+endif()
+
+target_include_directories(hscrcpy PRIVATE ${NGHTTP2_INCLUDE})
+target_compile_definitions(hscrcpy PRIVATE NGHTTP2_STATICLIB)
+target_link_libraries(hscrcpy "${NGHTTP2_LIB}")
+
 message(STATUS "FFmpeg: OK (${AVCODEC_LIB})")
 
 # ============================================
