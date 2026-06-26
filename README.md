@@ -6,13 +6,15 @@ Windows 端鸿蒙设备投屏控制工具，Base On [HOScrcpy](https://gitcode.com/OpenHarmo
 
 ## 功能特性
 
-- **H264 实时投屏**：通过 gRPC 虚拟屏流 + FFmpeg 硬解，低延迟实时画面
+- **H264 实时投屏**：通过 gRPC 虚拟屏流 + nghttp2 + FFmpeg 硬解，低延迟实时画面
 - **JPEG 快照回退**：无 FFmpeg 时自动降级为 `snapshot_display` 模式（~2 FPS）
 - **Direct2D 渲染**：优先使用 D2D 硬件加速渲染，GDI 回退；零拷贝解码 + 帧池复用
 - **UI 布局检查**：实时查看设备 UI 组件树，点击节点高亮定位，支持搜索/刷新/展开，可拖拽分割线调整面板
-- **触控反控**：点击、长按、滑动、鼠标滚轮
+- **触控反控**：点击、长按、滑动、鼠标滚轮；双通道 touchUp 保证释放；鼠标拖出画面自动释放
 - **键盘输入**：英文/数字通过 `uinput` keyEvent 映射，中文通过 `uitest uiInput inputText` 输入
 - **剪贴板粘贴**：Ctrl+V 将 Windows 剪贴板内容输入到手机
+- **文件管理器**：浏览设备文件系统，支持上传/下载/删除/新建目录
+- **云手机模拟面板**：电池状态注入、GNSS 模拟定位，支持 CPH 云手机自动检测
 - **多实例**：支持同时打开多个 hscrcpy 窗口，分别连接不同设备
 - **USB / TCP 连接**：支持 USB 直连和 WiFi 无线连接
 - **参数配置**：独立 USB/TCP 编码参数（缩放、码率、帧率），INI 持久化存储
@@ -28,14 +30,14 @@ Windows 端鸿蒙设备投屏控制工具，Base On [HOScrcpy](https://gitcode.com/OpenHarmo
 │  │  │ D2D/GDI  │ │ FFmpeg   │ │  HDC Wrapper      │  │  │
 │  │  │ Render   │ │ H264     │ │  devices/forward  │  │  │
 │  │  │ Layout   │ │ Decode   │ │  shell/push       │  │  │
-│  │  │ Input    │ │          │ │                    │  │  │
+│  │  │ Input    │ │ nghttp2  │ │                    │  │  │
 │  │  └────┬─────┘ └────┬─────┘ └────────┬──────────┘  │  │
 │  │       │            │                │              │  │
 │  │  ┌────┴────────────┴────────────────┴──────────┐   │  │
 │  │  │            ScreenCapture                     │   │  │
 │  │  │  ┌──────────────┐  ┌─────────────────────┐  │   │  │
 │  │  │  │ gRPC Stream  │  │ Snapshot Fallback   │  │   │  │
-│  │  │  │ (H264)       │  │ (JPEG/GDI+)         │  │   │  │
+│  │  │  │ (nghttp2)    │  │ (JPEG/GDI+)         │  │   │  │
 │  │  │  └──────────────┘  └─────────────────────┘  │   │  │
 │  │  └─────────────────────────────────────────────┘   │  │
 │  └────────────────────────────────────────────────────┘  │
@@ -69,6 +71,7 @@ Windows 端鸿蒙设备投屏控制工具，Base On [HOScrcpy](https://gitcode.com/OpenHarmo
 
 - Windows 10/11
 - [MSYS2](https://www.msys2.org/) + MinGW-w64 工具链
+- **nghttp2**（构建脚本自动安装，用于 gRPC HTTP/2 协议）
 - **FFmpeg 7.x**（可选，用于 H264 硬解，无 FFmpeg 时自动降级 JPEG 快照模式）
 
 ### 编译
@@ -151,6 +154,8 @@ hscrcpy.exe -s 192.168.1.100:5555
 |------|------|
 | ⚙ Settings | 打开参数设置（缩放、码率、帧率、端口等） |
 | 📐 Layout | 打开/关闭 UI 布局检查面板 |
+| 📁 Files | 打开/关闭文件管理器面板 |
+| ☁ CPH | 打开/关闭云手机模拟面板（电池/GNSS） |
 | Back | 返回键 |
 | Home | 主页键 |
 | Recent | 最近任务键 |
@@ -165,18 +170,21 @@ hscrcpy/
 ├── src/                    # 源代码
 │   ├── main.cpp            # Win32 GUI 主程序
 │   ├── screen_capture.cpp  # 投屏核心（gRPC 流 / 快照回退）
-│   ├── grpc_client.cpp     # HTTP/2 + gRPC 客户端（无第三方依赖）
+│   ├── grpc_client.cpp     # nghttp2 + gRPC 客户端
 │   ├── h264_decoder.cpp    # FFmpeg H264 解码（条件编译）
 │   ├── jpeg_decoder.cpp    # GDI+ JPEG 解码（回退模式）
-│   ├── input_injector.cpp  # 输入注入（uitest socket / shell）
+│   ├── input_injector.cpp  # 输入注入（uitest socket / shell，异步队列）
 │   ├── hdc_wrapper.cpp     # HDC 命令封装
 │   ├── layout_window.cpp   # UI 布局检查面板（TreeView + ListView）
+│   ├── file_manager_window.cpp  # 文件管理器面板
+│   ├── cph_window.cpp      # 云手机模拟面板（电池/GNSS）
 │   ├── config.cpp          # INI 配置读写
 │   ├── cli.cpp             # 命令行参数解析
 │   └── window_renderer.cpp # Win32 窗口渲染（备用）
 ├── common/                 # 公共头文件
 │   ├── protocol.h          # 协议常量、端口定义
 │   ├── log.h               # 日志宏
+│   ├── net_util.h          # 网络工具（TCP keepalive 等）
 │   └── version.h           # 版本号
 ├── res/                    # 资源文件
 │   ├── settings_icon.png   # 设置按钮图标
@@ -197,7 +205,7 @@ hscrcpy/
 
 1. 通过 `hdc shell` 推送并启动 uitest 扩展（`libscreen_casting.z.so`）
 2. 扩展创建 VirtualScreen，绑定 H264 编码器，通过 gRPC SERVER_STREAMING 推流
-3. 客户端通过 `hdc fport` 端口转发连接 gRPC，接收 H264 裸帧
+3. 客户端通过 `hdc fport` 端口转发连接 gRPC，nghttp2 处理 HTTP/2 帧解析，接收 H264 裸帧
 4. FFmpeg 解码为 BGRA，Direct2D 硬件加速渲染（GDI StretchDIBits 回退）
 
 ### 渲染管线
@@ -217,7 +225,11 @@ hscrcpy/
 ### 输入注入
 
 - **Socket 模式**（低延迟）：通过 uitest agent 的 JSON socket 协议发送 touchDown/touchMove/touchUp
-- **Shell 模式**（回退）：通过 `hdc shell uitest uiInput` 命令发送
+- **Shell 模式**（回退）：通过 `hdc shell uinput` 命令发送，所有 socket 方法均有 shell fallback
+- **双通道 touchUp**：touchUp 同时走 socket（快速）和 shell（保证送达），避免手指卡住
+- **异步队列**：所有注入方法通过 task_queue 异步执行，不阻塞 UI 线程
+- **16ms 限流**：touchMove 事件限流至 ~60Hz，避免队列积压
+- **鼠标离开画面自动释放**：拖拽超出画面区域时自动发送 touchUp
 - **键盘映射**：Windows 虚拟键码 → HarmonyOS 键码，通过 `uinput -K` 发送 keyEvent
 - **中文输入**：IME committed text 通过 `uitest uiInput inputText` 发送
 
@@ -238,6 +250,7 @@ hscrcpy/
 - [HOScrcpy](https://gitcode.com/OpenHarmonyToolkitsPlaza/HOScrcpy) — 鸿蒙投屏工具SDK
 - [scrcpy](https://github.com/Genymobile/scrcpy/) — Android 投屏工具，架构设计参考
 - [FFmpeg](https://ffmpeg.org) — H264 视频解码
+- [nghttp2](https://nghttp2.org) — HTTP/2 协议实现
 
 ## License
 
