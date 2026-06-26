@@ -60,8 +60,8 @@ bool H264Decoder::init() {
         return false;
     }
 
-    int hw_threads = static_cast<int>(std::thread::hardware_concurrency());
-    codec_ctx_->thread_count = (std::max)(1, (std::min)(hw_threads / 4, 4));
+    // Limit to 2 threads per instance — multiple hscrcpy instances share the CPU
+    codec_ctx_->thread_count = 2;
     codec_ctx_->thread_type = FF_THREAD_SLICE;
 
     if (avcodec_open2(codec_ctx_, codec, nullptr) < 0) {

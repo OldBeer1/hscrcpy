@@ -545,9 +545,16 @@ static bool is_local_port_free(uint16_t port) {
 }
 
 bool ScreenCapture::setup_port_forward() {
-    hdc_.cleanup_stale_forwards();
+    // Don't broad-clean forwards — other instances may be using them.
+    // Only our own forwards will be cleaned on exit via HdcWrapper destructor.
 
-    for (uint16_t base = AppConfig::instance().local_base_port; base < AppConfig::instance().local_base_port + AppConfig::instance().local_port_range; base += 2) {
+    // Add random offset (0-50, even) to base port to reduce collision when
+    // multiple instances start simultaneously against different devices
+    srand(static_cast<unsigned>(GetCurrentProcessId() ^ GetTickCount()));
+    uint16_t random_offset = (rand() % 26) * 2;  // 0,2,4,...,50
+
+    for (uint16_t base = AppConfig::instance().local_base_port + random_offset;
+         base < AppConfig::instance().local_base_port + AppConfig::instance().local_port_range; base += 2) {
         if (!is_local_port_free(base) || !is_local_port_free(base + 1)) continue;
 
         local_video_port_ = base;
@@ -939,7 +946,13 @@ void ScreenCapture::grpc_stream_loop() {
 
     while (running_) {
         while (running_ && grpc_client_.is_connected() && grpc_client_.is_streaming_active()) {
-            Sleep(100);
+            // Wait for frame event with 500ms timeout — event-driven when frames arrive,
+            // timeout fallback for health checks. Much less CPU than Sleep(100) polling.
+            if (frame_event_) {
+                WaitForSingleObject(frame_event_, 500);
+            } else {
+                Sleep(500);
+            }
 
             // If PING keepalive is failing, break out to trigger reconnection
             if (grpc_client_.is_ping_failing()) {
@@ -947,10 +960,10 @@ void ScreenCapture::grpc_stream_loop() {
                 break;
             }
 
-            // Periodically check hdc reachability for TCP devices (~every 10s)
+            // Periodically check hdc reachability for TCP devices (~every 5s)
             if (hdc_.is_tcp()) {
                 hdc_check_counter++;
-                if (hdc_check_counter >= 100) {
+                if (hdc_check_counter >= 10) {
                     hdc_check_counter = 0;
                     if (!hdc_.is_device_reachable()) {
                         // Device may have reconnected with new port, try to find it

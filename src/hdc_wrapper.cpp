@@ -16,9 +16,9 @@ HdcWrapper::HdcWrapper(const std::string &serial,
     : serial_(serial), ip_(ip), port_(port) {}
 
 HdcWrapper::~HdcWrapper() {
-    // Clean up our fport forwards on exit to avoid stale residue
-    if (is_tcp()) {
-        cleanup_stale_forwards({});
+    // Only clean up our own forwards, never broad-clean (would kill other instances)
+    if (!our_forward_ports_.empty()) {
+        cleanup_stale_forwards(our_forward_ports_);
     }
 }
 
@@ -362,6 +362,7 @@ bool HdcWrapper::forward_tcp(uint16_t local_port, uint16_t remote_port) {
     int ret = run_process(build_hdc_cmd(subcmd), &result, 10000);
     bool ok = (ret == 0) && (result.find("OK") != std::string::npos) && (result.find("Fail") == std::string::npos);
     LOGD("forward_tcp result: %s (ret=%d, ok=%s)", result.c_str(), ret, ok ? "true" : "false");
+    if (ok) register_forward_port(local_port);
     return ok;
 }
 
@@ -372,6 +373,7 @@ bool HdcWrapper::forward_localabstract(uint16_t local_port, const std::string &s
     int ret = run_process(build_hdc_cmd(subcmd), &result, 10000);
     bool ok = (ret == 0) && (result.find("OK") != std::string::npos) && (result.find("Fail") == std::string::npos);
     LOGD("forward_localabstract result: %s (ret=%d, ok=%s)", result.c_str(), ret, ok ? "true" : "false");
+    if (ok) register_forward_port(local_port);
     return ok;
 }
 
@@ -438,6 +440,10 @@ int HdcWrapper::forward_count() {
         if (line.find("tcp:") != std::string::npos) count++;
     }
     return count;
+}
+
+void HdcWrapper::register_forward_port(uint16_t port) {
+    our_forward_ports_.push_back(port);
 }
 
 bool HdcWrapper::cleanup_stale_forwards(const std::vector<uint16_t> &our_ports) {

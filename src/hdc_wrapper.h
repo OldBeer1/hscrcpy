@@ -36,6 +36,7 @@ public:
     bool forward_remove_all();
     int forward_count();
     bool cleanup_stale_forwards(const std::vector<uint16_t> &our_ports = {});
+    void register_forward_port(uint16_t port);
     bool shell_command(const std::string &cmd, std::string *output = nullptr, int timeout_sec = 30);
     bool push_file(const std::string &local_path, const std::string &remote_path, std::string *output = nullptr);
     bool pull_file(const std::string &remote_path, const std::string &local_path, std::string *output = nullptr);
@@ -55,6 +56,7 @@ private:
     std::string serial_;
     std::string ip_;
     std::string port_;
+    std::vector<uint16_t> our_forward_ports_;  // Track our own forward ports for safe cleanup
 };
 
 } // namespace hscrcpy
