@@ -116,7 +116,22 @@ if ($Clean) {
 }
 
 # ============================================================
-# Step 5: Check FFmpeg (optional, for H264 decoding)
+# Step 5: Check nghttp2 (required for gRPC HTTP/2)
+# ============================================================
+$nghttp2Lib = "$mingwDir\lib\libnghttp2.a"
+if (-not (Test-Path $nghttp2Lib)) {
+    Write-Step "Installing nghttp2 via MSYS2..."
+    $exitCode = Invoke-MSYS2 "pacman -S --noconfirm ${mingwPkgPrefix}-nghttp2"
+    if ($exitCode -ne 0) {
+        Write-Err "nghttp2 installation failed (exit code: $exitCode).`nPlease run: pacman -S ${mingwPkgPrefix}-nghttp2"
+    }
+    Write-Ok "nghttp2 installed"
+} else {
+    Write-Ok "nghttp2: $nghttp2Lib"
+}
+
+# ============================================================
+# Step 6: Check FFmpeg (optional, for H264 decoding)
 # ============================================================
 $ffmpegRoot = $env:FFMPEG_DIR
 if (-not $ffmpegRoot) {
@@ -134,7 +149,7 @@ if ($ffmpegRoot) {
 }
 
 # ============================================================
-# Step 6: Configure (CMake)
+# Step 7: Configure (CMake)
 # ============================================================
 Write-Step "CMake configure..."
 
@@ -149,7 +164,7 @@ if ($LASTEXITCODE -ne 0) { Write-Err "CMake configuration failed!" }
 Write-Ok "CMake configured"
 
 # ============================================================
-# Step 7: Build
+# Step 8: Build
 # ============================================================
 Write-Step "Building..."
 & $cmake --build build -j
@@ -157,7 +172,7 @@ if ($LASTEXITCODE -ne 0) { Write-Err "Build failed!" }
 Write-Ok "Build successful"
 
 # ============================================================
-# Step 8: Copy runtime files
+# Step 9: Copy runtime files
 # ============================================================
 Write-Step "Copying runtime files..."
 
