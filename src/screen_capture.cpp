@@ -13,7 +13,6 @@ namespace hscrcpy {
 ScreenCapture::ScreenCapture(HdcWrapper &hdc, const CaptureConfig &config)
     : hdc_(hdc), config_(config) {
     auto &ac = AppConfig::instance();
-    max_h264_queue_size_ = ac.max_h264_queue;
     max_grpc_reconnect_ = ac.max_grpc_reconnect;
     char exe_path[MAX_PATH];
     GetModuleFileNameA(NULL, exe_path, MAX_PATH);
@@ -701,7 +700,6 @@ bool ScreenCapture::start() {
         }
         pool_idx_ = 0;
         if (!frame_event_) frame_event_ = CreateEventA(NULL, FALSE, FALSE, NULL);
-        decode_thread_ = std::thread(&ScreenCapture::decode_loop, this);
         thread_ = std::thread(&ScreenCapture::grpc_stream_loop, this);
 
         uint64_t frames_before = frame_count_.load();
@@ -751,8 +749,6 @@ bool ScreenCapture::start() {
 
 void ScreenCapture::stop() {
     running_ = false;
-    h264_queue_cv_.notify_all();
-    if (decode_thread_.joinable()) decode_thread_.join();
     if (thread_.joinable()) thread_.join();
 
     grpc_client_.disconnect();
@@ -886,14 +882,47 @@ void ScreenCapture::grpc_stream_loop() {
 
     auto on_frame = [this](const uint8_t *data, size_t size) {
         got_stream_data_ = true;
-        {
-            std::lock_guard<std::mutex> lock(h264_queue_mutex_);
-            if (h264_queue_.size() >= max_h264_queue_size_) {
-                h264_queue_.pop_front();
+
+        // Zero-copy decode: decode directly from the nghttp2 receive buffer.
+        // The H264 parser (av_parser_parse2) copies data internally, so the
+        // nghttp2 buffer can be freed after decode() returns.
+        bool ok = decoder_.decode(data, size);
+        if (!ok) {
+            if (size > 100) {
+                LOGW("Decode fail (%zu bytes): %02x %02x %02x %02x %02x %02x %02x %02x",
+                     size, data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
             }
-            h264_queue_.push_back(std::make_shared<std::vector<uint8_t>>(data, data + size));
+            return;
         }
-        h264_queue_cv_.notify_one();
+
+        auto &img = decoder_.image();
+        if (img.width == 0 || img.height == 0) return;
+
+        // Save dimensions before swap (swap moves data out of decoder's image_)
+        uint32_t w = img.width, h = img.height;
+
+        // Swap decoded frame to frame pool (zero-copy buffer swap)
+        auto &frame = frame_pool_[pool_idx_];
+        if (frame.use_count() > 1) {
+            frame = std::make_shared<DecodedImage>();
+        }
+        std::swap(*frame, decoder_.image_ref());
+        decoder_.rebind_rgb_pointer();
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            latest_frame_ = frame;
+        }
+        pool_idx_ = (pool_idx_ + 1) % 3;
+
+        if (w != width_.load() || h != height_.load()) {
+            width_ = w;
+            height_ = h;
+            LOGI("Screen resolution changed: %ux%u", w, h);
+        }
+        frame_count_++;
+        if (frame_event_) SetEvent(frame_event_);
+        if (notify_hwnd_) PostMessageA(notify_hwnd_, kMsgFrameRender, 0, 0);
     };
 
     if (!grpc_client_.start_streaming(on_frame)) {
@@ -1008,125 +1037,12 @@ void ScreenCapture::grpc_stream_loop() {
     grpc_client_.stop_streaming();
     reconnecting_ = false;
     running_ = false;
-    h264_queue_cv_.notify_all();
     LOGI("gRPC stream loop ended, frames: %llu", (unsigned long long)frame_count_.load());
 
     // Notify UI that streaming has stopped (connection lost or max retries exceeded)
     if (notify_hwnd_) {
         PostMessageA(notify_hwnd_, kMsgStreamEnded, 0, 0);
     }
-}
-
-static bool is_idr_frame(const uint8_t *data, size_t size) {
-    // Scan for H264 NAL start codes and check for IDR (type 5)
-    size_t pos = 0;
-    while (pos + 3 < size) {
-        if (data[pos] == 0 && data[pos + 1] == 0) {
-            if (data[pos + 2] == 1) {
-                // 3-byte start code: 0x00 0x00 0x01
-                if (pos + 3 < size) {
-                    uint8_t nal_type = data[pos + 3] & 0x1F;
-                    if (nal_type == 5) return true;  // IDR
-                    if (nal_type == 1) return false;  // Non-IDR slice (P/B frame)
-                }
-                pos += 4;
-                continue;
-            }
-            if (pos + 4 < size && data[pos + 2] == 0 && data[pos + 3] == 1) {
-                // 4-byte start code: 0x00 0x00 0x00 0x01
-                uint8_t nal_type = data[pos + 4] & 0x1F;
-                if (nal_type == 5) return true;  // IDR
-                if (nal_type == 1) return false;  // Non-IDR slice (P/B frame)
-                pos += 5;
-                continue;
-            }
-        }
-        pos++;
-    }
-    return false;
-}
-
-void ScreenCapture::decode_loop() {
-    LOGI("Decode loop started");
-
-    int total_packets = 0;
-    while (running_) {
-        std::shared_ptr<std::vector<uint8_t>> h264_data;
-        {
-            std::unique_lock<std::mutex> lock(h264_queue_mutex_);
-            h264_queue_cv_.wait(lock, [this] {
-                return !h264_queue_.empty() || !running_;
-            });
-            if (!running_ && h264_queue_.empty()) break;
-            if (h264_queue_.empty()) continue;
-
-            // Frame skip: when queue is backlogged, skip to the latest IDR frame
-            if (h264_queue_.size() > 3) {
-                ssize_t target = -1;
-                for (ssize_t i = static_cast<ssize_t>(h264_queue_.size()) - 1; i >= 0; i--) {
-                    if (is_idr_frame(h264_queue_[i]->data(), h264_queue_[i]->size())) {
-                        target = i;
-                        break;
-                    }
-                }
-                if (target > 0) {
-                    LOGI("Frame skip: dropping %zu queued frames, jumping to IDR at index %zd",
-                         static_cast<size_t>(target), target);
-                    h264_queue_.erase(h264_queue_.begin(), h264_queue_.begin() + target);
-                } else if (h264_queue_.size() > 5) {
-                    // No IDR found but queue is very backlogged - drop all, request new IDR
-                    LOGI("Frame skip: no IDR found, dropping %zu queued frames, requesting IDR",
-                         h264_queue_.size());
-                    h264_queue_.clear();
-                    grpc_client_.request_idr_frame();
-                    continue;
-                }
-            }
-
-            h264_data = std::move(h264_queue_.front());
-            h264_queue_.pop_front();
-        }
-
-        total_packets++;
-        bool ok = decoder_.decode(h264_data->data(), h264_data->size());
-        if (ok) {
-            auto &img = decoder_.image();
-            if (img.width > 0 && img.height > 0) {
-                uint32_t w = img.width, h = img.height;
-
-                // Use pre-allocated frame pool to avoid per-frame make_shared
-                auto &frame = frame_pool_[pool_idx_];
-                // If the pool slot is still held by the UI thread, fall back to make_shared
-                if (frame.use_count() > 1) {
-                    frame = std::make_shared<DecodedImage>();
-                }
-                std::swap(*frame, decoder_.image_ref());
-                // After swap, decoder's internal frame_rgb_ pointer is stale - rebind it
-                decoder_.rebind_rgb_pointer();
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    latest_frame_ = frame;
-                }
-                pool_idx_ = (pool_idx_ + 1) % 3;
-                if (w != width_.load() || h != height_.load()) {
-                    width_ = w;
-                    height_ = h;
-                    LOGI("Screen resolution changed: %ux%u", width_.load(), height_.load());
-                }
-                frame_count_++;
-                if (frame_event_) SetEvent(frame_event_);
-                if (notify_hwnd_) PostMessageA(notify_hwnd_, kMsgFrameRender, 0, 0);
-            }
-        } else {
-            static int decode_fail_count = 0;
-            if (++decode_fail_count <= 3) {
-                LOGW("H264 decode failed (%zu bytes)", h264_data->size());
-            }
-        }
-    }
-
-    LOGI("Decode loop ended (total_packets=%d, frames_decoded=%llu)",
-         total_packets, (unsigned long long)frame_count_.load());
 }
 
 bool ScreenCapture::capture_one_snapshot() {

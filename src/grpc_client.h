@@ -13,9 +13,11 @@
 #include <functional>
 #include <atomic>
 #include <thread>
-#include <mutex>
+#include <chrono>
 
 namespace hscrcpy {
+
+struct H264Ref { const uint8_t *data; size_t size; };
 
 class GrpcClient {
 public:
@@ -41,26 +43,15 @@ private:
     bool flush_nghttp2();
     void reset_grpc_parser();
 
-    // nghttp2 callbacks
-    static nghttp2_ssize send_callback(nghttp2_session *session, const uint8_t *data,
-                                        size_t length, int flags, void *user_data);
-    static int on_begin_headers_callback(nghttp2_session *session,
-                                          const nghttp2_frame *frame, void *user_data);
-    static int on_header_callback(nghttp2_session *session,
-                                   const nghttp2_frame *frame,
-                                   const uint8_t *name, size_t namelen,
-                                   const uint8_t *value, size_t valuelen,
-                                   uint8_t flags, void *user_data);
-    static int on_data_chunk_recv_callback(nghttp2_session *session,
-                                            uint8_t flags,
-                                            int32_t stream_id,
-                                            const uint8_t *data, size_t len,
-                                            void *user_data);
-    static int on_stream_close_callback(nghttp2_session *session,
-                                         int32_t stream_id,
-                                         uint32_t error_code, void *user_data);
-    static int on_frame_recv_callback(nghttp2_session *session,
-                                       const nghttp2_frame *frame, void *user_data);
+    // nghttp2 callbacks — only nghttp2_submit_* calls, no flush/send
+    static int on_begin_headers_callback(nghttp2_session *, const nghttp2_frame *, void *);
+    static int on_header_callback(nghttp2_session *, const nghttp2_frame *,
+                                   const uint8_t *, size_t, const uint8_t *, size_t,
+                                   uint8_t, void *);
+    static int on_data_chunk_recv_callback(nghttp2_session *, uint8_t,
+                                            int32_t, const uint8_t *, size_t, void *);
+    static int on_stream_close_callback(nghttp2_session *, int32_t, uint32_t, void *);
+    static int on_frame_recv_callback(nghttp2_session *, const nghttp2_frame *, void *);
 
     int sock_ = -1;
     std::string connected_host_;
@@ -69,43 +60,37 @@ private:
     std::atomic<bool> streaming_{false};
     std::thread stream_thread_;
     std::function<void(const uint8_t *, size_t)> on_frame_;
-    std::mutex mutex_;
 
-    // nghttp2 session
+    // nghttp2 session (accessed only from streaming thread + connect/disconnect)
     nghttp2_session *session_ = nullptr;
 
     // Connection handshake
-    bool settings_ack_received_ = false;
+    bool settings_received_ = false;
 
-    // Stream management
-    uint32_t active_stream_id_ = 1;
-    uint32_t next_stream_id_ = 3;
+    // Stream tracking
+    int32_t active_stream_id_ = -1;
+    int32_t last_idr_stream_id_ = -1;
     std::atomic<bool> idr_pending_{false};
 
-    // gRPC message parser state (per active stream)
+    // gRPC parser state (active stream only)
     std::vector<uint8_t> grpc_msg_buf_;
-    size_t grpc_consumed_ = 0;
-    size_t grpc_buf_size_ = 0;
-    uint32_t grpc_expected_len_ = 0;
-    bool grpc_header_parsed_ = false;
-
-    // Network buffers
-    std::vector<uint8_t> recv_buf_;
-    size_t recv_used_ = 0;
-    std::vector<uint8_t> send_buf_;
+    size_t grpc_buf_size_ = 0;    // logical size (may differ from vector.size())
+    bool got_response_headers_ = false;
 
     // Streaming state
     bool got_first_data_ = false;
-    bool got_response_headers_ = false;
     int end_stream_retries_ = 0;
-    int stall_retries_ = 0;
     int consecutive_rst_on_idr_ = 0;
 
     // Keepalive / idle detection
     int idle_timeout_sec_ = 300;
     static constexpr int kPingFailThreshold = 2;
     std::atomic<int> ping_fail_count_{0};
-    int ping_sent_count_ = 0;
+    bool ping_ack_received_ = false;  // Set by PING ACK callback, checked by streaming loop
+
+    // FPS counter (debug)
+    int frame_count_ = 0;
+    std::chrono::steady_clock::time_point fps_start_;
 };
 
 } // namespace hscrcpy

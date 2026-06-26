@@ -20,7 +20,6 @@
 #include "log.h"
 #include "version.h"
 #include <cmath>
-#include <chrono>
 #include <cstdio>
 #include <memory>
 #include <algorithm>
@@ -78,8 +77,6 @@ static int TOOLBAR_H = 68;
 static bool g_snapshot_warned = false;
 
 static bool g_mouse_down = false;
-static uint32_t g_drag_start_x = 0, g_drag_start_y = 0;
-static auto g_last_click_time = std::chrono::steady_clock::now();
 
 static CaptureConfig g_capture_config;
 static uint32_t g_device_screen_w = 0, g_device_screen_h = 0;
@@ -106,6 +103,7 @@ static ID2D1Factory *g_d2d_factory = nullptr;
 static ID2D1HwndRenderTarget *g_d2d_rt = nullptr;
 static ID2D1Bitmap *g_d2d_bitmap = nullptr;
 static bool g_d2d_available = false;
+static bool g_d2d_bitmap_current = false;  // true when bitmap matches latest g_cur_frame
 static uint32_t g_d2d_bmp_w = 0, g_d2d_bmp_h = 0;
 
 // Cached D2D brushes for layout highlight overlay
@@ -130,6 +128,7 @@ static void cleanup_d2d() {
     if (g_d2d_rt) { g_d2d_rt->Release(); g_d2d_rt = nullptr; }
     if (g_d2d_factory) { g_d2d_factory->Release(); g_d2d_factory = nullptr; }
     g_d2d_available = false;
+    g_d2d_bitmap_current = false;
     g_d2d_bmp_w = 0;
     g_d2d_bmp_h = 0;
 }
@@ -639,39 +638,58 @@ static HdcDevice get_selected_device() {
     return g_devices[sel];
 }
 
-static std::pair<uint32_t, uint32_t> canvas_to_screen(int wx, int wy) {
-    if (g_screen_w == 0 || g_screen_h == 0) return {0, 0};
+// Shared layout calculation: compute the drawn image rect within the canvas
+struct CanvasLayout {
+    int draw_w, draw_h, off_x, off_y;
+};
+
+static CanvasLayout calc_canvas_layout() {
+    CanvasLayout lay = {0, 0, 0, 0};
+    if (g_screen_w == 0 || g_screen_h == 0) return lay;
     RECT rc;
     GetClientRect(g_canvas_hwnd, &rc);
     int cw = rc.right, ch = rc.bottom;
-    if (cw <= 0 || ch <= 0) return {0, 0};
+    if (cw <= 0 || ch <= 0) return lay;
 
     double aspect = (double)g_screen_w / g_screen_h;
-    int draw_w, draw_h;
     if ((double)cw / ch > aspect) {
-        draw_h = ch;
-        draw_w = (int)(ch * aspect);
+        lay.draw_h = ch;
+        lay.draw_w = (int)(ch * aspect);
     } else {
-        draw_w = cw;
-        draw_h = (int)(cw / aspect);
+        lay.draw_w = cw;
+        lay.draw_h = (int)(cw / aspect);
     }
-    if (draw_w == cw - 1) draw_w = cw;
-    if (draw_h == ch - 1) draw_h = ch;
-    int off_x = (cw - draw_w) / 2;
-    int off_y = (ch - draw_h) / 2;
+    if (lay.draw_w == cw - 1) lay.draw_w = cw;
+    if (lay.draw_h == ch - 1) lay.draw_h = ch;
+    lay.off_x = (cw - lay.draw_w) / 2;
+    lay.off_y = (ch - lay.draw_h) / 2;
+    return lay;
+}
 
-    int rel_x = wx - off_x;
-    int rel_y = wy - off_y;
+// Check if canvas coordinates (wx, wy) are within the rendered image area
+static bool is_inside_canvas_image(int wx, int wy) {
+    auto lay = calc_canvas_layout();
+    if (lay.draw_w == 0) return false;
+    return wx >= lay.off_x && wx <= lay.off_x + lay.draw_w &&
+           wy >= lay.off_y && wy <= lay.off_y + lay.draw_h;
+}
+
+static std::pair<uint32_t, uint32_t> canvas_to_screen(int wx, int wy) {
+    auto lay = calc_canvas_layout();
+    if (lay.draw_w == 0) return {0, 0};
+
+    int rel_x = wx - lay.off_x;
+    int rel_y = wy - lay.off_y;
     if (rel_x < 0) rel_x = 0;
     if (rel_y < 0) rel_y = 0;
-    if (rel_x > draw_w) rel_x = draw_w;
-    if (rel_y > draw_h) rel_y = draw_h;
+    if (rel_x > lay.draw_w) rel_x = lay.draw_w;
+    if (rel_y > lay.draw_h) rel_y = lay.draw_h;
 
     uint32_t phy_w = g_screen_w * g_capture_config.scale;
     uint32_t phy_h = g_screen_h * g_capture_config.scale;
 
-    return {static_cast<uint32_t>(rel_x * phy_w / draw_w),
-            static_cast<uint32_t>(rel_y * phy_h / draw_h)};
+    return {static_cast<uint32_t>(rel_x * phy_w / lay.draw_w),
+            static_cast<uint32_t>(rel_y * phy_h / lay.draw_h)};
 }
 
 static WNDPROC g_canvas_orig_wndproc = nullptr;
@@ -824,20 +842,10 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         // Try Direct2D rendering path
         if (g_d2d_available && ensure_d2d_render_target()) {
-            std::lock_guard<std::mutex> lock(g_frame_mutex);
-            if (g_cur_frame && !g_cur_frame->data.empty() && g_cur_frame->width > 0) {
-                upload_frame_to_d2d(*g_cur_frame);
-            } else if (g_d2d_bitmap) {
-                // No frame: release bitmap so DrawBitmap won't paint stale data
-                g_d2d_bitmap->Release();
-                g_d2d_bitmap = nullptr;
-                g_d2d_bmp_w = 0;
-                g_d2d_bmp_h = 0;
-            }
-
+            // Bitmap upload happens in try_update_frame(); just draw here
             g_d2d_rt->BeginDraw();
             g_d2d_rt->Clear(D2D1::ColorF(0.12f, 0.12f, 0.12f));
-            if (g_d2d_bitmap) {
+            if (g_d2d_bitmap && g_d2d_bitmap_current) {
                 double aspect = (double)g_d2d_bmp_w / g_d2d_bmp_h;
                 int draw_w, draw_h, off_x, off_y;
                 if ((double)cw / ch > aspect) {
@@ -895,7 +903,7 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             HRESULT hr = g_d2d_rt->EndDraw();
             if (FAILED(hr)) {
                 LOGW("D2D EndDraw failed (hr=0x%08X)", (unsigned)hr);
-                if (g_d2d_bitmap) { g_d2d_bitmap->Release(); g_d2d_bitmap = nullptr; g_d2d_bmp_w = 0; g_d2d_bmp_h = 0; }
+                if (g_d2d_bitmap) { g_d2d_bitmap->Release(); g_d2d_bitmap = nullptr; g_d2d_bitmap_current = false; g_d2d_bmp_w = 0; g_d2d_bmp_h = 0; }
                 if (g_d2d_hl_fill) { g_d2d_hl_fill->Release(); g_d2d_hl_fill = nullptr; }
                 if (g_d2d_hl_border) { g_d2d_hl_border->Release(); g_d2d_hl_border = nullptr; }
                 g_d2d_rt->Release();
@@ -988,16 +996,13 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ERASEBKGND:
         return 1;
     case WM_LBUTTONDOWN: {
-        LOGI("Canvas WM_LBUTTONDOWN");
         if (g_mirroring && g_input) {
             HWND prev = SetFocus(hwnd);
             LOGI("SetFocus to canvas: hwnd=%p, prev=%p, err=%d", hwnd, prev, GetLastError());
             POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             auto [x, y] = canvas_to_screen(pt.x, pt.y);
             g_mouse_down = true;
-            g_drag_start_x = x; g_drag_start_y = y;
             g_last_touch_x = x; g_last_touch_y = y;
-            g_last_click_time = std::chrono::steady_clock::now();
             g_input->queue_touch_down(x, y);
             SetCapture(hwnd);
         }
@@ -1006,6 +1011,13 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_MOUSEMOVE: {
         if (g_mouse_down && g_mirroring && g_input) {
             POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            // Mouse left the image area — auto touchUp
+            if (!is_inside_canvas_image(pt.x, pt.y)) {
+                g_mouse_down = false;
+                ReleaseCapture();
+                g_input->queue_touch_up(g_last_touch_x, g_last_touch_y);
+                return 0;
+            }
             auto [x, y] = canvas_to_screen(pt.x, pt.y);
             int dx = (int)x - (int)g_last_touch_x;
             int dy = (int)y - (int)g_last_touch_y;
@@ -1023,18 +1035,7 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             ReleaseCapture();
             POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             auto [x, y] = canvas_to_screen(pt.x, pt.y);
-            auto elapsed = std::chrono::steady_clock::now() - g_last_click_time;
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-            int dx = static_cast<int>(x) - static_cast<int>(g_drag_start_x);
-            int dy = static_cast<int>(y) - static_cast<int>(g_drag_start_y);
-            if (dx * dx + dy * dy >= 100) {
-                g_input->queue_touch_up(x, y);
-            } else if (ms > 500) {
-                g_input->queue_touch_up(x, y);
-                g_input->inject_long_click(x, y);
-            } else {
-                g_input->queue_touch_up(x, y);
-            }
+            g_input->queue_touch_up(x, y);
         }
         return 0;
     }
@@ -1141,8 +1142,21 @@ static void try_update_frame() {
                 g_screen_h = img->height;
                 PostMessageA(g_hwnd, kMsgLayoutUpdate, 0, 0);
             }
-            std::lock_guard<std::mutex> lock(g_frame_mutex);
-            g_cur_frame = std::move(img);
+            {
+                std::lock_guard<std::mutex> lock(g_frame_mutex);
+                g_cur_frame = std::move(img);
+                g_d2d_bitmap_current = false;
+            }
+
+            // Upload to D2D bitmap now (once per new frame, on UI thread)
+            if (g_d2d_available && ensure_d2d_render_target()) {
+                std::lock_guard<std::mutex> lock(g_frame_mutex);
+                if (g_cur_frame && !g_cur_frame->data.empty() && g_cur_frame->width > 0) {
+                    upload_frame_to_d2d(*g_cur_frame);
+                    g_d2d_bitmap_current = true;
+                }
+            }
+
             g_last_rendered_seq = fc;
             InvalidateRect(g_canvas_hwnd, NULL, FALSE);
 
@@ -1185,6 +1199,14 @@ static void stop_mirroring() {
     {
         std::lock_guard<std::mutex> lock(g_frame_mutex);
         g_cur_frame.reset();
+        g_d2d_bitmap_current = false;
+    }
+    // Release D2D bitmap so WM_PAINT paints black, not stale frame
+    if (g_d2d_bitmap) {
+        g_d2d_bitmap->Release();
+        g_d2d_bitmap = nullptr;
+        g_d2d_bmp_w = 0;
+        g_d2d_bmp_h = 0;
     }
 
     {
@@ -1332,7 +1354,7 @@ static void start_mirroring(const std::string &serial, const std::string &ip = "
         }
 
         HANDLE evt = g_capture->frame_event();
-        for (int i = 0; i < 150 && g_capture->width() == 0; i++) {
+        for (int i = 0; i < 300 && g_capture->width() == 0; i++) {
             if (evt) {
                 WaitForSingleObject(evt, 100);
             } else {
@@ -1510,6 +1532,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         refresh_devices();
         break;
     }
+    case WM_LBUTTONUP:
+        // Fallback: if mouse was down on canvas but BUTTONUP arrived at main
+        // window instead (e.g. SetCapture lost capture), still send touchUp
+        if (g_mouse_down && g_mirroring && g_input) {
+            g_mouse_down = false;
+            ReleaseCapture();
+            g_input->queue_touch_up(g_last_touch_x, g_last_touch_y);
+            return 0;
+        }
+        break;
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case ID_COMBO:

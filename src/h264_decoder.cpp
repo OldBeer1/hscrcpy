@@ -144,7 +144,7 @@ bool H264Decoder::decode(const uint8_t *h264_data, size_t h264_size) {
         int send_ret = avcodec_send_packet(codec_ctx_, pkt_);
         if (send_ret < 0 && send_ret != AVERROR(EAGAIN)) {
             static int send_fail_count = 0;
-            if (++send_fail_count <= 5) {
+            if (++send_fail_count <= 10) {
                 LOGW("avcodec_send_packet error ret=%d pkt_size=%d", send_ret, pkt_->size);
             }
             continue;
@@ -237,6 +237,76 @@ bool H264Decoder::decode(const uint8_t *h264_data, size_t h264_size) {
             image_.stride = frame_rgb_->linesize[0];
             // No memcpy needed - data is already in image_.data
             got_frame = true;
+        }
+    }
+
+    // Flush the H264 parser: when SPS/PPS and IDR arrive as separate gRPC messages,
+    // the parser buffers them and waits for the next access unit boundary before
+    // emitting a packet. If the screen is static (no more frames), the buffered
+    // SPS+PPS+IDR is never output. Flushing forces the parser to emit any remaining
+    // buffered data so the first frame can be decoded immediately.
+    if (!got_frame) {
+        av_packet_unref(pkt_);
+        int ret = av_parser_parse2(parser_ctx_, codec_ctx_,
+                                    &pkt_->data, &pkt_->size,
+                                    nullptr, 0,
+                                    AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+        if (ret >= 0 && pkt_->size > 0) {
+            int send_ret = avcodec_send_packet(codec_ctx_, pkt_);
+            if (send_ret >= 0 || send_ret == AVERROR(EAGAIN)) {
+                while (true) {
+                    int recv_ret = avcodec_receive_frame(codec_ctx_, frame_);
+                    if (recv_ret != 0) break;
+                    int w = codec_ctx_->coded_width;
+                    int h = codec_ctx_->coded_height;
+                    int fmt = codec_ctx_->pix_fmt;
+                    int display_w = frame_->width;
+                    int display_h = frame_->height;
+                    if (w <= 0 || h <= 0) continue;
+
+                    bool need_realloc = !sws_initialized_ ||
+                        (last_width_ != w || last_height_ != h || last_pix_fmt_ != fmt);
+                    bool pointer_stale = sws_initialized_ &&
+                        (frame_rgb_->data[0] != image_.data.data() ||
+                         image_.data.size() < static_cast<size_t>(rgb_buf_size_));
+
+                    if (pointer_stale && !need_realloc) {
+                        image_.data.resize(rgb_buf_size_);
+                        av_image_fill_arrays(frame_rgb_->data, frame_rgb_->linesize,
+                                             image_.data.data(), AV_PIX_FMT_BGRA,
+                                             last_width_, last_height_, 1);
+                    }
+
+                    if (need_realloc) {
+                        if (sws_ctx_) { sws_freeContext(sws_ctx_); sws_ctx_ = nullptr; }
+                        int buf_size = av_image_get_buffer_size(AV_PIX_FMT_BGRA, w, h, 1);
+                        if (buf_size < 0) break;
+                        size_t needed = static_cast<size_t>(buf_size);
+                        if (image_.data.capacity() < needed) image_.data.reserve(needed);
+                        image_.data.resize(needed);
+                        av_image_fill_arrays(frame_rgb_->data, frame_rgb_->linesize,
+                                             image_.data.data(), AV_PIX_FMT_BGRA, w, h, 1);
+                        sws_ctx_ = sws_getContext(w, h, static_cast<AVPixelFormat>(fmt),
+                                                  w, h, AV_PIX_FMT_BGRA,
+                                                  SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+                        if (!sws_ctx_) break;
+                        sws_initialized_ = true;
+                        last_width_ = w;
+                        last_height_ = h;
+                        last_pix_fmt_ = fmt;
+                        rgb_buf_size_ = needed;
+                        LOGI("Decoder(flush): %dx%d pix_fmt=%d rgb_buf=%zu", w, h, fmt, rgb_buf_size_);
+                    }
+
+                    sws_scale(sws_ctx_,
+                              frame_->data, frame_->linesize, 0, h,
+                              frame_rgb_->data, frame_rgb_->linesize);
+                    image_.width = static_cast<uint32_t>(display_w);
+                    image_.height = static_cast<uint32_t>(display_h);
+                    image_.stride = frame_rgb_->linesize[0];
+                    got_frame = true;
+                }
+            }
         }
     }
 

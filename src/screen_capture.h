@@ -22,8 +22,6 @@
 #include <thread>
 #include <functional>
 #include <memory>
-#include <condition_variable>
-#include <deque>
 
 namespace hscrcpy {
 
@@ -82,7 +80,6 @@ private:
     std::string build_extension_cmd() const;
     void kill_uitest_extension();
     void grpc_stream_loop();
-    void decode_loop();
     void snapshot_loop();
     bool capture_one_snapshot();
 
@@ -94,17 +91,11 @@ private:
 
     std::atomic<bool> running_{false};
     std::thread thread_;
-    std::thread decode_thread_;
     std::mutex mutex_;
     std::shared_ptr<DecodedImage> latest_frame_;
     std::atomic<uint64_t> frame_count_{0};
     std::atomic<bool> got_stream_data_{false};
     HANDLE frame_event_ = nullptr;
-
-    std::mutex h264_queue_mutex_;
-    std::condition_variable h264_queue_cv_;
-    std::deque<std::shared_ptr<std::vector<uint8_t>>> h264_queue_;
-    size_t max_h264_queue_size_ = 10;
 
     GrpcClient grpc_client_;
     H264Decoder decoder_;

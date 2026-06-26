@@ -49,7 +49,6 @@ public:
     bool inject_reboot();
 
 private:
-    bool send_json_command(const std::string &json);
     bool send_to_socket(const std::string &json);
     bool setup_control_port();
     bool push_agent_so();
@@ -71,11 +70,13 @@ private:
     std::atomic<uint32_t> last_touch_x_{0};
     std::atomic<uint32_t> last_touch_y_{0};
 
+    std::chrono::steady_clock::time_point last_move_time_;
     std::queue<std::function<void()>> task_queue_;
     std::mutex task_mutex_;
     std::condition_variable task_cv_;
     std::atomic<bool> task_running_{false};
     std::thread task_thread_;
+
 };
 
 } // namespace hscrcpy
