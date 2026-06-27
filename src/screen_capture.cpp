@@ -387,6 +387,9 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
     // Reusing a stale extension leads to gRPC connection succeeding but
     // receiving no frames (the extension accepts TCP but doesn't stream).
     // The uitest daemon itself is never killed — only the extension process.
+    // Note: the extension does NOT support multiple concurrent gRPC clients —
+    // each onStart is immediately closed with grpc-status=0 if another client
+    // is already streaming. So we must kill the existing one first.
     if (extension_running && !pids.empty()) {
         LOGI("Killing existing uitest extension (%zu process(es))", pids.size());
         std::string kill_cmd = "kill -9";
