@@ -12,6 +12,7 @@
 #include <sstream>
 #include <algorithm>
 #include <set>
+#include <fstream>
 
 // Check if shell command output contains error indicators.
 // hdc shell returns exit code 0 even when the inner command fails,
@@ -168,10 +169,18 @@ bool FileManagerWindow::show_input_dialog(const wchar_t *title, const wchar_t *p
 
 static std::wstring utf8_to_wide(const std::string &s) {
     if (s.empty()) return L"";
-    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, NULL, 0);
-    if (len <= 0) return L"";
-    std::wstring ws(len - 1, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &ws[0], len);
+    // First try UTF-8 conversion (handles embedded NUL by using length)
+    int len = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), NULL, 0);
+    if (len > 0) {
+        std::wstring ws(len, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &ws[0], len);
+        return ws;
+    }
+    // Fallback: byte-by-byte mapping (for binary/non-UTF-8 content)
+    std::wstring ws;
+    ws.reserve(s.size());
+    for (unsigned char c : s)
+        ws += (wchar_t)c;
     return ws;
 }
 
@@ -271,6 +280,12 @@ static HICON load_icon_file(const char *rel_path, int size,
     return icon;
 }
 
+// Replace a button's icon, destroying the previous one to avoid GDI leaks
+static void set_btn_icon(HWND btn, HICON new_ico) {
+    HICON prev = (HICON)SendMessageW(btn, BM_SETIMAGE, IMAGE_ICON, (LPARAM)new_ico);
+    if (prev) DestroyIcon(prev);
+}
+
 // ── Statics ──────────────────────────────────────────────
 
 HWND FileManagerWindow::g_hwnd = nullptr;
@@ -287,6 +302,7 @@ HWND FileManagerWindow::g_delete_btn = nullptr;
 HWND FileManagerWindow::g_copy_btn = nullptr;
 HWND FileManagerWindow::g_paste_btn = nullptr;
 HWND FileManagerWindow::g_rename_btn = nullptr;
+HWND FileManagerWindow::g_selectall_btn = nullptr;
 HWND FileManagerWindow::g_file_list = nullptr;
 HWND FileManagerWindow::g_status_label = nullptr;
 HINSTANCE FileManagerWindow::g_inst = nullptr;
@@ -297,6 +313,8 @@ std::string FileManagerWindow::g_current_dir;
 std::vector<FileEntry> FileManagerWindow::g_entries;
 std::vector<std::string> FileManagerWindow::g_history;
 FileClipboard FileManagerWindow::g_clipboard;
+std::string FileManagerWindow::g_select_after_refresh;
+bool FileManagerWindow::g_check_mode = false;
 
 FileManagerWindow::OnShellCommand FileManagerWindow::g_on_shell;
 FileManagerWindow::OnPushFile FileManagerWindow::g_on_push;
@@ -304,9 +322,6 @@ FileManagerWindow::OnPullFile FileManagerWindow::g_on_pull;
 FileManagerWindow::OnBusy FileManagerWindow::g_on_busy;
 bool FileManagerWindow::g_busy = false;
 
-HICON FileManagerWindow::g_icon_folder = nullptr;
-HICON FileManagerWindow::g_icon_file = nullptr;
-HICON FileManagerWindow::g_icon_link = nullptr;
 HIMAGELIST FileManagerWindow::g_img_list = nullptr;
 HWND FileManagerWindow::g_toast_hwnd = nullptr;
 
@@ -359,7 +374,7 @@ static LRESULT CALLBACK CustomMsgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         int client_h = text_h + 12 + btn_row_h;  // 12px top margin before text
         int max_client_h = GetSystemMetrics(SM_CYSCREEN) - nc_h - 80;  // leave margin
         if (client_h > max_client_h) client_h = max_client_h;
-        if (client_h < 80) client_h = 80;
+        if (client_h < 100) client_h = 100;
 
         // Adjust window rect: client_h -> total dlg_h
         RECT adj = {0, 0, dlg_w, client_h};
@@ -493,9 +508,22 @@ static bool show_custom_dialog(const std::wstring &title, const std::wstring &te
 
 // ── Text viewer dialog ──────────────────────────────────
 
+// Forward declarations for functions defined later in this file
+static std::string get_download_dir();
+static std::string shell_escape(const std::string &s);
+static std::string wide_to_utf8(const std::wstring &ws);
+
 struct TextViewerData {
     std::wstring title;
-    std::wstring content;  // already \r\n converted
+    std::wstring content;     // already \r\n converted
+    std::string remote_path;  // full device path for save-back (empty = read-only)
+    bool editable;            // true = show Save button, EDIT is writable
+};
+
+// Text viewer control IDs
+enum TvCtrlId : int {
+    TV_EDIT = 4001,
+    TV_SAVE_BTN = 4002,
 };
 
 static LRESULT CALLBACK TextViewerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -510,51 +538,139 @@ static LRESULT CALLBACK TextViewerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         HFONT hf = CreateFontW(15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                                 0, 0, CLEARTYPE_QUALITY, 0, L"Consolas");
 
-        // Full-size read-only EDIT control
         RECT rc;
         GetClientRect(hwnd, &rc);
-        HWND edit = CreateWindowExW(0, L"EDIT", data->content.c_str(),
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
-            ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_LEFT,
-            0, 0, rc.right, rc.bottom - 36, hwnd, (HMENU)4001, cs->hInstance, NULL);
+
+        // EDIT control — editable or read-only based on data->editable
+        DWORD edit_style = WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
+                           ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_LEFT;
+        if (!data->editable) edit_style |= ES_READONLY;
+        HWND edit = CreateWindowExW(0, L"EDIT", L"", edit_style,
+            0, 0, rc.right, rc.bottom - 36, hwnd, (HMENU)TV_EDIT, cs->hInstance, NULL);
         SendMessageW(edit, WM_SETFONT, (WPARAM)hf, TRUE);
+        // Allow large text (default EDIT limit is ~32K)
+        SendMessageW(edit, EM_SETLIMITTEXT, 0, 0);
+        SetWindowTextW(edit, data->content.c_str());
 
-        // Close button
-        CreateWindowW(L"BUTTON", L"Close",
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
-            rc.right / 2 - 40, rc.bottom - 32, 80, 26, hwnd, (HMENU)IDOK, cs->hInstance, NULL);
-        SendMessageW(GetDlgItem(hwnd, IDOK), WM_SETFONT, (WPARAM)hf, TRUE);
+        if (data->editable) {
+            // [Save] [Close] buttons
+            int bw = 80, gap = 8;
+            int total = bw * 2 + gap;
+            int x1 = rc.right / 2 - total / 2;
+            CreateWindowW(L"BUTTON", L"Save",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                x1, rc.bottom - 32, bw, 26, hwnd, (HMENU)TV_SAVE_BTN, cs->hInstance, NULL);
+            CreateWindowW(L"BUTTON", L"Close",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                x1 + bw + gap, rc.bottom - 32, bw, 26, hwnd, (HMENU)IDOK, cs->hInstance, NULL);
+            SendMessageW(GetDlgItem(hwnd, TV_SAVE_BTN), WM_SETFONT, (WPARAM)hf, TRUE);
+            SendMessageW(GetDlgItem(hwnd, IDOK), WM_SETFONT, (WPARAM)hf, TRUE);
+        } else {
+            // Read-only: just [Close] button
+            CreateWindowW(L"BUTTON", L"Close",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
+                rc.right / 2 - 40, rc.bottom - 32, 80, 26, hwnd, (HMENU)IDOK, cs->hInstance, NULL);
+            SendMessageW(GetDlgItem(hwnd, IDOK), WM_SETFONT, (WPARAM)hf, TRUE);
+        }
 
-        // Delete the font when dialog closes (store as prop)
+        // Store font and dirty flag as window props
         SetPropW(hwnd, L"tv_font", (HANDLE)hf);
+        SetPropW(hwnd, L"tv_dirty", (HANDLE)FALSE);
         return 0;
     }
     case WM_SIZE: {
         RECT rc;
         GetClientRect(hwnd, &rc);
-        HWND edit = GetDlgItem(hwnd, 4001);
-        HWND btn = GetDlgItem(hwnd, IDOK);
+        HWND edit = GetDlgItem(hwnd, TV_EDIT);
         if (edit) MoveWindow(edit, 0, 0, rc.right, rc.bottom - 36, TRUE);
-        if (btn) MoveWindow(btn, rc.right / 2 - 40, rc.bottom - 32, 80, 26, TRUE);
+        if (data && data->editable) {
+            int bw = 80, gap = 8;
+            int total = bw * 2 + gap;
+            int x1 = rc.right / 2 - total / 2;
+            HWND save_btn = GetDlgItem(hwnd, TV_SAVE_BTN);
+            HWND close_btn = GetDlgItem(hwnd, IDOK);
+            if (save_btn) MoveWindow(save_btn, x1, rc.bottom - 32, bw, 26, TRUE);
+            if (close_btn) MoveWindow(close_btn, x1 + bw + gap, rc.bottom - 32, bw, 26, TRUE);
+        } else {
+            HWND btn = GetDlgItem(hwnd, IDOK);
+            if (btn) MoveWindow(btn, rc.right / 2 - 40, rc.bottom - 32, 80, 26, TRUE);
+        }
         return 0;
     }
-    case WM_COMMAND:
-        if (LOWORD(wp) == IDOK)
+    case WM_COMMAND: {
+        int id = LOWORD(wp);
+        int code = HIWORD(wp);
+        if (id == TV_EDIT && code == EN_CHANGE) {
+            // Mark dirty on any edit
+            SetPropW(hwnd, L"tv_dirty", (HANDLE)TRUE);
+            return 0;
+        }
+        if (id == TV_SAVE_BTN) {
+            // Save edited content back to device
+            if (!data || data->remote_path.empty()) return 0;
+
+            HWND edit = GetDlgItem(hwnd, TV_EDIT);
+            int len = GetWindowTextLengthW(edit);
+            std::wstring wtext(len, L'\0');
+            GetWindowTextW(edit, &wtext[0], len + 1);
+
+            // Convert \r\n → \n, wide → UTF-8
+            std::wstring cleaned;
+            cleaned.reserve(wtext.size());
+            for (size_t i = 0; i < wtext.size(); i++) {
+                if (wtext[i] == L'\r' && i + 1 < wtext.size() && wtext[i + 1] == L'\n')
+                    continue;  // skip \r, keep \n
+                cleaned += wtext[i];
+            }
+            std::string utf8 = wide_to_utf8(cleaned);
+
+            // Write to local temp file
+            std::string local_tmp = get_download_dir() + ".hscrcpy_edit_tmp";
+            {
+                std::ofstream ofs(local_tmp, std::ios::binary | std::ios::trunc);
+                if (!ofs) {
+                    MessageBoxW(hwnd, L"Cannot write temp file.", L"Save Failed", MB_OK | MB_ICONERROR);
+                    return 0;
+                }
+                ofs.write(utf8.data(), utf8.size());
+            }
+
+            // Post save request to file manager WndProc (which has access to g_on_shell etc.)
+            auto *save_data = new std::pair<std::string, std::string>(
+                std::move(local_tmp), data->remote_path);
+            PostMessageW(s_fm_hwnd_for_dialog, WM_USER + 211, (WPARAM)hwnd, (LPARAM)save_data);
+
+            // Disable Save button while saving
+            EnableWindow(GetDlgItem(hwnd, TV_SAVE_BTN), FALSE);
+            return 0;
+        }
+        if (id == IDOK)
             PostMessageW(hwnd, WM_CLOSE, 0, 0);
         return 0;
-    case WM_CLOSE:
+    }
+    case WM_CLOSE: {
+        // Check dirty state — ask to discard if unsaved
+        BOOL dirty = (BOOL)(LONG_PTR)GetPropW(hwnd, L"tv_dirty");
+        if (dirty) {
+            int r = MessageBoxW(hwnd, L"Discard unsaved changes?", L"Confirm",
+                                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+            if (r != IDYES) return 0;  // stay open
+        }
         DestroyWindow(hwnd);
         return 0;
+    }
     case WM_DESTROY: {
         HFONT hf = (HFONT)GetPropW(hwnd, L"tv_font");
         if (hf) { DeleteObject(hf); RemovePropW(hwnd, L"tv_font"); }
+        RemovePropW(hwnd, L"tv_dirty");
         break;
     }
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-static void show_text_viewer(const std::wstring &title, const std::wstring &content) {
+static void show_text_viewer(const std::wstring &title, const std::wstring &content,
+                              const std::string &remote_path = "", bool editable = true) {
     static bool reg = false;
     if (!reg) {
         WNDCLASSEXW wc = {};
@@ -571,6 +687,8 @@ static void show_text_viewer(const std::wstring &title, const std::wstring &cont
     TextViewerData data;
     data.title = title;
     data.content = content;
+    data.remote_path = remote_path;
+    data.editable = editable && !remote_path.empty();
 
     // Center on file manager panel
     RECT orr = {};
@@ -592,15 +710,19 @@ static void show_text_viewer(const std::wstring &title, const std::wstring &cont
     ShowWindow(dlg, SW_SHOW);
     UpdateWindow(dlg);
 
-    // Modal message loop
+    // Modal message loop — don't use IsDialogMessageW so that
+    // Enter key goes to the EDIT control instead of being swallowed
     MSG m;
     while (IsWindow(dlg) && GetMessageW(&m, NULL, 0, 0)) {
         if (!IsWindow(dlg)) break;
         if (m.message == WM_QUIT) { PostQuitMessage((int)m.wParam); break; }
-        if (!IsDialogMessageW(dlg, &m)) {
-            TranslateMessage(&m);
-            DispatchMessageW(&m);
+        // Intercept Esc key to close the text viewer dialog
+        if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE && IsWindow(dlg)) {
+            PostMessageW(dlg, WM_CLOSE, 0, 0);
+            continue;
         }
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
     }
 }
 
@@ -670,6 +792,7 @@ void FileManagerWindow::show(OnShellCommand on_shell, OnPushFile on_push, OnPull
 }
 
 void FileManagerWindow::hide() {
+    if (g_check_mode) exit_select_mode();
     if (g_hwnd) ShowWindow(g_hwnd, SW_HIDE);
 }
 
@@ -777,17 +900,138 @@ void FileManagerWindow::go_back() {
     }
 }
 
+// ── File type classification ─────────────────────────────
+
+enum FileCategory { kText, kImage, kBinary, kOther };
+
+static FileCategory get_file_category(const std::string &name) {
+    // Handle .z.so double extension first
+    if (name.size() > 5 && name.compare(name.size() - 5, 5, ".z.so") == 0) return kBinary;
+
+    auto dot_pos = name.rfind('.');
+    if (dot_pos == std::string::npos) return kOther;  // no extension → sniff content later
+    std::string ext = name.substr(dot_pos + 1);
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+    static const std::set<std::string> text_exts = {
+        "txt", "log", "cfg", "conf", "ini", "json", "xml", "yaml", "yml", "toml",
+        "md", "csv", "html", "htm", "css", "js", "ts", "py", "sh", "bat", "cmd",
+        "c", "cpp", "h", "hpp", "java", "kt", "rs", "go", "rb", "php", "sql",
+        "properties", "gradle", "cmake", "makefile", "gitignore", "dockerfile",
+        "rc", "reg", "inf", "prop", "version", "cert", "pem", "csr",
+        "map", "plist", "pro", "mk", "am"
+    };
+    static const std::set<std::string> image_exts = {
+        "jpg", "jpeg", "png", "gif", "bmp", "webp", "ico", "svg", "tiff", "tif"
+    };
+    static const std::set<std::string> binary_exts = {
+        "so", "o", "a", "bin", "dex", "jar", "apk", "hap", "db", "sqlite",
+        "proto", "pb", "elf", "ko", "dat", "pak"
+    };
+
+    if (text_exts.count(ext)) return kText;
+    if (image_exts.count(ext)) return kImage;
+    if (binary_exts.count(ext)) return kBinary;
+    return kOther;
+}
+
+// Sniff file content to determine if it's text or binary.
+// Reads first 512 bytes and checks for null bytes (binary indicator).
+static FileCategory sniff_content_category(const std::string &content) {
+    size_t check_len = (std::min)(content.size(), (size_t)512);
+    if (check_len == 0) return kText;  // empty file → treat as text
+    for (size_t i = 0; i < check_len; i++) {
+        unsigned char c = static_cast<unsigned char>(content[i]);
+        // Null byte = definitely binary
+        if (c == 0) return kBinary;
+        // Non-printable, non-whitespace control chars (except \t \n \r) = likely binary
+        if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') return kBinary;
+    }
+    return kText;
+}
+
+// Get user's Downloads directory for pulled files
+static std::string get_download_dir() {
+    PWSTR downloads_path = nullptr;
+    HRESULT hr = SHGetKnownFolderPath(FOLDERID_Downloads, 0, NULL, &downloads_path);
+    if (SUCCEEDED(hr) && downloads_path) {
+        std::string result;
+        int len = WideCharToMultiByte(CP_ACP, 0, downloads_path, -1, NULL, 0, NULL, NULL);
+        if (len > 0) {
+            result.resize(len - 1);
+            WideCharToMultiByte(CP_ACP, 0, downloads_path, -1, &result[0], len, NULL, NULL);
+        }
+        CoTaskMemFree(downloads_path);
+        if (!result.empty()) return result + "\\";
+    }
+    // Fallback to Desktop
+    char path[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_DESKTOPDIRECTORY, NULL, 0, path))) {
+        return std::string(path) + "\\";
+    }
+    return ".\\";
+}
+
+
+// Struct for WM_USER+210 (pull-and-open result)
+struct PullOpenResult {
+    std::string local_path;
+    std::string file_name;
+    FileCategory category;
+    bool ok;
+};
+
+// Struct for WM_USER+205 (text file load result)
+struct TextLoadResult {
+    std::string file_name;    // display name
+    std::string remote_path;  // full device path for save-back
+    std::wstring content;     // \r\n-converted content
+    bool read_ok;             // false if cat failed → read-only viewer
+};
+
+
+
 void FileManagerWindow::enter_selected() {
     int sel = ListView_GetNextItem(g_file_list, -1, LVNI_SELECTED);
     if (sel < 0 || sel >= (int)g_entries.size()) return;
 
     const FileEntry &e = g_entries[sel];
-    if (e.is_dir() || e.is_link()) {
-        // Search results have full absolute paths; normal listings have relative names
+    if (e.is_dir()) {
+        // Directory — navigate into it
         if (!e.name.empty() && e.name[0] == '/') {
             navigate(e.name);
         } else {
             navigate(build_remote_path(g_current_dir, e.name));
+        }
+    } else if (e.is_link()) {
+        // Symlink — navigate to the link target
+        std::string target = e.link_target.empty()
+            ? build_remote_path(g_current_dir, e.name)
+            : e.link_target;
+        // Resolve relative target to absolute path
+        if (!target.empty() && target[0] != '/') {
+            target = build_remote_path(g_current_dir, target);
+        }
+        // Check if target is a directory or file
+        std::string check_output;
+        bool is_dir = false;
+        if (g_on_shell) {
+            g_on_shell("ls -ald " + shell_escape(target), &check_output, 5);
+            is_dir = !check_output.empty() && check_output[0] == 'd';
+        }
+        if (is_dir) {
+            navigate(target);
+        } else {
+            // Target is a file — navigate to its parent directory and select it
+            auto last_sep = target.rfind('/');
+            if (last_sep != std::string::npos && last_sep > 0) {
+                std::string parent_dir = target.substr(0, last_sep + 1);
+                std::string file_name = target.substr(last_sep + 1);
+                g_select_after_refresh = file_name;
+                navigate(parent_dir);
+            } else {
+                navigate(target);
+            }
         }
     } else if (e.is_file()) {
         // Double-click on a file
@@ -805,50 +1049,220 @@ void FileManagerWindow::enter_selected() {
         }
 
         const long long MAX_VIEW_SIZE = 1024 * 1024;  // 1 MB
-        if (e.size > MAX_VIEW_SIZE) {
-            // File too large — export instead
-            export_files();
-            return;
-        }
+        FileCategory cat = get_file_category(e.name);
 
-        // Cat file content and show in text viewer
-        g_busy = true;
-        if (g_on_busy) g_on_busy(true);
-        if (g_status_label) SetWindowTextW(g_status_label, L"Loading file...");
+        // For unknown extensions (kOther), sniff content to determine text vs binary
+        // We'll handle this inside the background thread after reading the first chunk
 
-        auto file_name = e.name;
-        auto file_path = path;
-        DWORD tid;
-        CreateThread(NULL, 0, [](LPVOID param) -> DWORD {
-            auto *d = reinterpret_cast<std::pair<std::string, std::string>*>(param);
-            auto &name = d->first;
-            auto &path = d->second;
-
-            std::string output;
-            bool ok = g_on_shell("cat " + shell_escape(path), &output, 15);
-            std::wstring wcontent;
-            if (ok && !shell_output_has_error(output)) {
-                // Convert \n to \r\n for Windows EDIT control
-                std::wstring wide = utf8_to_wide(output);
-                wcontent.reserve(wide.size());
-                for (size_t i = 0; i < wide.size(); i++) {
-                    if (wide[i] == L'\n' && (i == 0 || wide[i - 1] != L'\r'))
-                        wcontent += L"\r\n";
-                    else
-                        wcontent += wide[i];
+        // Helper: pull file to user-chosen folder (binary / large-unknown)
+        auto file_name_copy = e.name;
+        auto file_path_copy = path;
+        auto pull_binary_save = [file_name_copy, file_path_copy]() {
+            char save_dir[MAX_PATH] = {};
+            std::string default_dir = get_download_dir();
+            if (!default_dir.empty() && default_dir.back() == '\\') default_dir.pop_back();
+            BROWSEINFOA bi = {};
+            bi.hwndOwner = g_hwnd;
+            bi.lpszTitle = "Select folder to save file";
+            bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+            bi.lParam = (LPARAM)default_dir.c_str();
+            bi.lpfn = [](HWND hwnd, UINT uMsg, LPARAM, LPARAM pData) -> int {
+                if (uMsg == BFFM_INITIALIZED) {
+                    SendMessageA(hwnd, BFFM_SETSELECTIONA, TRUE, pData);
                 }
-            } else {
-                wcontent = L"Failed to read file: " + utf8_to_wide(name);
-                if (!output.empty()) wcontent += L"\r\n" + utf8_to_wide(output);
+                return 0;
+            };
+            LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
+            if (!pidl) return;
+            SHGetPathFromIDListA(pidl, save_dir);
+            CoTaskMemFree(pidl);
+
+            g_busy = true;
+            if (g_on_busy) g_on_busy(true);
+            if (g_status_label) SetWindowTextW(g_status_label, L"Downloading file...");
+
+            DWORD tid;
+            CreateThread(NULL, 0, [](LPVOID param) -> DWORD {
+                auto *d = reinterpret_cast<std::tuple<std::string, std::string, std::string>*>(param);
+                auto &name = std::get<0>(*d);
+                auto &remote = std::get<1>(*d);
+                auto &local_dir = std::get<2>(*d);
+
+                auto *result = new PullOpenResult();
+                result->file_name = name;
+                result->category = kBinary;
+                result->local_path = local_dir + "\\" + name;
+                std::string pull_output;
+                result->ok = g_on_pull(remote, result->local_path, &pull_output);
+
+                PostMessageW(g_hwnd, WM_USER + 210, 0, (LPARAM)result);
+                delete d;
+                return 0;
+            }, new std::tuple<std::string, std::string, std::string>(
+                std::move(file_name_copy), std::move(file_path_copy), std::string(save_dir)
+            ), 0, &tid);
+        };
+
+        switch (cat) {
+        case kText: {
+            if (e.size > MAX_VIEW_SIZE) {
+                export_files();
+                return;
             }
+            // Cat file content and show in text viewer
+            g_busy = true;
+            if (g_on_busy) g_on_busy(true);
+            if (g_status_label) SetWindowTextW(g_status_label, L"Loading file...");
 
-            // Post result to UI thread
-            auto *result = new std::pair<std::string, std::wstring>(name, std::move(wcontent));
-            PostMessageW(g_hwnd, WM_USER + 205, 0, (LPARAM)result);
+            auto file_name = e.name;
+            auto file_path = path;
+            DWORD tid;
+            CreateThread(NULL, 0, [](LPVOID param) -> DWORD {
+                auto *d = reinterpret_cast<std::pair<std::string, std::string>*>(param);
+                auto &name = d->first;
+                auto &path = d->second;
 
-            delete d;
-            return 0;
-        }, new std::pair<std::string, std::string>(std::move(file_name), std::move(file_path)), 0, &tid);
+                auto *result = new TextLoadResult();
+                result->file_name = name;
+                result->remote_path = path;
+
+                std::string output;
+                bool ok = g_on_shell("cat " + shell_escape(path), &output, 15);
+                // If cat returned empty (HDC truncates at null bytes), try cat -v
+                // cat -v displays non-printable chars as ^@/M-X but breaks UTF-8
+                // multi-byte chars (Chinese etc.), so only use as fallback
+                if (ok && output.empty()) {
+                    g_on_shell("cat -v " + shell_escape(path), &output, 15);
+                }
+                if (ok) {
+                    // Convert \n to \r\n for Windows EDIT control
+                    std::wstring wide = utf8_to_wide(output);
+                    result->content.reserve(wide.size());
+                    for (size_t i = 0; i < wide.size(); i++) {
+                        if (wide[i] == L'\n' && (i == 0 || wide[i - 1] != L'\r'))
+                            result->content += L"\r\n";
+                        else
+                            result->content += wide[i];
+                    }
+                    result->read_ok = true;
+                } else {
+                    result->content = L"Failed to read file: " + utf8_to_wide(name);
+                    if (!output.empty()) result->content += L"\r\n" + utf8_to_wide(output);
+                    result->read_ok = false;
+                }
+
+                PostMessageW(g_hwnd, WM_USER + 205, 0, (LPARAM)result);
+
+                delete d;
+                return 0;
+            }, new std::pair<std::string, std::string>(std::move(file_name), std::move(file_path)), 0, &tid);
+            break;
+        }
+        case kImage: {
+            // Pull to Downloads dir and open with Windows viewer
+            g_busy = true;
+            if (g_on_busy) g_on_busy(true);
+            if (g_status_label) SetWindowTextW(g_status_label, L"Downloading image...");
+
+            auto file_name = e.name;
+            auto file_path = path;
+            DWORD tid;
+            CreateThread(NULL, 0, [](LPVOID param) -> DWORD {
+                auto *d = reinterpret_cast<std::pair<std::string, std::string>*>(param);
+                auto &name = d->first;
+                auto &remote = d->second;
+                auto *result = new PullOpenResult();
+                result->file_name = name;
+                result->category = kImage;
+
+                std::string local_dir = get_download_dir();
+                result->local_path = local_dir + name;
+                std::string pull_output;
+                result->ok = g_on_pull(remote, result->local_path, &pull_output);
+
+                PostMessageW(g_hwnd, WM_USER + 210, 0, (LPARAM)result);
+                delete d;
+                return 0;
+            }, new std::pair<std::string, std::string>(std::move(file_name), std::move(file_path)), 0, &tid);
+            break;
+        }
+        case kBinary:
+            // Binary file — ask user where to save
+            pull_binary_save();
+            break;
+        case kOther:
+            if (e.size > MAX_VIEW_SIZE) {
+                // Large unknown file — treat as binary
+                pull_binary_save();
+            } else {
+                // Small unknown file — sniff content to determine text vs binary
+                g_busy = true;
+                if (g_on_busy) g_on_busy(true);
+                if (g_status_label) SetWindowTextW(g_status_label, L"Loading file...");
+
+                auto file_name = e.name;
+                auto file_path = path;
+                DWORD tid;
+                CreateThread(NULL, 0, [](LPVOID param) -> DWORD {
+                    auto *d = reinterpret_cast<std::pair<std::string, std::string>*>(param);
+                    auto &name = d->first;
+                    auto &path = d->second;
+
+                    // Read content and sniff
+                    std::string output;
+                    bool ok = g_on_shell("cat " + shell_escape(path), &output, 15);
+                    if (ok) {
+                        FileCategory sniffed = sniff_content_category(output);
+                        if (sniffed == kText) {
+                            // It's text — use raw cat output for display
+                            // If cat returned empty (HDC truncates at null bytes),
+                            // fall back to cat -v (breaks UTF-8 multi-byte but shows something)
+                            std::string &display_output = output;
+                            std::string catv_output;
+                            if (output.empty()) {
+                                g_on_shell("cat -v " + shell_escape(path), &catv_output, 15);
+                                if (!catv_output.empty()) display_output = catv_output;
+                            }
+                            auto *result = new TextLoadResult();
+                            result->file_name = name;
+                            result->remote_path = path;
+                            result->read_ok = true;
+                            std::wstring wide = utf8_to_wide(display_output);
+                            result->content.reserve(wide.size());
+                            for (size_t i = 0; i < wide.size(); i++) {
+                                if (wide[i] == L'\n' && (i == 0 || wide[i - 1] != L'\r'))
+                                    result->content += L"\r\n";
+                                else
+                                    result->content += wide[i];
+                            }
+                            PostMessageW(g_hwnd, WM_USER + 205, 0, (LPARAM)result);
+                        } else {
+                            // It's binary — pull to Downloads and notify
+                            auto *result = new PullOpenResult();
+                            result->file_name = name;
+                            result->category = kBinary;
+                            result->local_path = get_download_dir() + name;
+                            std::string pull_output;
+                            result->ok = g_on_pull(path, result->local_path, &pull_output);
+                            PostMessageW(g_hwnd, WM_USER + 210, 0, (LPARAM)result);
+                        }
+                    } else {
+                        // Failed to read — show error in text viewer
+                        auto *result = new TextLoadResult();
+                        result->file_name = name;
+                        result->remote_path = path;
+                        result->read_ok = false;
+                        result->content = L"Failed to read file: " + utf8_to_wide(name);
+                        if (!output.empty()) result->content += L"\r\n" + utf8_to_wide(output);
+                        PostMessageW(g_hwnd, WM_USER + 205, 0, (LPARAM)result);
+                    }
+
+                    delete d;
+                    return 0;
+                }, new std::pair<std::string, std::string>(std::move(file_name), std::move(file_path)), 0, &tid);
+            }
+            break;
+        }
     }
 }
 
@@ -1139,10 +1553,13 @@ void FileManagerWindow::import_files() {
                         WS_CHILD | WS_VISIBLE, 12, 14, 200, 18, hwnd, NULL, cs->hInstance, NULL);
                     CreateWindowW(L"BUTTON", L"Folder",
                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
-                        30, 44, 100, 28, hwnd, (HMENU)1001, cs->hInstance, NULL);
+                        12, 44, 90, 28, hwnd, (HMENU)1001, cs->hInstance, NULL);
                     CreateWindowW(L"BUTTON", L"Files",
                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                        150, 44, 100, 28, hwnd, (HMENU)1002, cs->hInstance, NULL);
+                        112, 44, 90, 28, hwnd, (HMENU)1002, cs->hInstance, NULL);
+                    CreateWindowW(L"BUTTON", L"Cancel",
+                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                        212, 44, 90, 28, hwnd, (HMENU)1003, cs->hInstance, NULL);
 
                     HFONT hf = CreateFontW(16, 0, 0, 0, FW_NORMAL, 0, 0, 0,
                                             DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
@@ -1156,6 +1573,7 @@ void FileManagerWindow::import_files() {
                 case WM_COMMAND:
                     if (LOWORD(wp) == 1001) { *icd->result = 2; PostMessageW(hwnd, WM_CLOSE, 0, 0); }
                     else if (LOWORD(wp) == 1002) { *icd->result = 1; PostMessageW(hwnd, WM_CLOSE, 0, 0); }
+                    else if (LOWORD(wp) == 1003) { *icd->result = 0; PostMessageW(hwnd, WM_CLOSE, 0, 0); }
                     return 0;
                 case WM_CLOSE:
                     DestroyWindow(hwnd);
@@ -1181,9 +1599,9 @@ void FileManagerWindow::import_files() {
         HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
             L"HScrcpyImportChoiceDlg", L"Import to Device",
             WS_POPUP | WS_CAPTION,
-            orr.left + (orr.right - orr.left - 280) / 2,
+            orr.left + (orr.right - orr.left - 320) / 2,
             orr.top + (orr.bottom - orr.top - 120) / 2,
-            280, 120, g_parent, NULL, g_inst, &icd);
+            320, 120, g_parent, NULL, g_inst, &icd);
 
         EnableWindow(g_hwnd, FALSE);
         ShowWindow(dlg, SW_SHOW);
@@ -1361,11 +1779,7 @@ void FileManagerWindow::export_files() {
     if (!g_on_pull) return;
 
     // Get selected entries
-    std::vector<int> selected;
-    int idx = -1;
-    while ((idx = ListView_GetNextItem(g_file_list, idx, LVNI_SELECTED)) >= 0) {
-        selected.push_back(idx);
-    }
+    std::vector<int> selected = get_selected_indices();
     if (selected.empty()) {
         msg_box("Export", "No files selected.");
         return;
@@ -1512,10 +1926,13 @@ void FileManagerWindow::new_item() {
                         WS_CHILD | WS_VISIBLE, 12, 14, 200, 18, hwnd, NULL, cs->hInstance, NULL);
                     CreateWindowW(L"BUTTON", L"Folder",
                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                        30, 44, 100, 28, hwnd, (HMENU)1001, cs->hInstance, NULL);
+                        20, 44, 80, 28, hwnd, (HMENU)1001, cs->hInstance, NULL);
                     CreateWindowW(L"BUTTON", L"File",
                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                        150, 44, 100, 28, hwnd, (HMENU)1002, cs->hInstance, NULL);
+                        110, 44, 80, 28, hwnd, (HMENU)1002, cs->hInstance, NULL);
+                    CreateWindowW(L"BUTTON", L"Cancel",
+                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                        200, 44, 80, 28, hwnd, (HMENU)1003, cs->hInstance, NULL);
 
                     HFONT hf = CreateFontW(16, 0, 0, 0, FW_NORMAL, 0, 0, 0,
                                             DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
@@ -1529,6 +1946,7 @@ void FileManagerWindow::new_item() {
                 case WM_COMMAND:
                     if (LOWORD(wp) == 1001) { *nd->result = 1; PostMessageW(hwnd, WM_CLOSE, 0, 0); }
                     else if (LOWORD(wp) == 1002) { *nd->result = 2; PostMessageW(hwnd, WM_CLOSE, 0, 0); }
+                    else if (LOWORD(wp) == 1003) { *nd->result = 0; PostMessageW(hwnd, WM_CLOSE, 0, 0); }
                     return 0;
                 case WM_CLOSE:
                     DestroyWindow(hwnd);
@@ -1554,9 +1972,9 @@ void FileManagerWindow::new_item() {
         HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
             L"HscrcpyNewItemDlg", L"New Item",
             WS_POPUP | WS_CAPTION,
-            orr.left + (orr.right - orr.left - 280) / 2,
+            orr.left + (orr.right - orr.left - 320) / 2,
             orr.top + (orr.bottom - orr.top - 120) / 2,
-            280, 120, g_parent, NULL, g_inst, &nd);
+            320, 120, g_parent, NULL, g_inst, &nd);
 
         EnableWindow(g_hwnd, FALSE);
         ShowWindow(dlg, SW_SHOW);
@@ -1612,11 +2030,7 @@ void FileManagerWindow::new_item() {
 void FileManagerWindow::delete_selected() {
     if (!g_on_shell) return;
 
-    std::vector<int> selected;
-    int idx = -1;
-    while ((idx = ListView_GetNextItem(g_file_list, idx, LVNI_SELECTED)) >= 0) {
-        selected.push_back(idx);
-    }
+    std::vector<int> selected = get_selected_indices();
     if (selected.empty()) return;
 
     // Build confirmation message
@@ -1697,11 +2111,7 @@ void FileManagerWindow::delete_selected() {
 }
 
 void FileManagerWindow::copy_selected() {
-    std::vector<int> selected;
-    int idx = -1;
-    while ((idx = ListView_GetNextItem(g_file_list, idx, LVNI_SELECTED)) >= 0) {
-        selected.push_back(idx);
-    }
+    std::vector<int> selected = get_selected_indices();
     if (selected.empty()) return;
 
     g_clipboard.entries.clear();
@@ -1715,6 +2125,7 @@ void FileManagerWindow::copy_selected() {
     snprintf(buf, sizeof(buf), "Copied %d item(s)", (int)g_clipboard.entries.size());
     show_toast(buf, true);
     update_status();
+    if (g_check_mode) exit_select_mode();
 }
 
 void FileManagerWindow::paste_clipboard() {
@@ -1847,6 +2258,83 @@ void FileManagerWindow::rename_selected() {
     refresh_list();
 }
 
+void FileManagerWindow::enter_select_mode() {
+    if (g_check_mode) return;
+    g_check_mode = true;
+    // Enable checkboxes and check all items
+    SendMessageW(g_file_list, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_CHECKBOXES, LVS_EX_CHECKBOXES);
+    int count = ListView_GetItemCount(g_file_list);
+    for (int i = 0; i < count; i++) {
+        ListView_SetCheckState(g_file_list, i, TRUE);
+    }
+    // Switch to unchecked icon (取消全选)
+    HICON hIco = load_icon_file("res\\file-manager\\file-unchecked.png", 24, 85, 85, 85, true);
+    if (hIco) set_btn_icon(g_selectall_btn, hIco);
+    // Disable buttons not applicable in select mode
+    EnableWindow(g_import_btn, FALSE);
+    EnableWindow(g_paste_btn, FALSE);
+    EnableWindow(g_rename_btn, FALSE);
+    EnableWindow(g_new_btn, FALSE);
+    update_status();
+}
+
+void FileManagerWindow::exit_select_mode() {
+    if (!g_check_mode) return;
+    g_check_mode = false;
+    // Remove checkboxes
+    SendMessageW(g_file_list, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_CHECKBOXES, 0);
+    // Restore checked icon (多选)
+    HICON hIco = load_icon_file("res\\file-manager\\file-checked.png", 24, 85, 85, 85, true);
+    if (hIco) set_btn_icon(g_selectall_btn, hIco);
+    // Re-enable all buttons
+    EnableWindow(g_import_btn, TRUE);
+    EnableWindow(g_paste_btn, TRUE);
+    EnableWindow(g_rename_btn, TRUE);
+    EnableWindow(g_new_btn, TRUE);
+    refresh_list();
+    update_status();
+}
+
+void FileManagerWindow::toggle_select_all() {
+    if (!g_check_mode) return;
+    int count = ListView_GetItemCount(g_file_list);
+    // Check if all are currently checked
+    bool all_checked = true;
+    for (int i = 0; i < count; i++) {
+        if (!ListView_GetCheckState(g_file_list, i)) { all_checked = false; break; }
+    }
+    if (all_checked) {
+        // Uncheck all → show checked icon (全选)
+        for (int i = 0; i < count; i++) ListView_SetCheckState(g_file_list, i, FALSE);
+        HICON hIco = load_icon_file("res\\file-manager\\file-checked.png", 24, 85, 85, 85, true);
+        if (hIco) set_btn_icon(g_selectall_btn, hIco);
+    } else {
+        // Check all → show unchecked icon (取消全选)
+        for (int i = 0; i < count; i++) ListView_SetCheckState(g_file_list, i, TRUE);
+        HICON hIco = load_icon_file("res\\file-manager\\file-unchecked.png", 24, 85, 85, 85, true);
+        if (hIco) set_btn_icon(g_selectall_btn, hIco);
+    }
+    update_status();
+}
+
+std::vector<int> FileManagerWindow::get_selected_indices() {
+    std::vector<int> indices;
+    if (g_check_mode) {
+        int count = ListView_GetItemCount(g_file_list);
+        for (int i = 0; i < count; i++) {
+            if (ListView_GetCheckState(g_file_list, i)) {
+                indices.push_back(i);
+            }
+        }
+    } else {
+        int idx = -1;
+        while ((idx = ListView_GetNextItem(g_file_list, idx, LVNI_SELECTED)) >= 0) {
+            indices.push_back(idx);
+        }
+    }
+    return indices;
+}
+
 // ── Context menu ─────────────────────────────────────────
 
 void FileManagerWindow::show_context_menu(POINT pt) {
@@ -1879,6 +2367,18 @@ void FileManagerWindow::show_context_menu(POINT pt) {
             }
         }
         AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+        if (g_check_mode) {
+            // Check if all items are checked to show appropriate menu item
+            bool all_checked = true;
+            int count = ListView_GetItemCount(g_file_list);
+            for (int i = 0; i < count; i++) {
+                if (!ListView_GetCheckState(g_file_list, i)) { all_checked = false; break; }
+            }
+            AppendMenuW(hMenu, MF_STRING, all_checked ? IDM_DESELECTALL : IDM_SELECTALL,
+                        all_checked ? L"取消全选" : L"全选");
+        } else {
+            AppendMenuW(hMenu, MF_STRING, IDM_SELECTALL, L"多选");
+        }
         AppendMenuW(hMenu, MF_STRING, IDM_REFRESH, L"Refresh");
     }
 
@@ -1928,10 +2428,17 @@ void FileManagerWindow::update_status() {
     if (!g_status_label) return;
 
     int count = (int)g_entries.size();
-    int sel_count = ListView_GetSelectedCount(g_file_list);
-
     std::string status = std::to_string(count) + " items";
-    if (sel_count > 0) status += ", " + std::to_string(sel_count) + " selected";
+    if (g_check_mode) {
+        int checked = 0;
+        for (int i = 0; i < count; i++) {
+            if (ListView_GetCheckState(g_file_list, i)) checked++;
+        }
+        status += ", " + std::to_string(checked) + " checked";
+    } else {
+        int sel_count = ListView_GetSelectedCount(g_file_list);
+        if (sel_count > 0) status += ", " + std::to_string(sel_count) + " selected";
+    }
     if (!g_clipboard.entries.empty()) {
         status += " | Clipboard: " + std::to_string(g_clipboard.entries.size());
         status += (g_clipboard.action == FileClipAction::Copy ? " (copy)" : " (move)");
@@ -2099,10 +2606,12 @@ void FileManagerWindow::populate_list() {
 
         std::wstring wname = utf8_to_wide(e.name);
         // In root directory, prefix subdirectories with '/' for clarity
-        if (g_current_dir == "/" && e.is_dir() && e.name.find('/') == std::string::npos)
+        if (g_current_dir == "/" && (e.is_dir() || e.is_link()) && e.name.find('/') == std::string::npos)
             wname = L"/" + wname;
         if (e.is_dir()) wname += L"/";
-        if (e.is_link()) wname += L" -> " + utf8_to_wide(e.link_target);
+        if (e.is_link()) {
+            wname += L" -> " + utf8_to_wide(e.link_target);
+        }
 
         LVITEMW lvi = {};
         lvi.mask = LVIF_TEXT | LVIF_IMAGE;
@@ -2143,7 +2652,7 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         // File-list icons: use ImageList_AddMasked with magenta background.
         // Color bitmap has solid tint where alpha>0, magenta where alpha=0.
         // ImageList_AddMasked auto-generates the mask from the transparent color.
-        g_img_list = ImageList_Create(24, 24, ILC_COLOR32 | ILC_MASK, 3, 0);
+        g_img_list = ImageList_Create(20, 20, ILC_COLOR32 | ILC_MASK, 3, 0);
 
         auto add_il_icon = [&](const char *path, BYTE r, BYTE g, BYTE b) {
             char exe_path[MAX_PATH];
@@ -2163,24 +2672,25 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
                 return;
             }
 
+            const int sz = 20;
             // Scale source
-            Gdiplus::Bitmap *scaled = new Gdiplus::Bitmap(24, 24, PixelFormat32bppARGB);
+            Gdiplus::Bitmap *scaled = new Gdiplus::Bitmap(sz, sz, PixelFormat32bppARGB);
             { Gdiplus::Graphics gs(scaled);
               gs.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
               gs.Clear(Gdiplus::Color(0, 0, 0, 0));
-              gs.DrawImage(src, 0, 0, 24, 24); }
+              gs.DrawImage(src, 0, 0, sz, sz); }
             delete src;
 
             // Read alpha channel
             Gdiplus::BitmapData bd = {};
-            Gdiplus::Rect rect(0, 0, 24, 24);
+            Gdiplus::Rect rect(0, 0, sz, sz);
             scaled->LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bd);
 
             // Create color DIB: tint where alpha>0, magenta where alpha=0
             BITMAPINFO bmi = {};
             bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-            bmi.bmiHeader.biWidth = 24;
-            bmi.bmiHeader.biHeight = -24;  // top-down
+            bmi.bmiHeader.biWidth = sz;
+            bmi.bmiHeader.biHeight = -sz;  // top-down
             bmi.bmiHeader.biPlanes = 1;
             bmi.bmiHeader.biBitCount = 32;
             bmi.bmiHeader.biCompression = BI_RGB;
@@ -2188,10 +2698,10 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
             HBITMAP hbmColor = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, (void **)&color_bits, NULL, 0);
 
             if (hbmColor && color_bits) {
-                for (int y = 0; y < 24; y++) {
+                for (int y = 0; y < sz; y++) {
                     const BYTE *sp = (const BYTE *)bd.Scan0 + y * bd.Stride;
-                    BYTE *dp = color_bits + y * 24 * 4;
-                    for (int x = 0; x < 24; x++) {
+                    BYTE *dp = color_bits + y * sz * 4;
+                    for (int x = 0; x < sz; x++) {
                         BYTE a = sp[3];
                         if (a > 0) {
                             dp[0] = b; dp[1] = g; dp[2] = r; dp[3] = 0;
@@ -2214,9 +2724,9 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
                 ImageList_AddIcon(g_img_list, LoadIcon(NULL, IDI_WINLOGO));
             }
         };
-        add_il_icon("res\\file-manager\\folder.png", 85, 85, 85);
-        add_il_icon("res\\file-manager\\file.png", 85, 85, 85);
-        add_il_icon("res\\file-manager\\file-link.png", 85, 85, 85);
+        add_il_icon("res\\file-manager\\filelist-folder.png", 85, 85, 85);
+        add_il_icon("res\\file-manager\\filelist-file.png", 85, 85, 85);
+        add_il_icon("res\\file-manager\\filelist-link.png", 85, 85, 85);
 
         HFONT hf = CreateFontW(16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
 
@@ -2279,13 +2789,14 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
             HWND btn = CreateWindowW(L"BUTTON", L"",
                                       WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_ICON,
                                       bx, y2, BTN_SIZE, BTN_SIZE, hwnd, (HMENU)id, g_inst, NULL);
-            HICON hIco = load_icon_file(icon_path, 24, 85, 85, 85, true);
+            HICON hIco = icon_path ? load_icon_file(icon_path, 24, 85, 85, 85, true) : nullptr;
             if (hIco) { SendMessageW(btn, BM_SETIMAGE, IMAGE_ICON, (LPARAM)hIco); }
             else SetWindowTextW(btn, fallback);
             bx += BTN_SIZE + 2;
             return btn;
         };
 
+        g_selectall_btn = make_icon_btn(IDC_SELECTALL_BTN, "res\\file-manager\\file-checked.png", L"Sel");
         g_import_btn = make_icon_btn(IDC_IMPORT_BTN, "res\\file-manager\\file-import.png", L"Push");
         g_export_btn = make_icon_btn(IDC_EXPORT_BTN, "res\\file-manager\\file-export.png", L"Pull");
         g_copy_btn = make_icon_btn(IDC_COPY_BTN, "res\\file-manager\\file-copy.png", L"Cp");
@@ -2297,7 +2808,7 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         // Remove visual styles from buttons so WM_CTLCOLORBTN works for white background
         for (HWND btn : {g_back_btn, g_go_btn, g_search_btn,
                          g_import_btn, g_export_btn, g_new_btn, g_delete_btn,
-                         g_copy_btn, g_paste_btn, g_rename_btn}) {
+                         g_copy_btn, g_paste_btn, g_rename_btn, g_selectall_btn}) {
             SetWindowTheme(btn, L"", L"");
         }
 
@@ -2423,7 +2934,9 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
                 show_context_menu(pt);
             } else if (nm->code == LVN_KEYDOWN) {
                 auto *lvkd = reinterpret_cast<NMLVKEYDOWN *>(lp);
-                if (lvkd->wVKey == VK_DELETE) {
+                if (lvkd->wVKey == VK_ESCAPE && g_check_mode) {
+                    exit_select_mode();
+                } else if (lvkd->wVKey == VK_DELETE) {
                     delete_selected();
                 } else if (lvkd->wVKey == 'C' && (GetKeyState(VK_CONTROL) & 0x8000)) {
                     copy_selected();
@@ -2450,7 +2963,6 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
             navigate(wide_to_utf8(wbuf));
             break;
         }
-        case IDC_UP_BTN: break; // removed
         case IDC_BACK_BTN: go_back(); break;
         case IDC_SEARCH_BTN: search_files(); break;
         case IDC_IMPORT_BTN: import_files(); break;
@@ -2460,6 +2972,10 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         case IDC_COPY_BTN: copy_selected(); break;
         case IDC_PASTE_BTN: paste_clipboard(); break;
         case IDC_RENAME_BTN: rename_selected(); break;
+        case IDC_SELECTALL_BTN:
+            if (g_check_mode) toggle_select_all();
+            else enter_select_mode();
+            break;
         // Context menu commands
         case IDM_OPEN: enter_selected(); break;
         case IDM_OPEN_CONTAINING_FOLDER: {
@@ -2488,6 +3004,27 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         case IDM_DELETE: delete_selected(); break;
         case IDM_NEWFOLDER: new_item(); break;
         case IDM_REFRESH: refresh_list(); break;
+        case IDM_SELECTALL:
+            if (g_check_mode) {
+                // Check all items
+                int count = ListView_GetItemCount(g_file_list);
+                for (int i = 0; i < count; i++) ListView_SetCheckState(g_file_list, i, TRUE);
+                HICON hIco = load_icon_file("res\\file-manager\\file-unchecked.png", 24, 85, 85, 85, true);
+                if (hIco) set_btn_icon(g_selectall_btn, hIco);
+                update_status();
+            } else {
+                enter_select_mode();
+            }
+            break;
+        case IDM_DESELECTALL: {
+            // Uncheck all items
+            int count = ListView_GetItemCount(g_file_list);
+            for (int i = 0; i < count; i++) ListView_SetCheckState(g_file_list, i, FALSE);
+            HICON hIco = load_icon_file("res\\file-manager\\file-checked.png", 24, 85, 85, 85, true);
+            if (hIco) set_btn_icon(g_selectall_btn, hIco);
+            update_status();
+            break;
+        }
         case IDM_PROPERTIES: show_properties(); break;
         }
         break;
@@ -2499,6 +3036,20 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         if (wp == 1) {
             populate_list();
             update_status();
+            // Select file requested by symlink navigation
+            if (!g_select_after_refresh.empty()) {
+                std::string sel_name = std::move(g_select_after_refresh);
+                g_select_after_refresh.clear();
+                // Search by entry name (not display text, which may have " -> target" suffix)
+                int sel_idx = -1;
+                for (int i = 0; i < (int)g_entries.size(); i++) {
+                    if (g_entries[i].name == sel_name) { sel_idx = i; break; }
+                }
+                if (sel_idx >= 0) {
+                    ListView_SetItemState(g_file_list, sel_idx, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+                    ListView_EnsureVisible(g_file_list, sel_idx, FALSE);
+                }
+            }
         } else if (wp == 2) {
             // Permission denied
             ListView_DeleteAllItems(g_file_list);
@@ -2588,6 +3139,7 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
             }
         }
         update_status();
+        if (g_check_mode) exit_select_mode();
         break;
     }
     // delete result
@@ -2613,7 +3165,8 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
                 show_toast("Delete failed", false);
             }
         }
-        refresh_list();
+        if (g_check_mode) exit_select_mode();
+        else refresh_list();
         break;
     }
     // paste result
@@ -2647,15 +3200,105 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         g_busy = false;
         if (g_on_busy) g_on_busy(false);
         if (g_status_label) SetWindowTextW(g_status_label, L"File Manager");
-        auto *result = reinterpret_cast<std::pair<std::string, std::wstring>*>(lp);
+        auto *result = reinterpret_cast<TextLoadResult*>(lp);
         if (result) {
-            show_text_viewer(utf8_to_wide(result->first), result->second);
+            show_text_viewer(utf8_to_wide(result->file_name), result->content,
+                             result->remote_path, result->read_ok);
             delete result;
         }
         break;
     }
+    case WM_USER + 210: {
+        // Pull-and-open result
+        g_busy = false;
+        if (g_on_busy) g_on_busy(false);
+        if (g_status_label) SetWindowTextW(g_status_label, L"File Manager");
+        auto *result = reinterpret_cast<PullOpenResult*>(lp);
+        if (result) {
+            if (result->ok) {
+                if (result->category == kBinary) {
+                    msg_box("File Saved", "Downloaded '%s' to:\n%s", result->file_name.c_str(), result->local_path.c_str());
+                } else {
+                    // kImage or kOther — open with Windows default viewer
+                    std::wstring wpath = utf8_to_wide(result->local_path);
+                    HINSTANCE h = ShellExecuteW(NULL, L"open", wpath.c_str(), NULL, NULL, SW_SHOWNORMAL);
+                    if ((intptr_t)h <= 32) {
+                        msg_box("File Saved", "Downloaded '%s' to:\n%s\n(No default viewer found)", result->file_name.c_str(), result->local_path.c_str());
+                    }
+                }
+            } else {
+                msg_box("Download Failed", "Failed to download '%s'", result->file_name.c_str());
+            }
+            delete result;
+        }
+        break;
+    }
+    case WM_USER + 211: {
+        // Text viewer save request: wp = viewer hwnd, lp = pair<local_tmp, remote_path>
+        // Run push+dd on background thread to avoid freezing UI
+        auto *sd = reinterpret_cast<std::pair<std::string, std::string>*>(lp);
+        if (!sd) break;
+        HWND viewer_hwnd = (HWND)wp;
+        DWORD tid;
+        CreateThread(NULL, 0, [](LPVOID param) -> DWORD {
+            auto *d = reinterpret_cast<std::tuple<std::string, std::string, HWND>*>(param);
+            auto &local_tmp = std::get<0>(*d);
+            auto &remote_path = std::get<1>(*d);
+            HWND vhwnd = std::get<2>(*d);
+
+            // Push temp file to device
+            std::string remote_tmp = "/data/local/tmp/.hscrcpy_edit_tmp";
+            std::string push_output;
+            bool push_ok = g_on_push(local_tmp, remote_tmp, &push_output);
+            if (!push_ok) {
+                DeleteFileA(local_tmp.c_str());
+                delete d;
+                if (IsWindow(vhwnd))
+                    EnableWindow(GetDlgItem(vhwnd, TV_SAVE_BTN), TRUE);
+                return 0;
+            }
+
+            // Use dd to overwrite content while preserving inode metadata.
+            // dd if=A of=B opens B with O_WRONLY|O_CREAT|O_TRUNC — truncates in-place,
+            // keeping the same inode (owner, group, mode, SELinux xattr all preserved).
+            // NOTE: Cannot use "cat tmp > file" because the '>' redirect is intercepted
+            // by the Windows shell before reaching hdc, causing a local-path error.
+            std::string dd_output;
+            bool dd_ok = g_on_shell("dd if=" + shell_escape(remote_tmp) + " of=" + shell_escape(remote_path), &dd_output, 15);
+            if (!dd_ok) {
+                g_on_shell("rm " + shell_escape(remote_tmp), nullptr, 5);
+                DeleteFileA(local_tmp.c_str());
+                delete d;
+                if (IsWindow(vhwnd))
+                    EnableWindow(GetDlgItem(vhwnd, TV_SAVE_BTN), TRUE);
+                return 0;
+            }
+
+            // Cleanup
+            g_on_shell("rm " + shell_escape(remote_tmp), nullptr, 5);
+            DeleteFileA(local_tmp.c_str());
+            delete d;
+
+            // Mark viewer as not-dirty and show success (must post back to UI thread)
+            PostMessageW(g_hwnd, WM_USER + 213, (WPARAM)vhwnd, 0);
+            return 0;
+        }, new std::tuple<std::string, std::string, HWND>(std::move(sd->first), std::move(sd->second), viewer_hwnd), 0, &tid);
+        delete sd;
+        break;
+    }
+    case WM_USER + 213: {
+        // Text viewer save completed on background thread
+        HWND viewer_hwnd = (HWND)wp;
+        if (IsWindow(viewer_hwnd)) {
+            SetPropW(viewer_hwnd, L"tv_dirty", (HANDLE)FALSE);
+            EnableWindow(GetDlgItem(viewer_hwnd, TV_SAVE_BTN), TRUE);
+        }
+        show_toast("File saved", true);
+        break;
+    }
 
     case WM_DESTROY:
+        g_check_mode = false;
         g_hwnd = nullptr;
         g_file_list = nullptr;
         g_address_edit = nullptr;
@@ -2666,9 +3309,6 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         g_clipboard.action = FileClipAction::None;
         g_busy = false;
         if (g_img_list) { ImageList_Destroy(g_img_list); g_img_list = nullptr; }
-        if (g_icon_folder) { DestroyIcon(g_icon_folder); g_icon_folder = nullptr; }
-        if (g_icon_file) { DestroyIcon(g_icon_file); g_icon_file = nullptr; }
-        if (g_icon_link) { DestroyIcon(g_icon_link); g_icon_link = nullptr; }
         break;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);

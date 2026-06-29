@@ -75,6 +75,7 @@ private:
         IDC_COPY_BTN,
         IDC_PASTE_BTN,
         IDC_RENAME_BTN,
+        IDC_SELECTALL_BTN,
         IDC_FILE_LIST,
         IDC_STATUS_LABEL,
         // Context menu commands
@@ -92,6 +93,8 @@ private:
         IDM_NEWFILE,
         IDM_REFRESH,
         IDM_PROPERTIES,
+        IDM_SELECTALL,
+        IDM_DESELECTALL,
     };
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
@@ -111,6 +114,10 @@ private:
     static void copy_selected();
     static void paste_clipboard();
     static void rename_selected();
+    static void enter_select_mode();
+    static void exit_select_mode();
+    static void toggle_select_all();
+    static std::vector<int> get_selected_indices();
     static void show_context_menu(POINT pt);
     static void show_properties();
     static void update_status();
@@ -137,6 +144,7 @@ private:
     static HWND g_copy_btn;
     static HWND g_paste_btn;
     static HWND g_rename_btn;
+    static HWND g_selectall_btn;
     static HWND g_file_list;
     static HWND g_status_label;
     static HINSTANCE g_inst;
@@ -147,6 +155,8 @@ private:
     static std::vector<FileEntry> g_entries;
     static std::vector<std::string> g_history;  // navigation history
     static FileClipboard g_clipboard;
+    static std::string g_select_after_refresh;
+    static bool g_check_mode;
 
     static OnShellCommand g_on_shell;
     static OnPushFile g_on_push;
@@ -155,9 +165,6 @@ private:
     static bool g_busy;
 
     // Icon handles
-    static HICON g_icon_folder;
-    static HICON g_icon_file;
-    static HICON g_icon_link;
     static HIMAGELIST g_img_list;
     static HWND g_toast_hwnd;
 };
