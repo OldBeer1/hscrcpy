@@ -1609,12 +1609,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 LayoutWindow::hide();
                 ShowWindow(g_splitter_hwnd, SW_HIDE);
                 g_layout_visible = false;
-                RECT wr;
-                GetWindowRect(hwnd, &wr);
-                SetWindowPos(hwnd, NULL, 0, 0,
-                             wr.right - wr.left - LayoutWindow::panel_width(),
-                             wr.bottom - wr.top,
-                             SWP_NOMOVE | SWP_NOZORDER);
+                if (IsZoomed(hwnd)) {
+                    SendMessageW(hwnd, WM_SIZE, 0, 0);
+                } else {
+                    RECT wr;
+                    GetWindowRect(hwnd, &wr);
+                    SetWindowPos(hwnd, NULL, 0, 0,
+                                 wr.right - wr.left - LayoutWindow::panel_width(),
+                                 wr.bottom - wr.top,
+                                 SWP_NOMOVE | SWP_NOZORDER);
+                }
             } else {
                 bool need_expand = !g_layout_visible && !g_fm_visible && !g_cph_visible;
                 // Hide FM panel if visible
@@ -1637,7 +1641,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 );
                 ShowWindow(g_splitter_hwnd, SW_SHOW);
                 g_layout_visible = true;
-                if (need_expand) {
+                if (need_expand && !IsZoomed(hwnd)) {
                     RECT wr;
                     GetWindowRect(hwnd, &wr);
                     SetWindowPos(hwnd, NULL, 0, 0,
@@ -1645,7 +1649,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                  wr.bottom - wr.top,
                                  SWP_NOMOVE | SWP_NOZORDER);
                 } else {
-                    // Panel swapped, just reposition
+                    // Panel swapped or maximized — just reposition
                     SendMessageW(hwnd, WM_SIZE, 0, 0);
                 }
             }
@@ -1660,12 +1664,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 FileManagerWindow::hide();
                 ShowWindow(g_splitter_hwnd, SW_HIDE);
                 g_fm_visible = false;
-                RECT wr;
-                GetWindowRect(hwnd, &wr);
-                SetWindowPos(hwnd, NULL, 0, 0,
-                             wr.right - wr.left - FileManagerWindow::panel_width(),
-                             wr.bottom - wr.top,
-                             SWP_NOMOVE | SWP_NOZORDER);
+                if (IsZoomed(hwnd)) {
+                    SendMessageW(hwnd, WM_SIZE, 0, 0);
+                } else {
+                    RECT wr;
+                    GetWindowRect(hwnd, &wr);
+                    SetWindowPos(hwnd, NULL, 0, 0,
+                                 wr.right - wr.left - FileManagerWindow::panel_width(),
+                                 wr.bottom - wr.top,
+                                 SWP_NOMOVE | SWP_NOZORDER);
+                }
             } else {
                 bool need_expand = !g_layout_visible && !g_fm_visible && !g_cph_visible;
                 // Hide layout panel if visible
@@ -1696,7 +1704,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 );
                 ShowWindow(g_splitter_hwnd, SW_SHOW);
                 g_fm_visible = true;
-                if (need_expand) {
+                if (need_expand && !IsZoomed(hwnd)) {
                     RECT wr;
                     GetWindowRect(hwnd, &wr);
                     SetWindowPos(hwnd, NULL, 0, 0,
@@ -1704,7 +1712,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                  wr.bottom - wr.top,
                                  SWP_NOMOVE | SWP_NOZORDER);
                 } else {
-                    // Panel swapped, just reposition
+                    // Panel swapped or maximized — just reposition
                     SendMessageW(hwnd, WM_SIZE, 0, 0);
                 }
             }
@@ -1725,12 +1733,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 CphWindow::hide();
                 ShowWindow(g_splitter_hwnd, SW_HIDE);
                 g_cph_visible = false;
-                RECT wr;
-                GetWindowRect(hwnd, &wr);
-                SetWindowPos(hwnd, NULL, 0, 0,
-                             wr.right - wr.left - CphWindow::panel_width(),
-                             wr.bottom - wr.top,
-                             SWP_NOMOVE | SWP_NOZORDER);
+                if (IsZoomed(hwnd)) {
+                    SendMessageW(hwnd, WM_SIZE, 0, 0);
+                } else {
+                    RECT wr;
+                    GetWindowRect(hwnd, &wr);
+                    SetWindowPos(hwnd, NULL, 0, 0,
+                                 wr.right - wr.left - CphWindow::panel_width(),
+                                 wr.bottom - wr.top,
+                                 SWP_NOMOVE | SWP_NOZORDER);
+                }
             } else {
                 bool need_expand = !g_layout_visible && !g_fm_visible && !g_cph_visible;
                 // Hide other panels
@@ -1750,7 +1762,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 );
                 ShowWindow(g_splitter_hwnd, SW_SHOW);
                 g_cph_visible = true;
-                if (need_expand) {
+                if (need_expand && !IsZoomed(hwnd)) {
                     RECT wr;
                     GetWindowRect(hwnd, &wr);
                     SetWindowPos(hwnd, NULL, 0, 0,
@@ -1758,6 +1770,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                  wr.bottom - wr.top,
                                  SWP_NOMOVE | SWP_NOZORDER);
                 } else {
+                    // Panel swapped or maximized — just reposition
                     SendMessageW(hwnd, WM_SIZE, 0, 0);
                 }
             }
