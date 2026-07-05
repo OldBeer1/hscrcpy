@@ -8,6 +8,9 @@
 #include <windows.h>
 #endif
 
+// Verbose flag — set from CLI (-v). LOGV outputs only when this is true.
+extern bool g_verbose;
+
 static inline void log_to_file(const char *msg, int level) {
 #ifdef _WIN32
     static HANDLE hLog = INVALID_HANDLE_VALUE;
@@ -37,6 +40,7 @@ static inline void log_to_file(const char *msg, int level) {
 #define LOGI(fmt, ...) do { char _buf[1024]; snprintf(_buf, sizeof(_buf), "[I] " fmt, ##__VA_ARGS__); log_to_file(_buf, 0); } while(0)
 #define LOGW(fmt, ...) do { char _buf[1024]; snprintf(_buf, sizeof(_buf), "[W] " fmt, ##__VA_ARGS__); log_to_file(_buf, 1); } while(0)
 #define LOGE(fmt, ...) do { char _buf[1024]; snprintf(_buf, sizeof(_buf), "[E] " fmt, ##__VA_ARGS__); log_to_file(_buf, 2); } while(0)
+#define LOGV(fmt, ...) do { if (g_verbose) { char _buf[1024]; snprintf(_buf, sizeof(_buf), "[V] " fmt, ##__VA_ARGS__); log_to_file(_buf, 0); } } while(0)
 #define LOGD(fmt, ...) do { } while(0)
 #define LOGI_ONCE(fmt, ...) do { static bool _once = false; if (!_once) { _once = true; LOGI(fmt, ##__VA_ARGS__); } } while(0)
 

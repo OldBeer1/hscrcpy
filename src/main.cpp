@@ -68,6 +68,8 @@ static LRESULT CALLBACK SplitterWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
 static std::vector<HdcDevice> g_devices;
 static hscrcpy::CliArgs g_cli_args;
 
+bool g_verbose = false;
+
 static std::shared_ptr<DecodedImage> g_cur_frame;
 static std::mutex g_frame_mutex;
 static uint64_t g_last_rendered_seq = 0;
@@ -155,13 +157,39 @@ static bool ensure_d2d_render_target() {
     return true;
 }
 
+// Resize main window to match current frame aspect ratio (no black bars).
+// Formula: init_h=480, init_w=480×aspect, if init_w<360 then init_w=360 and
+// recalc init_h to preserve aspect. Skipped when maximized (SetWindowPos is
+// ignored on maximized windows anyway — see feedback_maximized_setwindowpos.md).
+static void resize_window_to_frame_aspect(HWND hwnd) {
+    if (g_screen_w <= 0 || g_screen_h <= 0 || IsZoomed(hwnd)) return;
+    double aspect = (double)g_screen_w / g_screen_h;
+    int init_h = 480;
+    int init_w = (int)(init_h * aspect);
+    if (init_w < 360) {
+        init_w = 360;
+        init_h = (int)(init_w / aspect);
+    }
+    RECT wr = {0, 0, init_w, init_h + TOOLBAR_H};
+    AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+    SetWindowPos(hwnd, NULL, 0, 0,
+                 wr.right - wr.left, wr.bottom - wr.top,
+                 SWP_NOMOVE | SWP_NOZORDER);
+}
+
 static void upload_frame_to_d2d(const DecodedImage &img) {
     if (!g_d2d_rt) return;
 
+    // Bitmap width = linesize (img.stride/4), NOT display width (img.width).
+    // sws writes rows of `stride` bytes = linesize*4. Bitmap must be linesize-wide
+    // so stride == bitmap_width*4 (no D2D misalignment). Display crop via srcRect at render.
+    UINT bmp_w = static_cast<UINT>(img.stride / 4);
+    UINT bmp_h = img.height;
+
     // Recreate bitmap if size changed
-    if (!g_d2d_bitmap || g_d2d_bmp_w != img.width || g_d2d_bmp_h != img.height) {
+    if (!g_d2d_bitmap || g_d2d_bmp_w != bmp_w || g_d2d_bmp_h != bmp_h) {
         if (g_d2d_bitmap) { g_d2d_bitmap->Release(); g_d2d_bitmap = nullptr; }
-        D2D1_SIZE_U sz = D2D1::SizeU(img.width, img.height);
+        D2D1_SIZE_U sz = D2D1::SizeU(bmp_w, bmp_h);
         D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
         HRESULT hr = g_d2d_rt->CreateBitmap(sz, props, &g_d2d_bitmap);
@@ -169,12 +197,13 @@ static void upload_frame_to_d2d(const DecodedImage &img) {
             LOGW("CreateBitmap failed (hr=0x%08X)", (unsigned)hr);
             return;
         }
-        g_d2d_bmp_w = img.width;
-        g_d2d_bmp_h = img.height;
-        LOGI("D2D bitmap created: %ux%u stride=%d data_size=%zu", img.width, img.height, img.stride, img.data.size());
+        g_d2d_bmp_w = bmp_w;
+        g_d2d_bmp_h = bmp_h;
+        LOGI("D2D bitmap created: %ux%u (display=%ux%u) stride=%d data_size=%zu",
+             bmp_w, bmp_h, img.width, img.height, img.stride, img.data.size());
     }
 
-    D2D1_RECT_U rc = D2D1::RectU(0, 0, img.width, img.height);
+    D2D1_RECT_U rc = D2D1::RectU(0, 0, bmp_w, bmp_h);
     HRESULT hr = g_d2d_bitmap->CopyFromMemory(&rc, img.data.data(), img.stride);
     if (FAILED(hr)) {
         LOGW("CopyFromMemory failed (hr=0x%08X)", (unsigned)hr);
@@ -846,7 +875,10 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_d2d_rt->BeginDraw();
             g_d2d_rt->Clear(D2D1::ColorF(0.12f, 0.12f, 0.12f));
             if (g_d2d_bitmap && g_d2d_bitmap_current) {
-                double aspect = (double)g_d2d_bmp_w / g_d2d_bmp_h;
+                // Use display dims (g_screen_w/h) for aspect, NOT bitmap dims (g_d2d_bmp_w/h):
+                // bitmap is linesize-wide (includes padding), would distort aspect.
+                double aspect = (g_screen_h > 0) ? (double)g_screen_w / g_screen_h
+                                                  : (double)g_d2d_bmp_w / g_d2d_bmp_h;
                 int draw_w, draw_h, off_x, off_y;
                 if ((double)cw / ch > aspect) {
                     draw_h = ch;
@@ -863,8 +895,11 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 D2D1_RECT_F drawRect = D2D1::RectF(
                     static_cast<FLOAT>(off_x), static_cast<FLOAT>(off_y),
                     static_cast<FLOAT>(off_x + draw_w), static_cast<FLOAT>(off_y + draw_h));
+                // srcRect crops bitmap (linesize-wide) to display area, discarding padding.
+                D2D1_RECT_F srcRect = D2D1::RectF(0, 0,
+                    static_cast<FLOAT>(g_screen_w), static_cast<FLOAT>(g_screen_h));
                 g_d2d_rt->DrawBitmap(g_d2d_bitmap, drawRect, 1.0f,
-                                      D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                                      D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, &srcRect);
             }
 
             // Layout highlight overlay (D2D)
@@ -1829,6 +1864,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 flush_cjk_buffer();
             }
         }
+        if (wp == 3) {
+            KillTimer(hwnd, 3);
+            if (g_mirroring && g_capture) {
+                resize_window_to_frame_aspect(hwnd);
+            }
+        }
         if (wp == 2) {
             KillTimer(hwnd, 2);
             std::string auto_serial = g_cli_args.serial;
@@ -1917,19 +1958,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         EnableWindow(g_btn_start_hwnd, TRUE);
 
-        double aspect = (double)g_screen_w / g_screen_h;
-        int min_w = 440;
-        int init_h = 480;
-        int init_w = (int)(init_h * aspect);
-        if (init_w < min_w) {
-            init_w = min_w;
-            init_h = (int)(init_w / aspect);
-        }
-
-        RECT wr = {0, 0, init_w, init_h + TOOLBAR_H};
-        AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
-        SetWindowPos(g_hwnd, NULL, CW_USEDEFAULT, CW_USEDEFAULT,
-                     wr.right - wr.left, wr.bottom - wr.top, SWP_NOMOVE | SWP_NOZORDER);
+        resize_window_to_frame_aspect(g_hwnd);
 
         std::string serial = g_hdc->serial();
         char buf[256];
@@ -1976,20 +2005,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case kMsgLayoutUpdate: {
         if (!g_mirroring || !g_capture || !g_hdc) break;
 
-        double aspect = (double)g_screen_w / g_screen_h;
-        int min_w = 440;
-        int init_h = 480;
-        int init_w = (int)(init_h * aspect);
-        if (init_w < min_w) {
-            init_w = min_w;
-            init_h = (int)(init_w / aspect);
-        }
-
-        RECT wr = {0, 0, init_w, init_h + TOOLBAR_H};
-        AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
-        SetWindowPos(g_hwnd, NULL, 0, 0,
-                     wr.right - wr.left, wr.bottom - wr.top,
-                     SWP_NOMOVE | SWP_NOZORDER);
+        // Debounce the window resize: rotation/scale changes can flicker rapidly
+        // (portrait↔landscape multiple times). Resizing on every change causes
+        // D2D RT resize + bitmap recreation storms → FPS collapse.
+        // SetTimer with existing ID resets the timer, so only the LAST change in a
+        // burst triggers an actual resize. 300ms covers most rotation flicker while
+        // keeping the switch feeling near-instant.
+        SetTimer(hwnd, 3, 300, NULL);
 
         std::string serial = g_hdc->serial();
         char buf[256];
@@ -2107,6 +2129,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             hscrcpy::CliParser::print_usage("hscrcpy");
             return 0;
         }
+        g_verbose = g_cli_args.verbose;
     }
 
     WNDCLASSEXA canvas_wc = {};
