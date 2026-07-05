@@ -55,6 +55,7 @@ private:
     bool ensure_uitest_agent();
     void reconnect_loop();
     void task_loop();
+    void shell_bg_loop();
 
     HdcWrapper &hdc_;
     uint16_t base_port_ = 0;
@@ -71,11 +72,29 @@ private:
     std::atomic<uint32_t> last_touch_y_{0};
 
     std::chrono::steady_clock::time_point last_move_time_;
+    // Move coalescing: only one move task in queue, uses latest coordinates.
+    // pending_move_x_/y_ are only written from the UI thread (WM_MOUSEMOVE handler),
+    // so no interleaving between writes. Task thread reads them atomically — at worst
+    // it sees a slightly stale y from the previous store, which is harmless for move.
+    std::atomic<bool> has_pending_move_{false};
+    std::atomic<uint32_t> pending_move_x_{0};
+    std::atomic<uint32_t> pending_move_y_{0};
+    // Move generation: incremented on touchUp so stale queued moves self-cancel
+    // without flushing the entire queue (which could drop touchDown events).
+    std::atomic<uint64_t> move_generation_{0};
     std::queue<std::function<void()>> task_queue_;
     std::mutex task_mutex_;
     std::condition_variable task_cv_;
     std::atomic<bool> task_running_{false};
     std::thread task_thread_;
+
+    // Background shell thread: runs touchUp shell fallback without blocking task_queue.
+    // Ensures detached threads don't outlive this object (use-after-free fix).
+    std::thread shell_bg_thread_;
+    std::queue<std::string> shell_bg_queue_;
+    std::mutex shell_bg_mutex_;
+    std::condition_variable shell_bg_cv_;
+    std::atomic<bool> shell_bg_running_{false};
 
 };
 

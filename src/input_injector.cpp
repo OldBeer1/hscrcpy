@@ -44,8 +44,11 @@ InputInjector::~InputInjector() {
     reconnect_running_ = false;
     task_running_ = false;
     task_cv_.notify_all();
+    shell_bg_running_ = false;
+    shell_bg_cv_.notify_all();
     if (task_thread_.joinable()) task_thread_.join();
     if (reconnect_thread_.joinable()) reconnect_thread_.join();
+    if (shell_bg_thread_.joinable()) shell_bg_thread_.join();
     cleanup();
 }
 
@@ -73,25 +76,35 @@ bool InputInjector::init(const std::string &uitest_version) {
         if (n2 != n1) break;
     }
 
-    if (!ensure_uitest_agent()) {
-        LOGW("uitest agent may not be available");
-    }
+    bool agent_found = ensure_uitest_agent();
 
     if (!push_agent_so()) {
         LOGW("Failed to push agent SO, will use uitest uiInput shell commands");
+        use_socket_mode_ = false;
+    } else if (!agent_found) {
+        // No abstract socket found — don't try TCP 8012 (unreliable on cloud phones,
+        // e.g. port 8012 is a system service, not uitest agent).
+        // reconnect_loop will find abstract socket and upgrade to socket mode.
+        LOGW("uitest agent not available, using shell commands until reconnect");
         use_socket_mode_ = false;
     } else if (!setup_control_port()) {
         LOGW("Failed to setup control port, will use uitest uiInput shell commands");
         use_socket_mode_ = false;
     } else {
         use_socket_mode_ = true;
-        reconnect_running_ = true;
-        reconnect_thread_ = std::thread(&InputInjector::reconnect_loop, this);
     }
+
+    // Always start reconnect loop — it will find abstract socket and upgrade to socket mode
+    reconnect_running_ = true;
+    reconnect_thread_ = std::thread(&InputInjector::reconnect_loop, this);
 
     // Always start task thread — all inject methods use task_queue_
     task_running_ = true;
     task_thread_ = std::thread(&InputInjector::task_loop, this);
+
+    // Background shell thread for touchUp fallback — safe lifecycle vs detach
+    shell_bg_running_ = true;
+    shell_bg_thread_ = std::thread(&InputInjector::shell_bg_loop, this);
 
     LOGI("Input injector initialized (socket_mode=%s, abstract_control=%s)",
          use_socket_mode_ ? "true" : "false", use_abstract_control_ ? "true" : "false");
@@ -467,16 +480,35 @@ void InputInjector::queue_touch_move(uint32_t x, uint32_t y) {
     if (elapsed_ms < 16) return;
     last_move_time_ = now;
 
+    // Update pending move position (always update so task uses latest coords)
+    pending_move_x_.store(x);
+    pending_move_y_.store(y);
+
+    // If there's already a pending move task in the queue, don't add another
+    if (has_pending_move_.exchange(true)) {
+        return;
+    }
+
+    uint64_t gen = move_generation_.load();
+
     std::lock_guard<std::mutex> lock(task_mutex_);
-    if (use_socket_mode_) {
-        char json[512];
-        snprintf(json, sizeof(json),
-                 "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
-                 "\"params\":{\"api\":\"touchMove\",\"args\":{\"x\":%u,\"y\":%u}}}",
-                 x, y);
-        std::string msg(json);
-        task_queue_.push([this, msg, x, y]() {
-            if (send_to_socket(msg)) {
+    task_queue_.push([this, gen]() {
+        has_pending_move_.store(false);
+
+        // Stale move: touchUp already happened (generation advanced), skip
+        if (gen != move_generation_.load()) return;
+
+        // Read the latest coordinates (may have been updated since enqueue)
+        uint32_t x = pending_move_x_.load();
+        uint32_t y = pending_move_y_.load();
+
+        if (use_socket_mode_) {
+            char json[512];
+            snprintf(json, sizeof(json),
+                     "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
+                     "\"params\":{\"api\":\"touchMove\",\"args\":{\"x\":%u,\"y\":%u}}}",
+                     x, y);
+            if (send_to_socket(json)) {
                 last_touch_x_.store(x);
                 last_touch_y_.store(y);
                 return;
@@ -488,33 +520,31 @@ void InputInjector::queue_touch_move(uint32_t x, uint32_t y) {
             hdc_.shell_command(cmd, nullptr, 3);
             last_touch_x_.store(x);
             last_touch_y_.store(y);
-        });
-    } else {
-        uint32_t from_x = last_touch_x_.load(), from_y = last_touch_y_.load();
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "uinput -T -m %u %u %u %u", from_x, from_y, x, y);
-        std::string s(cmd);
-        task_queue_.push([this, s, x, y]() {
-            hdc_.shell_command(s, nullptr, 3);
+        } else {
+            uint32_t from_x = last_touch_x_.load(), from_y = last_touch_y_.load();
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd), "uinput -T -m %u %u %u %u", from_x, from_y, x, y);
+            hdc_.shell_command(cmd, nullptr, 3);
             last_touch_x_.store(x);
             last_touch_y_.store(y);
-        });
-    }
+        }
+    });
     task_cv_.notify_one();
 }
 
 void InputInjector::queue_touch_up(uint32_t x, uint32_t y) {
     std::lock_guard<std::mutex> lock(task_mutex_);
 
-    // Flush stale queued moves
-    while (!task_queue_.empty()) {
-        task_queue_.pop();
-    }
+    // Increment generation so stale queued moves self-cancel without flushing
+    // the entire queue (which could drop pending touchDown events).
+    move_generation_.fetch_add(1);
+    has_pending_move_.store(false);
 
     // Always send touchUp via both socket AND shell.
     // Socket may silently fail (agent not processing, TCP buffering, etc).
     // Shell command via hdc is the guaranteed delivery path.
     if (use_socket_mode_) {
+        bool socket_sent = false;
         char json[512];
         snprintf(json, sizeof(json),
                  "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
@@ -537,17 +567,30 @@ void InputInjector::queue_touch_up(uint32_t x, uint32_t y) {
                     Sleep(1);
                 }
                 if (remaining == 0) {
+                    socket_sent = true;
                     LOGI("touchUp(%u,%u) socket sent", x, y);
                 }
             }
             sock_lock.unlock();
         }
-        // ALSO queue shell fallback as guaranteed delivery
+
         char cmd[256];
         snprintf(cmd, sizeof(cmd), "uinput -T -u %u %u", x, y);
         std::string s(cmd);
-        task_queue_.push([this, s]() { hdc_.shell_command(s, nullptr, 3); });
-        task_cv_.notify_one();
+        if (socket_sent) {
+            // Shell fallback on background shell thread — guaranteed delivery without
+            // blocking task queue. Socket send succeeded but we can't be sure the agent
+            // processed it (TCP buffering, etc).
+            {
+                std::lock_guard<std::mutex> bg_lock(shell_bg_mutex_);
+                shell_bg_queue_.push(s);
+            }
+            shell_bg_cv_.notify_one();
+        } else {
+            // Socket failed, queue shell fallback normally
+            task_queue_.push([this, s]() { hdc_.shell_command(s, nullptr, 3); });
+            task_cv_.notify_one();
+        }
     } else {
         char cmd[256];
         snprintf(cmd, sizeof(cmd), "uinput -T -u %u %u", x, y);
@@ -856,6 +899,7 @@ void InputInjector::reconnect_loop() {
 
         if (setup_control_port()) {
             LOGI("Control socket reconnected on port %u", local_control_port_);
+            use_socket_mode_ = true;
             consecutive_failures = 0;
         } else {
             LOGW("Reconnect: setup_control_port failed");
@@ -886,6 +930,22 @@ void InputInjector::task_loop() {
             task_queue_.pop();
         }
         task();
+    }
+}
+
+void InputInjector::shell_bg_loop() {
+    while (shell_bg_running_) {
+        std::string cmd;
+        {
+            std::unique_lock<std::mutex> lock(shell_bg_mutex_);
+            shell_bg_cv_.wait_for(lock, std::chrono::milliseconds(100), [this] {
+                return !shell_bg_queue_.empty() || !shell_bg_running_;
+            });
+            if (shell_bg_queue_.empty()) continue;
+            cmd = std::move(shell_bg_queue_.front());
+            shell_bg_queue_.pop();
+        }
+        hdc_.shell_command(cmd, nullptr, 3);
     }
 }
 
