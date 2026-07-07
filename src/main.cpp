@@ -314,13 +314,14 @@ static HICON load_png_icon(const char *relative_path, int size,
 }
 
 static HHOOK g_msgbox_hook = NULL;
+static HWND g_msgbox_parent = NULL;
 
 static LRESULT CALLBACK MsgBoxCBTProc(int nCode, WPARAM wp, LPARAM lp) {
     if (nCode == HCBT_ACTIVATE) {
         HWND hMsg = (HWND)wp;
-        if (g_hwnd) {
+        if (g_msgbox_parent) {
             RECT pr, mr;
-            GetWindowRect(g_hwnd, &pr);
+            GetWindowRect(g_msgbox_parent, &pr);
             GetWindowRect(hMsg, &mr);
             int x = pr.left + (pr.right - pr.left - (mr.right - mr.left)) / 2;
             int y = pr.top + (pr.bottom - pr.top - (mr.bottom - mr.top)) / 2;
@@ -332,9 +333,10 @@ static LRESULT CALLBACK MsgBoxCBTProc(int nCode, WPARAM wp, LPARAM lp) {
     return CallNextHookEx(g_msgbox_hook, nCode, wp, lp);
 }
 
-static int center_msgbox(const char *text, const char *title, UINT type) {
+static int center_msgbox(const char *text, const char *title, UINT type, HWND hParent = NULL) {
+    g_msgbox_parent = hParent ? hParent : g_hwnd;
     g_msgbox_hook = SetWindowsHookExA(WH_CBT, MsgBoxCBTProc, NULL, GetCurrentThreadId());
-    int ret = MessageBoxA(g_hwnd, text, title, type);
+    int ret = MessageBoxA(g_msgbox_parent, text, title, type);
     if (g_msgbox_hook) {
         UnhookWindowsHookEx(g_msgbox_hook);
         g_msgbox_hook = NULL;
@@ -351,14 +353,14 @@ static void set_status(const char *msg) {
 }
 
 static const char *bitrate_label(int bitrate) {
-    if (bitrate >= 1000000) {
+    if (bitrate >= 1048576) {
         static char buf[32];
-        snprintf(buf, sizeof(buf), "%dM", bitrate / 1000000);
+        snprintf(buf, sizeof(buf), "%dMibps", bitrate / 1048576);
         return buf;
     }
-    if (bitrate >= 1000) {
+    if (bitrate >= 1024) {
         static char buf[32];
-        snprintf(buf, sizeof(buf), "%dK", bitrate / 1000);
+        snprintf(buf, sizeof(buf), "%dKibps", bitrate / 1024);
         return buf;
     }
     return "?";
@@ -432,11 +434,13 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         struct SE { const char *first; int second; };
         SE scale_entries[] = {{"1",1},{"2",2},{"3",3},{"4",4},{"5",5}};
         SE bitrate_entries[] = {
-            {"30 Mbps",31457280},{"20 Mbps",20971520},
-            {"8 Mbps",8388608},{"4 Mbps",4194304},{"2 Mbps",2097152}
+            {"4 Mibps",4194304},{"8 Mibps",8388608},
+            {"12 Mibps",12582912},{"16 Mibps",16777216},
+            {"20 Mibps",20971520},{"24 Mibps",25165824},
+            {"30 Mibps",31457280}
         };
         SE fps_entries[] = {
-            {"60 fps",60},{"30 fps",30},{"24 fps",24},{"15 fps",15},{"10 fps",10}
+            {"10 fps",10},{"15 fps",15},{"24 fps",24},{"30 fps",30},{"60 fps",60}
         };
         SE timeout_entries[] = {
             {"60s",60},{"120s",120},{"180s",180},{"300s",300},{"600s",600}
@@ -446,7 +450,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
         };
 
         std::vector<SE> sc(scale_entries, scale_entries + 5);
-        std::vector<SE> br(bitrate_entries, bitrate_entries + 5);
+        std::vector<SE> br(bitrate_entries, bitrate_entries + 7);
         std::vector<SE> fp(fps_entries, fps_entries + 5);
         std::vector<SE> to(timeout_entries, timeout_entries + 5);
         std::vector<SE> ifr(iframe_entries, iframe_entries + 5);
@@ -492,10 +496,23 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wp, LPARAM l
             char buf[32];
             GetWindowTextA(GetDlgItem(hDlg, 132), buf, sizeof(buf));
             pending->local_base_port = atoi(buf);
-            if (pending->local_base_port < 1024) pending->local_base_port = 9900;
+            if (pending->local_base_port < 1024 || pending->local_base_port > 60000) {
+                center_msgbox("Port Base must be between 1024 and 60000.", "Invalid Input", MB_OK | MB_ICONWARNING, hDlg);
+                SetFocus(GetDlgItem(hDlg, 132));
+                SendDlgItemMessageA(hDlg, 132, EM_SETSEL, 0, -1);
+                return TRUE;
+            }
             GetWindowTextA(GetDlgItem(hDlg, 133), buf, sizeof(buf));
             pending->local_port_range = atoi(buf);
-            if (pending->local_port_range < 10) pending->local_port_range = 500;
+            int max_range = 65535 - pending->local_base_port;
+            if (pending->local_port_range < 10 || pending->local_port_range > max_range) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "Port Range must be between 10 and %d.", max_range);
+                center_msgbox(msg, "Invalid Input", MB_OK | MB_ICONWARNING, hDlg);
+                SetFocus(GetDlgItem(hDlg, 133));
+                SendDlgItemMessageA(hDlg, 133, EM_SETSEL, 0, -1);
+                return TRUE;
+            }
 
             AppConfig::instance() = *pending;
             config_save();
@@ -547,14 +564,23 @@ static void show_settings_dialog() {
     struct {
         DLGTEMPLATE dlg;
         WORD menu, cls, title;
+        WORD pt;
+        WORD weight;
+        BYTE italic, charset;
+        wchar_t typeface[32];
     } tmpl = {};
-    tmpl.dlg.style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_CENTER | DS_MODALFRAME;
-    tmpl.dlg.cx = 280;
-    tmpl.dlg.cy = 230;
+    tmpl.dlg.style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_CENTER | DS_MODALFRAME | DS_SETFONT;
+    tmpl.dlg.cx = 204;
+    tmpl.dlg.cy = 144;
     tmpl.dlg.cdit = 25;
     tmpl.menu = 0;
     tmpl.cls = 0;
     tmpl.title = 0;
+    tmpl.pt = 6;
+    tmpl.weight = FW_NORMAL;
+    tmpl.italic = 0;
+    tmpl.charset = DEFAULT_CHARSET;
+    wcscpy(tmpl.typeface, L"MS Shell Dlg");
 
     static std::vector<BYTE> data;
     data.resize(8192);
@@ -564,6 +590,11 @@ static void show_settings_dialog() {
 
     write(&tmpl.dlg, sizeof(tmpl.dlg));
     p += sizeof(WORD) * 3;
+    write(&tmpl.pt, sizeof(WORD));
+    write(&tmpl.weight, sizeof(WORD));
+    write(&tmpl.italic, 1);
+    write(&tmpl.charset, 1);
+    write(tmpl.typeface, (wcslen(tmpl.typeface) + 1) * sizeof(wchar_t));
 
     auto writeItem = [&](DWORD style, WORD x, WORD y, WORD cx, WORD cy, WORD id, const wchar_t *cls, const wchar_t *text) {
         align();
@@ -584,34 +615,38 @@ static void show_settings_dialog() {
     auto ED = WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER | WS_TABSTOP;
     auto GRP = WS_CHILD | WS_VISIBLE | BS_GROUPBOX;
 
-    writeItem(GRP, 4, 2, 268, 52, (WORD)-1, L"BUTTON", L"USB Stream");
-    writeItem(L, 10, 16, 35, 8, (WORD)-1, L"STATIC", L"Scale:");
-    writeItem(CB, 48, 14, 45, 200, 110, L"COMBOBOX", L"");
-    writeItem(L, 100, 16, 35, 8, (WORD)-1, L"STATIC", L"Bitrate:");
-    writeItem(CB, 140, 14, 60, 200, 111, L"COMBOBOX", L"");
-    writeItem(L, 208, 16, 20, 8, (WORD)-1, L"STATIC", L"FPS:");
-    writeItem(CB, 232, 14, 35, 200, 112, L"COMBOBOX", L"");
+    // USB Stream group (y=2, cy=32) — label cy=8 fixes text clipping; cx widened for colon
+    writeItem(GRP, 4, 2, 198, 32, (WORD)-1, L"BUTTON", L"USB Stream");
+    writeItem(L, 6, 15, 22, 8, (WORD)-1, L"STATIC", L"Scale:");
+    writeItem(CB, 30, 13, 28, 200, 110, L"COMBOBOX", L"");
+    writeItem(L, 62, 15, 30, 8, (WORD)-1, L"STATIC", L"Bitrate:");
+    writeItem(CB, 94, 13, 46, 200, 111, L"COMBOBOX", L"");
+    writeItem(L, 142, 15, 18, 8, (WORD)-1, L"STATIC", L"FPS:");
+    writeItem(CB, 160, 13, 36, 200, 112, L"COMBOBOX", L"");
 
-    writeItem(GRP, 4, 58, 268, 52, (WORD)-1, L"BUTTON", L"TCP Stream");
-    writeItem(L, 10, 72, 35, 8, (WORD)-1, L"STATIC", L"Scale:");
-    writeItem(CB, 48, 70, 45, 200, 120, L"COMBOBOX", L"");
-    writeItem(L, 100, 72, 35, 8, (WORD)-1, L"STATIC", L"Bitrate:");
-    writeItem(CB, 140, 70, 60, 200, 121, L"COMBOBOX", L"");
-    writeItem(L, 208, 72, 20, 8, (WORD)-1, L"STATIC", L"FPS:");
-    writeItem(CB, 232, 70, 35, 200, 122, L"COMBOBOX", L"");
+    // TCP Stream group (y=36, cy=32)
+    writeItem(GRP, 4, 36, 198, 32, (WORD)-1, L"BUTTON", L"TCP Stream");
+    writeItem(L, 6, 49, 22, 8, (WORD)-1, L"STATIC", L"Scale:");
+    writeItem(CB, 30, 47, 28, 200, 120, L"COMBOBOX", L"");
+    writeItem(L, 62, 49, 30, 8, (WORD)-1, L"STATIC", L"Bitrate:");
+    writeItem(CB, 94, 47, 46, 200, 121, L"COMBOBOX", L"");
+    writeItem(L, 142, 49, 18, 8, (WORD)-1, L"STATIC", L"FPS:");
+    writeItem(CB, 160, 47, 36, 200, 122, L"COMBOBOX", L"");
 
-    writeItem(GRP, 4, 114, 268, 68, (WORD)-1, L"BUTTON", L"Advanced");
-    writeItem(L, 10, 128, 55, 8, (WORD)-1, L"STATIC", L"Idle Timeout:");
-    writeItem(CB, 68, 126, 50, 200, 130, L"COMBOBOX", L"");
-    writeItem(L, 125, 128, 25, 8, (WORD)-1, L"STATIC", L"IDR:");
-    writeItem(CB, 153, 126, 55, 200, 131, L"COMBOBOX", L"");
-    writeItem(L, 10, 148, 55, 8, (WORD)-1, L"STATIC", L"Port Base:");
-    writeItem(ED, 68, 146, 45, 12, 132, L"EDIT", L"");
-    writeItem(L, 120, 148, 55, 8, (WORD)-1, L"STATIC", L"Port Range:");
-    writeItem(ED, 178, 146, 45, 12, 133, L"EDIT", L"");
+    // Advanced group (y=70, cy=50) — col1 control x=50, col2 control x=120 (aligned)
+    writeItem(GRP, 4, 70, 198, 50, (WORD)-1, L"BUTTON", L"Advanced");
+    writeItem(L, 6, 83, 42, 8, (WORD)-1, L"STATIC", L"Idle Timeout:");
+    writeItem(CB, 50, 81, 42, 200, 130, L"COMBOBOX", L"");
+    writeItem(L, 96, 83, 22, 8, (WORD)-1, L"STATIC", L"IDR:");
+    writeItem(CB, 120, 81, 40, 200, 131, L"COMBOBOX", L"");
+    writeItem(L, 6, 99, 42, 8, (WORD)-1, L"STATIC", L"Port Base:");
+    writeItem(ED, 50, 97, 38, 10, 132, L"EDIT", L"");
+    writeItem(L, 96, 99, 48, 8, (WORD)-1, L"STATIC", L"Port Range:");
+    writeItem(ED, 146, 97, 38, 10, 133, L"EDIT", L"");
 
-    writeItem(WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP, 155, 192, 50, 14, IDOK, L"BUTTON", L"OK");
-    writeItem(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP, 215, 192, 50, 14, IDCANCEL, L"BUTTON", L"Cancel");
+    // Buttons (y=126)
+    writeItem(WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP, 110, 126, 42, 11, IDOK, L"BUTTON", L"OK");
+    writeItem(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP, 158, 126, 42, 11, IDCANCEL, L"BUTTON", L"Cancel");
 
     memcpy(data.data(), &tmpl.dlg, sizeof(tmpl.dlg));
 

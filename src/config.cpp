@@ -61,8 +61,8 @@ void config_load() {
     if (c.usb_frame_rate > 60) c.usb_frame_rate = 60;
     if (c.tcp_frame_rate < 1) c.tcp_frame_rate = 1;
     if (c.tcp_frame_rate > 60) c.tcp_frame_rate = 60;
-    if (c.local_base_port < 1024) c.local_base_port = 9900;
-    if (c.local_base_port > 60000) c.local_base_port = 9900;
+    if (c.local_base_port < 1024) c.local_base_port = 10000;
+    if (c.local_base_port > 60000) c.local_base_port = 10000;
     if (c.local_port_range < 10) c.local_port_range = 500;
     if (c.local_base_port + c.local_port_range > 65535) c.local_port_range = 65535 - c.local_base_port;
     if (c.idle_timeout_sec < 10) c.idle_timeout_sec = 300;

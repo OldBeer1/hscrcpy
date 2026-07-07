@@ -23,3 +23,6 @@ client/
 
 # Temp
 NUL
+
+# Release packaging (runtime binaries for distribution)
+hscrcpy/
