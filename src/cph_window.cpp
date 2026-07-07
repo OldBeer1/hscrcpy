@@ -71,7 +71,6 @@ CphWindow::OnShellCommand CphWindow::g_on_shell;
 CphWindow::OnPushFile CphWindow::g_on_push;
 CphWindow::OnBusy CphWindow::g_on_busy;
 int CphWindow::g_current_tab = TAB_GNSS;
-bool CphWindow::g_traj_running = false;
 std::atomic<bool> CphWindow::g_async_busy{false};
 UINT_PTR CphWindow::g_refresh_timer = 0;
 
@@ -500,11 +499,8 @@ void CphWindow::handle_async_done(AsyncResult *r) {
 
     case ASYNC_START_TRAJ:
         if (r->ok && r->output.find("error:") == std::string::npos) {
-            g_traj_running = true;
             show_toast("Trajectory playback started", true);
             set_status(r->cmd.c_str());
-            EnableWindow(g_gnss_traj_start_btn, FALSE);
-            EnableWindow(g_gnss_traj_stop_btn, TRUE);
         } else {
             std::string err = r->output.empty() ? "Unknown error" : r->output;
             while (!err.empty() && (err.back() == '\n' || err.back() == '\r')) err.pop_back();
@@ -517,11 +513,8 @@ void CphWindow::handle_async_done(AsyncResult *r) {
         // Stop may return "gnss server response timeout" even when successfully stopped
         if (r->ok && (r->output.find("error:") == std::string::npos ||
                       r->output.find("timeout") != std::string::npos)) {
-            g_traj_running = false;
             show_toast("Trajectory playback stopped", true);
             set_status("Trajectory stopped");
-            EnableWindow(g_gnss_traj_start_btn, TRUE);
-            EnableWindow(g_gnss_traj_stop_btn, FALSE);
         } else {
             std::string err = r->output.empty() ? "Unknown error" : r->output;
             while (!err.empty() && (err.back() == '\n' || err.back() == '\r')) err.pop_back();
@@ -1073,7 +1066,6 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                               edit_x, ty, 90, BTN_H);
             g_gnss_traj_stop_btn = make_btn(page, L"Stop", IDC_GNSS_TRAJ_STOP_BTN,
                                              edit_x + 98, ty, 90, BTN_H);
-            EnableWindow(g_gnss_traj_stop_btn, FALSE);
         }
 
         // ── Battery page ──────────────────────────────────

@@ -54,6 +54,7 @@ public:
     static int panel_width();
     static void set_panel_width(int w);
     static void reposition(int x, int y, int w, int h);
+    static void show_toast(const char *text, bool success = true, HWND parent = nullptr);
 
 private:
     static constexpr int TOOLBAR_H = 58;
@@ -123,7 +124,6 @@ private:
     static void update_status();
     static void msg_box(const char *title, const char *fmt, ...);
     static bool confirm(const char *title, const char *fmt, ...);
-    static void show_toast(const char *text, bool success = true);
     static std::string build_remote_path(const std::string &dir, const std::string &name);
     static bool parse_ls_line(const std::string &line, FileEntry &entry);
     static void populate_list();
@@ -168,6 +168,10 @@ private:
     static HIMAGELIST g_img_list;
     static HWND g_toast_hwnd;
 };
+
+// Get user's Downloads directory (with trailing backslash). Falls back to Desktop.
+// Defined in file_manager_window.cpp; shared by main.cpp for screenshot/recording saves.
+std::string get_download_dir();
 
 } // namespace hscrcpy
 

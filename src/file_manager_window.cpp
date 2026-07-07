@@ -509,7 +509,6 @@ static bool show_custom_dialog(const std::wstring &title, const std::wstring &te
 // ── Text viewer dialog ──────────────────────────────────
 
 // Forward declarations for functions defined later in this file
-static std::string get_download_dir();
 static std::string shell_escape(const std::string &s);
 static std::string wide_to_utf8(const std::wstring &ws);
 
@@ -951,7 +950,7 @@ static FileCategory sniff_content_category(const std::string &content) {
 }
 
 // Get user's Downloads directory for pulled files
-static std::string get_download_dir() {
+std::string get_download_dir() {
     PWSTR downloads_path = nullptr;
     HRESULT hr = SHGetKnownFolderPath(FOLDERID_Downloads, 0, NULL, &downloads_path);
     if (SUCCEEDED(hr) && downloads_path) {
@@ -2529,8 +2528,9 @@ LRESULT CALLBACK FileManagerWindow::ToastWndProc(HWND hwnd, UINT msg, WPARAM wp,
     return 0;
 }
 
-void FileManagerWindow::show_toast(const char *text, bool success) {
-    if (!g_hwnd) return;
+void FileManagerWindow::show_toast(const char *text, bool success, HWND parent) {
+    HWND owner = parent ? parent : g_hwnd;
+    if (!owner) return;
 
     // Register toast window class once
     static bool registered = false;
@@ -2551,7 +2551,7 @@ void FileManagerWindow::show_toast(const char *text, bool success) {
     }
 
     // Measure text width
-    HDC hdc = GetDC(g_hwnd);
+    HDC hdc = GetDC(owner);
     HFONT hf = CreateFontW(16, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0,
                             DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     HFONT old = (HFONT)SelectObject(hdc, hf);
@@ -2560,16 +2560,16 @@ void FileManagerWindow::show_toast(const char *text, bool success) {
     GetTextExtentPoint32W(hdc, wtext.c_str(), (int)wtext.size(), &sz);
     SelectObject(hdc, old);
     DeleteObject(hf);
-    ReleaseDC(g_hwnd, hdc);
+    ReleaseDC(owner, hdc);
 
     int tw = sz.cx + 28;
     int th = 32;
     RECT parent_rc;
-    GetClientRect(g_hwnd, &parent_rc);
+    GetClientRect(owner, &parent_rc);
     int x = (parent_rc.right - tw) / 2;
     int y = (parent_rc.bottom - th) / 2;
     POINT pt = {x, y};
-    ClientToScreen(g_hwnd, &pt);
+    ClientToScreen(owner, &pt);
     x = pt.x;
     y = pt.y;
 
@@ -2577,7 +2577,7 @@ void FileManagerWindow::show_toast(const char *text, bool success) {
                                     L"HscrcpyToast", wtext.c_str(),
                                     WS_POPUP | WS_CLIPCHILDREN,
                                     x, y, tw, th,
-                                    g_hwnd, NULL, g_inst, NULL);
+                                    owner, NULL, g_inst, NULL);
     if (g_toast_hwnd) {
         SetWindowLongPtrW(g_toast_hwnd, GWLP_USERDATA, success ? 1 : 0);
         // Semi-transparent

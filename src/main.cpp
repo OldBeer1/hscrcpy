@@ -23,6 +23,11 @@
 #include <cstdio>
 #include <memory>
 #include <algorithm>
+#include <atomic>
+#include <thread>
+#include <ctime>
+#include <sstream>
+#include <string>
 
 using namespace hscrcpy;
 
@@ -51,12 +56,29 @@ static HWND g_btn_quality_hwnd = nullptr;
 static HWND g_btn_layout_hwnd = nullptr;
 static HWND g_btn_fm_hwnd = nullptr;
 static HWND g_btn_cph_hwnd = nullptr;
+static HWND g_btn_record_hwnd = nullptr;
+static HWND g_btn_screenshot_hwnd = nullptr;
 static HWND g_status_hwnd = nullptr;
 static HWND g_canvas_hwnd = nullptr;
 static bool g_layout_visible = false;
 static bool g_fm_visible = false;
 static bool g_cph_visible = false;
 static bool g_is_cloud_phone = false;
+
+// Recording state (phone-side aa start screenrecorder + mediatool pull)
+static std::atomic<bool> g_recording{false};
+static std::string g_record_name;          // CustomizedFileName, e.g. hscrcpy_<ts>.mp4
+static std::string g_record_local_path;    // downloaded recording path (for toast+open on UI thread)
+static std::string g_screenshot_local_path; // downloaded screenshot path (for toast+open on UI thread)
+static std::string g_record_serial;        // serial captured at start (decouples from g_hdc lifetime)
+static std::thread g_record_thread;
+static constexpr int kRecordTimerId = 4;    // 30-min auto-stop timer
+static constexpr UINT kRecordMaxMs = 30 * 60 * 1000;
+
+// Recording/screenshot UI notification messages (WM_USER + 11..13, after WmNotify)
+static constexpr UINT kMsgRecordStarted  = WM_USER + 11;
+static constexpr UINT kMsgRecordStopped  = WM_USER + 12;
+static constexpr UINT kMsgScreenshotDone = WM_USER + 13;
 
 // Splitter bar child window
 static HWND g_splitter_hwnd = nullptr;
@@ -97,6 +119,8 @@ static uint32_t g_device_screen_w = 0, g_device_screen_h = 0;
 #define ID_BTN_LAYOUT  1012
 #define ID_BTN_FM      1013
 #define ID_BTN_CPH     1014
+#define ID_BTN_RECORD  1015
+#define ID_BTN_SCREENSHOT 1016
 
 static ULONG_PTR g_gdiplus_token = 0;
 
@@ -1142,6 +1166,222 @@ static void join_startup_thread() {
     if (g_startup_thread.joinable()) g_startup_thread.join();
 }
 
+static void join_record_thread() {
+    if (g_record_thread.joinable()) g_record_thread.join();
+}
+
+// --- Recording / screenshot helpers ---
+
+// YYYYMMDD_HHMMSS
+static std::string make_timestamp() {
+    std::time_t t = std::time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &t);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm);
+    return buf;
+}
+
+// Open a file with the default associated application.
+static void open_file_default(const std::string &path) {
+    int wlen = MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, NULL, 0);
+    if (wlen <= 0) return;
+    std::wstring wpath(wlen - 1, 0);
+    MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, &wpath[0], wlen);
+    ShellExecuteW(NULL, L"open", wpath.c_str(), NULL, NULL, SW_SHOWNORMAL);
+}
+
+// Parse mediatool query output. Sets uri_out (file://media/...) when present,
+// or path_out (absolute /path) when the device returns a directly-downloadable path.
+// Returns false if no result found.
+static bool parse_media_query(const std::string &out, std::string &uri_out, std::string &path_out) {
+    if (out.find("find 0 result") != std::string::npos) return false;
+    std::istringstream ss(out);
+    std::string line;
+    bool want_next = false;
+    bool want_uri = false;
+    while (std::getline(ss, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line == "uri") { want_next = true; want_uri = true; continue; }
+        if (line == "path") { want_next = true; want_uri = false; continue; }
+        if (want_next) {
+            if (line.empty()) continue;
+            std::string v = line;
+            if (v.front() == '"') v.erase(0, 1);
+            if (!v.empty() && v.back() == '"') v.pop_back();
+            if (!v.empty()) {
+                if (want_uri) uri_out = v; else path_out = v;
+                return true;
+            }
+            want_next = false;
+        }
+    }
+    // Fallback: scan for file://media/ anywhere
+    size_t u = out.find("file://media/");
+    if (u != std::string::npos) {
+        std::string v = out.substr(u);
+        size_t end = v.find_first_of("\"\r\n");
+        if (end != std::string::npos) v = v.substr(0, end);
+        if (!v.empty()) { uri_out = v; return true; }
+    }
+    return false;
+}
+
+// Start phone-side screen recording via aa start screenrecorder.
+static void start_recording() {
+    if (!g_hdc) {
+        center_msgbox("Start mirroring first to record.", "HScrcpy", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    if (g_recording) { set_status("Already recording"); return; }
+    g_record_name = "hscrcpy_" + make_timestamp() + ".mp4";
+    std::string serial = g_hdc->serial();
+    g_record_serial = serial;
+    std::string name = g_record_name;
+    join_record_thread();
+    g_recording = true;
+    set_status("Recording started");
+    g_record_thread = std::thread([serial, name]() {
+        HdcWrapper hdc(serial);
+        std::string out;
+        std::string cmd = "aa start -b com.huawei.hmos.screenrecorder "
+                          "-a com.huawei.hmos.screenrecorder.ServiceExtAbility "
+                          "--ps \"CustomizedFileName\" \"" + name + "\"";
+        bool ok = hdc.shell_command(cmd, &out, 15) &&
+                  out.find("start ability successfully") != std::string::npos;
+        LOGI("record start: ok=%d out=%s", (int)ok, out.c_str());
+        PostMessageA(g_hwnd, kMsgRecordStarted, ok ? 1 : 0, 0);
+    });
+}
+
+// Stop recording. If download_and_open: pull file to Downloads and open it.
+// Otherwise (exit cleanup): delete the media library entry, no download.
+static void stop_recording(bool download_and_open) {
+    if (!g_recording) return;
+    KillTimer(g_hwnd, kRecordTimerId);
+    std::string name = g_record_name;
+    std::string serial = g_record_serial;  // captured at start, survives g_hdc deletion
+    join_record_thread();
+    set_status(download_and_open ? "Stopping recording..." : "Cleaning up recording...");
+    g_record_thread = std::thread([serial, name, download_and_open]() {
+        HdcWrapper hdc(serial);
+        std::string out;
+        static const char *kStopCmd =
+            "aa start -b com.huawei.hmos.screenrecorder "
+            "-a com.huawei.hmos.screenrecorder.ServiceExtAbility";
+        hdc.shell_command(kStopCmd, &out, 15);
+        LOGI("record stop: out=%s", out.c_str());
+
+        std::string qcmd = "mediatool query " + name + " -u";
+        std::string qout;
+        hdc.shell_command(qcmd, &qout, 10);
+        LOGI("record query: out=%s", qout.c_str());
+        std::string uri, direct_path;
+        bool found = parse_media_query(qout, uri, direct_path);
+
+        if (!download_and_open) {
+            // Exit cleanup: just delete from media library.
+            if (found && !uri.empty()) {
+                hdc.shell_command("mediatool delete \"" + uri + "\"", nullptr, 10);
+                LOGI("record exit cleanup: deleted uri=%s", uri.c_str());
+            }
+            PostMessageA(g_hwnd, kMsgRecordStopped, 0, 0);
+            return;
+        }
+
+        if (!found) {
+            LOGE("record: no file found for %s", name.c_str());
+            PostMessageA(g_hwnd, kMsgRecordStopped, 0, 0);
+            return;
+        }
+
+        std::string record_file;
+        if (!uri.empty()) {
+            // Dest dir MUST have trailing slash — cloud phone mediatool
+            // is strict about path format; without the slash it reports
+            // "[FAIL] open source media file failed." (misleading error).
+            // Also: screenrecorder finalizes the file asynchronously after
+            // aa stop returns (close handles, flush moov, release lock).
+            // mediatool query finds the entry (already registered) but recv
+            // fails because the file is still locked. Retry with delay.
+            std::string rcmd = "mediatool recv \"" + uri + "\" /data/local/tmp/";
+            std::string rout;
+            for (int attempt = 1; attempt <= 3; attempt++) {
+                rout.clear();
+                hdc.shell_command(rcmd, &rout, 30);
+                LOGI("record recv (attempt %d): out=%s", attempt, rout.c_str());
+                if (rout.find("[FAIL]") == std::string::npos) break;
+                if (attempt < 3) Sleep(3000);
+            }
+            // Dest path is predictable: mediatool recv copies to
+            // /data/local/tmp/<source_basename>, where basename = the
+            // CustomizedFileName we passed to aa start. Don't parse recv
+            // output — hdc shell (non-interactive) sometimes drops the
+            // result path line, leaving only "Table Name: Photos".
+            record_file = "/data/local/tmp/" + name;
+        } else {
+            record_file = direct_path;
+        }
+        if (record_file.empty()) {
+            LOGE("record: could not resolve pullable path for %s", name.c_str());
+            PostMessageA(g_hwnd, kMsgRecordStopped, 0, 0);
+            return;
+        }
+
+        std::string local_path = hscrcpy::get_download_dir() + name;
+        std::string pout;
+        bool ok = hdc.pull_file(record_file, local_path, &pout);
+        LOGI("record pull: remote=%s local=%s ok=%d out=%s",
+             record_file.c_str(), local_path.c_str(), (int)ok, pout.c_str());
+
+        // Clean /data/local/tmp copy (best-effort).
+        if (!uri.empty()) hdc.shell_command("rm " + record_file, nullptr, 5);
+        // Delete media library entry (best-effort).
+        if (!uri.empty()) hdc.shell_command("mediatool delete \"" + uri + "\"", nullptr, 10);
+
+        if (ok) {
+            g_record_local_path = local_path;
+            PostMessageA(g_hwnd, kMsgRecordStopped, 1, 0);
+        } else {
+            PostMessageA(g_hwnd, kMsgRecordStopped, 0, 0);
+        }
+    });
+}
+
+// Take a single screenshot via snapshot_display, pull to Downloads, open.
+static void take_screenshot() {
+    if (!g_hdc) {
+        center_msgbox("Start mirroring first to take screenshot.", "HScrcpy", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    std::string serial = g_hdc->serial();
+    std::string ts = make_timestamp();
+    set_status("Taking screenshot...");
+    // Value capture only (serial, ts) — no this; detach is safe.
+    std::thread([serial, ts]() {
+        HdcWrapper hdc(serial);
+        std::string out;
+        static const char *kRemote = "/data/local/tmp/hscrcpy_shot.jpeg";
+        hdc.shell_command("rm /data/local/tmp/hscrcpy_shot.jpeg", nullptr, 5);
+        std::string cmd = "snapshot_display -f /data/local/tmp/hscrcpy_shot.jpeg";
+        bool ok = hdc.shell_command(cmd, &out, 15);
+        LOGI("screenshot: ok=%d out=%s", (int)ok, out.c_str());
+        if (!ok) { PostMessageA(g_hwnd, kMsgScreenshotDone, 0, 0); return; }
+        std::string local_path = hscrcpy::get_download_dir() + "hscrcpy_shot_" + ts + ".jpeg";
+        std::string pout;
+        ok = hdc.pull_file(kRemote, local_path, &pout);
+        LOGI("screenshot pull: local=%s ok=%d out=%s",
+             local_path.c_str(), (int)ok, pout.c_str());
+        hdc.shell_command("rm /data/local/tmp/hscrcpy_shot.jpeg", nullptr, 5);
+        if (ok) {
+            g_screenshot_local_path = local_path;
+            PostMessageA(g_hwnd, kMsgScreenshotDone, 1, 0);
+        } else {
+            PostMessageA(g_hwnd, kMsgScreenshotDone, 0, 0);
+        }
+    }).detach();
+}
+
 static std::string dump_layout_json() {
     if (!g_hdc) return "";
 
@@ -1521,28 +1761,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         g_combo_hwnd = CreateWindowA("COMBOBOX", "",
                                       WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-                                      58, 6, 200, 200, hwnd, (HMENU)ID_COMBO, g_hInst, NULL);
+                                      58, 6, 197, 200, hwnd, (HMENU)ID_COMBO, g_hInst, NULL);
 
         g_btn_refresh_hwnd = CreateWindowA("BUTTON", "",
-                                            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_ICON,
-                                            265, 5, 28, 28, hwnd, (HMENU)ID_BTN_REFRESH, g_hInst, NULL);
+                                            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | BS_ICON,
+                                            259, 5, 28, 28, hwnd, (HMENU)ID_BTN_REFRESH, g_hInst, NULL);
         HICON hRefresh = load_png_icon("res\\toolbar\\refresh.png", 24, 85, 85, 85, true);
         if (hRefresh) SendMessageA(g_btn_refresh_hwnd, BM_SETIMAGE, IMAGE_ICON, (LPARAM)hRefresh);
 
         g_btn_start_hwnd = CreateWindowA("BUTTON", "",
-                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_ICON | WS_DISABLED,
-                                           297, 5, 28, 28, hwnd, (HMENU)ID_BTN_START, g_hInst, NULL);
+                                           WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | BS_ICON | WS_DISABLED,
+                                           291, 5, 28, 28, hwnd, (HMENU)ID_BTN_START, g_hInst, NULL);
         HICON hStart = load_png_icon("res\\toolbar\\start.png", 24, 85, 85, 85, true);
         if (hStart) SendMessageA(g_btn_start_hwnd, BM_SETIMAGE, IMAGE_ICON, (LPARAM)hStart);
 
         SetWindowTheme(g_btn_refresh_hwnd, L"", L"");
         SetWindowTheme(g_btn_start_hwnd, L"", L"");
 
+        // Status text on Row 1, right of Start/Stop button (ends at x=320).
+        // 4px gap between button and text.
+        g_status_hwnd = CreateWindowA("STATIC", "",
+                                       WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                       323, 10, 400, 18, hwnd, NULL, g_hInst, NULL);
+
         // Row 2: icon buttons via mkbtn lambda
-        int bx = 8, by = 35, bsz = 28, bgap = 4;
+        int bx = 6, by = 35, bsz = 28, bgap = 4;
         auto mkbtn = [&](const char *png, int id) -> HWND {
             HWND h = CreateWindowA("BUTTON", "",
-                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_ICON,
+                                    WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | BS_ICON,
                                     bx, by, bsz, bsz, hwnd, (HMENU)(INT_PTR)id, g_hInst, NULL);
             HICON ico = load_png_icon(png, 24, 85, 85, 85, true);
             if (ico) SendMessageA(h, BM_SETIMAGE, IMAGE_ICON, (LPARAM)ico);
@@ -1562,10 +1808,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_btn_voldown_hwnd = mkbtn("res\\toolbar\\vol-decrease.png", ID_BTN_VOLDOWN);
         g_btn_power_hwnd   = mkbtn("res\\toolbar\\power.png", ID_BTN_POWER);
         g_btn_reboot_hwnd  = mkbtn("res\\toolbar\\reboot.png", ID_BTN_REBOOT);
-
-        g_status_hwnd = CreateWindowA("STATIC", "",
-                                       WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                       bx + 4, 38, 400, 18, hwnd, NULL, g_hInst, NULL);
+        g_btn_record_hwnd  = mkbtn("res\\toolbar\\record.png", ID_BTN_RECORD);
+        g_btn_screenshot_hwnd = mkbtn("res\\toolbar\\screenshot.png", ID_BTN_SCREENSHOT);
 
         g_canvas_hwnd = CreateWindowA(CANVAS_CLASS, "",
                                        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_TABSTOP,
@@ -1665,6 +1909,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (g_input) g_input->inject_reboot();
                 }
             }
+            break;
+        case ID_BTN_RECORD:
+            if (g_recording) stop_recording(true);
+            else start_recording();
+            break;
+        case ID_BTN_SCREENSHOT:
+            take_screenshot();
             break;
         case ID_BTN_QUALITY:
             show_settings_dialog();
@@ -1880,17 +2131,44 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(g_canvas_hwnd, NULL, FALSE);
         break;
     }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT*)lp;
+        if (dis->CtlType == ODT_BUTTON) {
+            FillRect(dis->hDC, &dis->rcItem, (HBRUSH)GetStockObject(WHITE_BRUSH));
+            HICON icon = (HICON)SendMessageA(dis->hwndItem, BM_GETIMAGE, IMAGE_ICON, 0);
+            if (icon) {
+                int ox = 2, oy = 2;
+                if (dis->itemState & ODS_SELECTED) { ox++; oy++; }
+                UINT flags = DST_ICON | ((dis->itemState & ODS_DISABLED) ? DSS_DISABLED : DSS_NORMAL);
+                DrawState(dis->hDC, NULL, NULL, (LPARAM)icon, 0,
+                          dis->rcItem.left + ox, dis->rcItem.top + oy, 0, 0, flags);
+            }
+            return TRUE;
+        }
+        break;
+    }
+    case WM_ERASEBKGND: {
+        // Only erase the toolbar area. The canvas child window covers the
+        // region below TOOLBAR_H; filling it here would flash gray before the
+        // canvas repaints, causing visible video flicker.
+        HDC hdc = (HDC)wp;
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        RECT tb = {0, 0, rc.right, TOOLBAR_H};
+        FillRect(hdc, &tb, (HBRUSH)GetStockObject(WHITE_BRUSH));
+        return 1;
+    }
     case WM_CTLCOLORBTN: {
         HDC hdcBtn = (HDC)wp;
         SetBkMode(hdcBtn, TRANSPARENT);
         SetTextColor(hdcBtn, RGB(60, 60, 60));
-        return (INT_PTR)GetSysColorBrush(COLOR_BTNFACE);
+        return (INT_PTR)GetStockObject(WHITE_BRUSH);
     }
     case WM_CTLCOLORSTATIC: {
         HDC hdcStatic = (HDC)wp;
         SetBkMode(hdcStatic, TRANSPARENT);
         SetTextColor(hdcStatic, RGB(60, 60, 60));
-        return (INT_PTR)GetSysColorBrush(COLOR_BTNFACE);
+        return (INT_PTR)GetStockObject(WHITE_BRUSH);
     }
     case WM_TIMER:
         if (wp == 1 && g_mirroring) {
@@ -1929,6 +2207,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 start_mirroring(auto_serial, ip, port);
             } else {
                 LOGW("No -s serial specified for auto-start");
+            }
+        }
+        if (wp == kRecordTimerId) {
+            KillTimer(hwnd, kRecordTimerId);
+            if (g_recording) {
+                LOGI("Recording auto-stop (30min max)");
+                set_status("Recording auto-stopped (30min max)");
+                stop_recording(true);
             }
         }
         break;
@@ -2105,6 +2391,44 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     }
+    case kMsgRecordStarted: {
+        if (wp) {
+            SetTimer(hwnd, kRecordTimerId, kRecordMaxMs, NULL);
+            set_status("Recording started (click again to stop)");
+        } else {
+            g_recording = false;
+            set_status("Recording failed to start");
+            center_msgbox("Failed to start screen recorder on device.", "HScrcpy", MB_OK | MB_ICONWARNING);
+        }
+        break;
+    }
+    case kMsgRecordStopped: {
+        g_recording = false;
+        if (wp) {
+            set_status("Recording saved to Downloads");
+            char msg[600];
+            snprintf(msg, sizeof(msg), "Recording saved: %s", g_record_local_path.c_str());
+            FileManagerWindow::show_toast(msg, true, g_hwnd);
+            open_file_default(g_record_local_path);
+        } else {
+            set_status("Recording stopped (pull failed)");
+            FileManagerWindow::show_toast("Recording pull failed", false, g_hwnd);
+        }
+        break;
+    }
+    case kMsgScreenshotDone: {
+        if (wp) {
+            set_status("Screenshot saved to Downloads");
+            char msg[600];
+            snprintf(msg, sizeof(msg), "Screenshot saved: %s", g_screenshot_local_path.c_str());
+            FileManagerWindow::show_toast(msg, true, g_hwnd);
+            open_file_default(g_screenshot_local_path);
+        } else {
+            set_status("Screenshot failed");
+            FileManagerWindow::show_toast("Screenshot failed", false, g_hwnd);
+        }
+        break;
+    }
     case WM_DESTROY:
         destroy_backbuffer();
         LayoutWindow::destroy();
@@ -2123,6 +2447,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_hdc) { delete g_hdc; g_hdc = nullptr; }
         }
         KillTimer(hwnd, 1);
+        KillTimer(hwnd, kRecordTimerId);
+        // If recording is active, stop it on the device and clean up the media
+        // library entry. Do NOT download — just delete the temp recording.
+        // stop_recording(false) spawns the cleanup thread; join_record_thread
+        // below waits for it so the process doesn't exit mid-cleanup.
+        if (g_recording) {
+            stop_recording(false);
+        }
+        join_record_thread();
         PostQuitMessage(0);
         break;
     default:

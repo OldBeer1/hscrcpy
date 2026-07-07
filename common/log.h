@@ -21,6 +21,14 @@ static inline void log_to_file(const char *msg, int level) {
         auto pos = path.find_last_of("\\/");
         if (pos != std::string::npos) path = path.substr(0, pos + 1);
         path += "hscrcpy.log";
+        // On startup (first write), if the log exceeds 5MB, delete and recreate it.
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fa)) {
+            ULARGE_INTEGER sz;
+            sz.LowPart = fa.nFileSizeLow;
+            sz.HighPart = fa.nFileSizeHigh;
+            if (sz.QuadPart > 5ull * 1024 * 1024) DeleteFileA(path.c_str());
+        }
         hLog = CreateFileA(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
                            NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hLog != INVALID_HANDLE_VALUE) {

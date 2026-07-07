@@ -200,7 +200,6 @@ private:
     static OnPushFile g_on_push;
     static OnBusy g_on_busy;
     static int g_current_tab;
-    static bool g_traj_running;
     static std::atomic<bool> g_async_busy;
     static UINT_PTR g_refresh_timer;
 
