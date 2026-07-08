@@ -164,8 +164,8 @@ hscrcpy.exe -s 192.168.1.100:5555
 | Vol+ / Vol- | 音量调节 |
 | Power | 电源键 |
 | Reboot | 重启设备 |
-| Record | 开始/停止录像（停止后下载到 Downloads 并自动播放） |
-| Screenshot | 截屏并下载到 Downloads，自动用图片查看器打开 |
+| Record | 开始/停止录像 |
+| Screenshot | 截屏 |
 
 ## 项目结构
 
