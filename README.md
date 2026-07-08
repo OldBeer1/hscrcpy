@@ -14,6 +14,8 @@ Windows 端鸿蒙设备投屏控制工具，Base On [HOScrcpy](https://gitcode.c
 - **键盘输入**：英文/数字通过 `uinput` keyEvent 映射，中文通过 `uitest uiInput inputText` 输入
 - **剪贴板粘贴**：Ctrl+V 将 Windows 剪贴板内容输入到手机
 - **文件管理器**：浏览设备文件系统，支持上传/下载/删除/新建目录
+- **截屏**：`snapshot_display` 截取设备屏幕，自动下载到 Downloads 并用默认图片查看器打开
+- **录像**：手机端 `aa start screenrecorder` 录制屏幕，停止后通过 `mediatool` 拉取到 Downloads 并自动播放，30 分钟超时自动停止
 - **云手机模拟面板**：电池状态注入、GNSS 模拟定位，支持 CPH 云手机自动检测
 - **多实例**：支持同时打开多个 hscrcpy 窗口，分别连接不同设备
 - **USB / TCP 连接**：支持 USB 直连和 WiFi 无线连接
@@ -162,6 +164,8 @@ hscrcpy.exe -s 192.168.1.100:5555
 | Vol+ / Vol- | 音量调节 |
 | Power | 电源键 |
 | Reboot | 重启设备 |
+| Record | 开始/停止录像（停止后下载到 Downloads 并自动播放） |
+| Screenshot | 截屏并下载到 Downloads，自动用图片查看器打开 |
 
 ## 项目结构
 
@@ -188,7 +192,10 @@ hscrcpy/
 │   └── version.h           # 版本号
 ├── res/                    # 资源文件
 │   ├── settings_icon.png   # 设置按钮图标
-│   └── layout_icon.png     # 布局按钮图标
+│   ├── layout_icon.png     # 布局按钮图标
+│   └── toolbar/            # 工具栏按钮图标
+│       ├── record.png      # 录像按钮图标
+│       └── screenshot.png  # 截屏按钮图标
 ├── server/                 # 设备端二进制
 │   ├── libscrcpy_server*.z.so  # uitest 扩展（虚拟屏 H264 编码）
 │   └── uitest_agent*.so        # uitest agent（输入注入）
