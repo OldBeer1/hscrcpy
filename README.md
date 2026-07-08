@@ -2,7 +2,7 @@
 
 Windows 端鸿蒙设备投屏控制工具，Base On [HOScrcpy](https://gitcode.com/OpenHarmonyToolkitsPlaza/HOScrcpy/)。
 
-![image.png](https://raw.gitcode.com/user-images/assets/10037292/16d00f40-67a7-4408-8251-7786b7b79d91/image.png 'image.png')
+![image.png](https://raw.gitcode.com/user-images/assets/10037292/69bb303f-07c2-4d67-bb51-28ff731b1020/image.png 'image.png')
 
 ## 功能特性
 
