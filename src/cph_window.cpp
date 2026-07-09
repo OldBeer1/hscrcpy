@@ -95,11 +95,71 @@ HWND CphWindow::g_toast_hwnd = nullptr;
 static const wchar_t CPH_CLASS_W[] = L"HScrcpyCphClass";
 static const wchar_t CPH_PAGE_W[] = L"HScrcpyCphPageClass";
 
+// Tab control subclass: fill white background instead of system COLOR_BTNFACE gray
+static WNDPROC g_tab_orig_proc = nullptr;
+static HFONT g_tab_bold_font = nullptr;  // cached bold font for selected tab button
+static LRESULT CALLBACK TabSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_ERASEBKGND) {
+        HDC hdc = (HDC)wp;
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, GetSysColorBrush(COLOR_WINDOW));
+        return 1;
+    }
+    return CallWindowProcW(g_tab_orig_proc, hwnd, msg, wp, lp);
+}
+
 // Page WndProc: forward WM_COMMAND to the CPH main window
 static LRESULT CALLBACK CphPageWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_COMMAND) {
         HWND cph_hwnd = GetParent(GetParent(hwnd));  // page -> tab -> cph window
         if (cph_hwnd) SendMessageW(cph_hwnd, WM_COMMAND, wp, lp);
+        return 0;
+    }
+    if (msg == WM_ERASEBKGND) {
+        HDC hdc = (HDC)wp;
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, GetSysColorBrush(COLOR_WINDOW));
+        return 1;
+    }
+    if (msg == WM_CTLCOLORSTATIC) {
+        HDC hdc = (HDC)wp;
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, RGB(0, 0, 0));
+        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+    }
+    if (msg == WM_CTLCOLORBTN) {
+        HDC hdc = (HDC)wp;
+        SetBkColor(hdc, RGB(255, 255, 255));
+        SetTextColor(hdc, RGB(0, 0, 0));
+        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+    }
+    if (msg == WM_DRAWITEM) {
+        DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT *)lp;
+        if (dis->CtlType == ODT_BUTTON) {
+            FillRect(dis->hDC, &dis->rcItem, (HBRUSH)GetStockObject(WHITE_BRUSH));
+            wchar_t buf[32] = {};
+            GetWindowTextW(dis->hwndItem, buf, 32);
+            int ox = 0, oy = 0;
+            if (dis->itemState & ODS_SELECTED) { ox = 1; oy = 1; }
+            SetBkMode(dis->hDC, TRANSPARENT);
+            SetTextColor(dis->hDC, (dis->itemState & ODS_DISABLED) ? RGB(160, 160, 160) : RGB(0, 0, 0));
+            // Draw thin gray border for text buttons
+            if (!SendMessageW(dis->hwndItem, BM_GETIMAGE, IMAGE_ICON, 0)) {
+                HPEN pen = CreatePen(PS_SOLID, 1, RGB(200, 200, 200));
+                HPEN old = (HPEN)SelectObject(dis->hDC, pen);
+                HBRUSH oldb = (HBRUSH)SelectObject(dis->hDC, GetStockObject(WHITE_BRUSH));
+                Rectangle(dis->hDC, dis->rcItem.left, dis->rcItem.top, dis->rcItem.right, dis->rcItem.bottom);
+                SelectObject(dis->hDC, old);
+                SelectObject(dis->hDC, oldb);
+                DeleteObject(pen);
+            }
+            RECT tr = dis->rcItem;
+            tr.left += ox; tr.top += oy;
+            DrawTextW(dis->hDC, buf, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            return TRUE;
+        }
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -114,7 +174,7 @@ static void ensure_page_class_registered(HINSTANCE inst) {
     wc.lpfnWndProc = CphPageWndProc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
     wc.lpszClassName = CPH_PAGE_W;
     RegisterClassExW(&wc);
     reg = true;
@@ -283,10 +343,9 @@ static HWND make_edit(HWND parent, int id, const wchar_t *def, int x, int y, int
 
 static HWND make_btn(HWND parent, const wchar_t *text, int id, int x, int y, int w, int h) {
     HWND hw = CreateWindowW(L"BUTTON", text,
-                             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                              x, y, w, h, parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
     if (g_cph_font) SendMessageW(hw, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
-    SetWindowTheme(hw, L"", L"");
     return hw;
 }
 
@@ -323,7 +382,7 @@ void CphWindow::create(HINSTANCE inst, HWND parent, int width) {
         wc.lpfnWndProc = WndProc;
         wc.hInstance = inst;
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
         wc.lpszClassName = CPH_CLASS_W;
         RegisterClassExW(&wc);
         registered = true;
@@ -408,6 +467,10 @@ void CphWindow::show_tab_page(int page) {
     for (int i = 0; i < TAB_COUNT; i++) {
         if (g_tab_pages[i])
             ShowWindow(g_tab_pages[i], i == page ? SW_SHOW : SW_HIDE);
+    }
+    if (page >= 0 && page < TAB_COUNT && g_tab_pages[page]) {
+        InvalidateRect(g_tab_pages[page], nullptr, TRUE);
+        UpdateWindow(g_tab_pages[page]);
     }
 }
 
@@ -964,10 +1027,11 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         // Tab control
         g_tab = CreateWindowW(WC_TABCONTROLW, L"",
-                               WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | TCS_FIXEDWIDTH,
+                               WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN | TCS_FIXEDWIDTH | TCS_OWNERDRAWFIXED,
                                MARGIN, HEADER_H, g_panel_w - MARGIN * 2, 800,
                                hwnd, (HMENU)IDC_TAB, nullptr, nullptr);
         SendMessageW(g_tab, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+        g_tab_orig_proc = (WNDPROC)SetWindowLongPtrW(g_tab, GWLP_WNDPROC, (LONG_PTR)TabSubclassProc);
 
         TCITEMW tie = {};
         tie.mask = TCIF_TEXT;
@@ -998,7 +1062,7 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         {
             ensure_page_class_registered(g_inst);
             HWND page = CreateWindowW(CPH_PAGE_W, L"",
-                                       WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+                                       WS_CHILD | WS_CLIPSIBLINGS,
                                        px, py, pw, ph,
                                        g_tab, nullptr, nullptr, nullptr);
             g_tab_pages[TAB_GNSS] = page;
@@ -1072,7 +1136,7 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         {
             ensure_page_class_registered(g_inst);
             HWND page = CreateWindowW(CPH_PAGE_W, L"",
-                                       WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+                                       WS_CHILD | WS_CLIPSIBLINGS,
                                        px, py, pw, ph,
                                        g_tab, nullptr, nullptr, nullptr);
             g_tab_pages[TAB_BATTERY] = page;
@@ -1321,6 +1385,61 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
+    case WM_ERASEBKGND: {
+        HDC hdc = (HDC)wp;
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, GetSysColorBrush(COLOR_WINDOW));
+        return 1;
+    }
+
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = (HDC)wp;
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, RGB(0, 0, 0));
+        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+    }
+
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT *)lp;
+        if (dis->CtlType == ODT_TAB) {
+            // Owner-draw tab buttons: white background + centered text
+            FillRect(dis->hDC, &dis->rcItem, (HBRUSH)GetStockObject(WHITE_BRUSH));
+            wchar_t buf[32] = {};
+            TCITEMW ti = {};
+            ti.mask = TCIF_TEXT;
+            ti.pszText = buf;
+            ti.cchTextMax = 32;
+            TabCtrl_GetItem(g_tab, dis->itemID, &ti);
+            SetBkMode(dis->hDC, TRANSPARENT);
+            SetTextColor(dis->hDC, RGB(0, 0, 0));
+            // Draw thin gray border for unselected tabs
+            if (!(dis->itemState & ODS_SELECTED)) {
+                HPEN pen = CreatePen(PS_SOLID, 1, RGB(200, 200, 200));
+                HPEN old = (HPEN)SelectObject(dis->hDC, pen);
+                HBRUSH oldb = (HBRUSH)SelectObject(dis->hDC, GetStockObject(WHITE_BRUSH));
+                Rectangle(dis->hDC, dis->rcItem.left, dis->rcItem.top,
+                          dis->rcItem.right, dis->rcItem.bottom);
+                SelectObject(dis->hDC, old);
+                SelectObject(dis->hDC, oldb);
+                DeleteObject(pen);
+            }
+            // Bold text for selected tab, normal for others
+            HFONT draw_font = g_cph_font;
+            if (dis->itemState & ODS_SELECTED) {
+                if (!g_tab_bold_font)
+                    g_tab_bold_font = CreateFontW(14, 0, 0, 0, FW_BOLD, 0, 0, 0,
+                                                  DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+                if (g_tab_bold_font) draw_font = g_tab_bold_font;
+            }
+            HFONT old_font = (HFONT)SelectObject(dis->hDC, draw_font);
+            DrawTextW(dis->hDC, buf, -1, &dis->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(dis->hDC, old_font);
+            return TRUE;
+        }
+        return 0;
+    }
+
     case WM_TIMER:
         if (wp == CPH_REFRESH_TIMER_ID) {
             // Stop auto-refresh after consecutive failures to avoid overloading gnss HAL
@@ -1335,6 +1454,7 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY: {
         if (g_refresh_timer) { KillTimer(hwnd, CPH_REFRESH_TIMER_ID); g_refresh_timer = 0; }
         if (g_cph_font) { DeleteObject(g_cph_font); g_cph_font = nullptr; }
+        if (g_tab_bold_font) { DeleteObject(g_tab_bold_font); g_tab_bold_font = nullptr; }
         RemovePropW(hwnd, L"cph_font");
         g_hwnd = nullptr;
         g_tab = nullptr;

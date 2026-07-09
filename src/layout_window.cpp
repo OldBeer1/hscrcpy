@@ -74,7 +74,7 @@ void LayoutWindow::create(HINSTANCE inst, HWND parent, int width) {
         wc.lpfnWndProc = WndProc;
         wc.hInstance = inst;
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
         wc.lpszClassName = LAYOUT_CLASS_W;
         RegisterClassExW(&wc);
         registered = true;
@@ -382,6 +382,38 @@ void LayoutWindow::search_tree() {
 
 // ── WndProc ──────────────────────────────────────────────
 
+// Owner-draw text button: white face + 1px gray border + black text.
+static void draw_od_text_button(DRAWITEMSTRUCT *dis) {
+    RECT r = dis->rcItem;
+    FillRect(dis->hDC, &r, (HBRUSH)GetStockObject(WHITE_BRUSH));
+
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(160, 160, 160));
+    HPEN oldPen = (HPEN)SelectObject(dis->hDC, pen);
+    HBRUSH oldBr = (HBRUSH)SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
+    if (dis->itemState & ODS_SELECTED) InflateRect(&r, -1, -1);
+    Rectangle(dis->hDC, r.left, r.top, r.right, r.bottom);
+    SelectObject(dis->hDC, oldPen);
+    SelectObject(dis->hDC, oldBr);
+    DeleteObject(pen);
+
+    wchar_t buf[64] = {};
+    GetWindowTextW(dis->hwndItem, buf, 64);
+    SetBkMode(dis->hDC, TRANSPARENT);
+    SetTextColor(dis->hDC, (dis->itemState & ODS_DISABLED) ? RGB(160, 160, 160) : RGB(0, 0, 0));
+    HFONT f = (HFONT)SendMessageW(dis->hwndItem, WM_GETFONT, 0, 0);
+    HFONT oldF = f ? (HFONT)SelectObject(dis->hDC, f) : nullptr;
+    RECT tr = dis->rcItem;
+    if (dis->itemState & ODS_SELECTED) { tr.left++; tr.top++; }
+    DrawTextW(dis->hDC, buf, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    if (oldF) SelectObject(dis->hDC, oldF);
+
+    if (dis->itemState & ODS_FOCUS) {
+        RECT fr = dis->rcItem;
+        InflateRect(&fr, -3, -3);
+        DrawFocusRect(dis->hDC, &fr);
+    }
+}
+
 LRESULT CALLBACK LayoutWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
@@ -394,20 +426,21 @@ LRESULT CALLBACK LayoutWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                                          MARGIN, 26, 200, 22, hwnd, (HMENU)10, g_inst, NULL);
 
         g_search_btn = CreateWindowW(L"BUTTON", L"Search",
-                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                      WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                                       210, 26, 60, 22, hwnd, (HMENU)11, g_inst, NULL);
 
         g_refresh_btn = CreateWindowW(L"BUTTON", L"Refresh",
-                                       WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                       WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                                        278, 26, 60, 22, hwnd, (HMENU)12, g_inst, NULL);
 
         g_expand_btn = CreateWindowW(L"BUTTON", L"Expand",
-                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                      WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                                       346, 26, 60, 22, hwnd, (HMENU)13, g_inst, NULL);
 
         g_tree = CreateWindowExW(0, WC_TREEVIEWW, L"",
                                   WS_CHILD | WS_VISIBLE | WS_BORDER | TVS_HASLINES | TVS_HASBUTTONS | TVS_LINESATROOT,
                                   MARGIN, TOOLBAR_H, 100, 100, hwnd, (HMENU)1, g_inst, NULL);
+        TreeView_SetBkColor(g_tree, RGB(255, 255, 255));
 
         g_list = CreateWindowExW(0, WC_LISTVIEWW, L"",
                                   WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL,
@@ -454,9 +487,22 @@ LRESULT CALLBACK LayoutWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         HDC hdc = (HDC)wp;
         RECT rc;
         GetClientRect(hwnd, &rc);
-        RECT toolbar_rc = {0, 0, rc.right, TOOLBAR_H};
-        FillRect(hdc, &toolbar_rc, (HBRUSH)(COLOR_BTNFACE + 1));
+        FillRect(hdc, &rc, GetSysColorBrush(COLOR_WINDOW));
         return 1;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = (HDC)wp;
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, RGB(0, 0, 0));
+        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+    }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT *)lp;
+        if (dis->CtlType == ODT_BUTTON) {
+            draw_od_text_button(dis);
+            return TRUE;
+        }
+        break;
     }
     case WM_NOTIFY: {
         NMHDR *nm = reinterpret_cast<NMHDR *>(lp);

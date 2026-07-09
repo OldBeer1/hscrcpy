@@ -39,6 +39,7 @@ static HdcWrapper *g_hdc = nullptr;
 static ScreenCapture *g_capture = nullptr;
 static InputInjector *g_input = nullptr;
 static uint32_t g_screen_w = 0, g_screen_h = 0;
+static std::string g_sized_serial;  // serial of the phone last auto-sized (per-phone first-connect)
 static bool g_mirroring = false;
 static bool g_starting = false;
 static HWND g_hwnd = nullptr;
@@ -135,6 +136,8 @@ static uint32_t g_d2d_bmp_w = 0, g_d2d_bmp_h = 0;
 // Cached D2D brushes for layout highlight overlay
 static ID2D1SolidColorBrush *g_d2d_hl_fill = nullptr;
 static ID2D1SolidColorBrush *g_d2d_hl_border = nullptr;
+// Cached D2D brush for the top separator line (canvas/toolbar boundary)
+static ID2D1SolidColorBrush *g_d2d_sep_brush = nullptr;
 
 static bool init_d2d() {
     HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &g_d2d_factory);
@@ -150,6 +153,7 @@ static bool init_d2d() {
 static void cleanup_d2d() {
     if (g_d2d_hl_fill) { g_d2d_hl_fill->Release(); g_d2d_hl_fill = nullptr; }
     if (g_d2d_hl_border) { g_d2d_hl_border->Release(); g_d2d_hl_border = nullptr; }
+    if (g_d2d_sep_brush) { g_d2d_sep_brush->Release(); g_d2d_sep_brush = nullptr; }
     if (g_d2d_bitmap) { g_d2d_bitmap->Release(); g_d2d_bitmap = nullptr; }
     if (g_d2d_rt) { g_d2d_rt->Release(); g_d2d_rt = nullptr; }
     if (g_d2d_factory) { g_d2d_factory->Release(); g_d2d_factory = nullptr; }
@@ -194,7 +198,13 @@ static void resize_window_to_frame_aspect(HWND hwnd) {
         init_w = 360;
         init_h = (int)(init_w / aspect);
     }
-    RECT wr = {0, 0, init_w, init_h + TOOLBAR_H};
+    // When a sub-window panel is visible, add its width so the canvas keeps
+    // its correct aspect-ratio width instead of being squished by the panel.
+    int panel_w = 0;
+    if (g_layout_visible) panel_w = LayoutWindow::panel_width();
+    else if (g_fm_visible) panel_w = FileManagerWindow::panel_width();
+    else if (g_cph_visible) panel_w = CphWindow::panel_width();
+    RECT wr = {0, 0, init_w + panel_w, init_h + TOOLBAR_H};
     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
     SetWindowPos(hwnd, NULL, 0, 0,
                  wr.right - wr.left, wr.bottom - wr.top,
@@ -994,12 +1004,22 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     if (g_d2d_hl_border) g_d2d_rt->DrawRectangle(hlRect, g_d2d_hl_border, 2.0f);
                 }
             }
+
+            // Thin gray separator line at the very top of the canvas to
+            // distinguish it from the light toolbar when the streamed image
+            // is bright/white and fills the whole client area.
+            if (!g_d2d_sep_brush)
+                g_d2d_rt->CreateSolidColorBrush(D2D1::ColorF(0.63f, 0.63f, 0.63f, 1.0f), &g_d2d_sep_brush);
+            if (g_d2d_sep_brush)
+                g_d2d_rt->FillRectangle(D2D1::RectF(0, 0, static_cast<FLOAT>(cw), 1.0f), g_d2d_sep_brush);
+
             HRESULT hr = g_d2d_rt->EndDraw();
             if (FAILED(hr)) {
                 LOGW("D2D EndDraw failed (hr=0x%08X)", (unsigned)hr);
                 if (g_d2d_bitmap) { g_d2d_bitmap->Release(); g_d2d_bitmap = nullptr; g_d2d_bitmap_current = false; g_d2d_bmp_w = 0; g_d2d_bmp_h = 0; }
                 if (g_d2d_hl_fill) { g_d2d_hl_fill->Release(); g_d2d_hl_fill = nullptr; }
                 if (g_d2d_hl_border) { g_d2d_hl_border->Release(); g_d2d_hl_border = nullptr; }
+                if (g_d2d_sep_brush) { g_d2d_sep_brush->Release(); g_d2d_sep_brush = nullptr; }
                 g_d2d_rt->Release();
                 g_d2d_rt = nullptr;
             }
@@ -1081,6 +1101,13 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 }
 
                 BitBlt(hdc, 0, 0, cw, ch, g_backbuffer_dc, 0, 0, SRCCOPY);
+
+                // Thin gray separator line at the top of the canvas
+                // (mirrors the D2D path; distinguishes canvas from toolbar).
+                RECT sep = {0, 0, cw, 1};
+                HBRUSH sepBr = CreateSolidBrush(RGB(160, 160, 160));
+                FillRect(hdc, &sep, sepBr);
+                DeleteObject(sepBr);
             }
         }
 
@@ -2179,8 +2206,36 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (wp == 3) {
             KillTimer(hwnd, 3);
-            if (g_mirroring && g_capture) {
-                resize_window_to_frame_aspect(hwnd);
+            if (g_mirroring && g_capture && !IsZoomed(hwnd)) {
+                // On portrait↔landscape rotation, swap canvas width and height
+                // so the frame fills the canvas without letterbox bars.
+                bool frame_portrait = (g_screen_w < g_screen_h);
+                RECT rc;
+                GetClientRect(hwnd, &rc);
+                int client_w = rc.right;
+                int client_h = rc.bottom - TOOLBAR_H;
+                int panel_w = 0;
+                if (g_layout_visible) panel_w = LayoutWindow::panel_width();
+                else if (g_fm_visible) panel_w = FileManagerWindow::panel_width();
+                else if (g_cph_visible) panel_w = CphWindow::panel_width();
+                int canvas_w = client_w - panel_w;
+                bool canvas_portrait = (canvas_w < client_h);
+                if (frame_portrait != canvas_portrait) {
+                    // Swap canvas dimensions; panel width and toolbar stay fixed
+                    int new_client_w = client_h + panel_w;
+                    int new_client_h = canvas_w + TOOLBAR_H;
+                    RECT wr = {0, 0, new_client_w, new_client_h};
+                    AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+                    SetWindowPos(hwnd, NULL, 0, 0,
+                                 wr.right - wr.left, wr.bottom - wr.top,
+                                 SWP_NOMOVE | SWP_NOZORDER);
+                } else {
+                    // Same orientation (e.g. scale change) — just repaint
+                    InvalidateRect(g_canvas_hwnd, NULL, FALSE);
+                }
+            } else if (g_mirroring && g_capture) {
+                // Maximized — can't resize, letterbox
+                InvalidateRect(g_canvas_hwnd, NULL, FALSE);
             }
         }
         if (wp == 2) {
@@ -2279,7 +2334,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         EnableWindow(g_btn_start_hwnd, TRUE);
 
-        resize_window_to_frame_aspect(g_hwnd);
+        // Auto-size window only on first connect per phone serial.
+        // Subsequent reconnects to the same phone keep the user's window size;
+        // rotation is handled by swapping canvas dimensions (Timer 3), not resize.
+        {
+            std::string cur_serial = g_hdc ? g_hdc->serial() : "";
+            if (g_sized_serial != cur_serial) {
+                resize_window_to_frame_aspect(g_hwnd);
+                g_sized_serial = cur_serial;
+            }
+        }
 
         std::string serial = g_hdc->serial();
         char buf[256];
@@ -2326,12 +2390,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case kMsgLayoutUpdate: {
         if (!g_mirroring || !g_capture || !g_hdc) break;
 
-        // Debounce the window resize: rotation/scale changes can flicker rapidly
-        // (portrait↔landscape multiple times). Resizing on every change causes
-        // D2D RT resize + bitmap recreation storms → FPS collapse.
-        // SetTimer with existing ID resets the timer, so only the LAST change in a
-        // burst triggers an actual resize. 300ms covers most rotation flicker while
-        // keeping the switch feeling near-instant.
+        // Debounce rotation repaint: portrait↔landscape can flicker rapidly.
+        // SetTimer resets on each call, so only the last change in a burst
+        // triggers a repaint. 300ms covers most rotation flicker.
         SetTimer(hwnd, 3, 300, NULL);
 
         std::string serial = g_hdc->serial();

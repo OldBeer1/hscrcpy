@@ -765,7 +765,7 @@ void FileManagerWindow::create(HINSTANCE inst, HWND parent, int width) {
         wc.lpfnWndProc = WndProc;
         wc.hInstance = inst;
         wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
         wc.lpszClassName = FM_CLASS_W;
         RegisterClassExW(&wc);
         registered = true;
@@ -2263,9 +2263,12 @@ void FileManagerWindow::enter_select_mode() {
     // Enable checkboxes and check all items
     SendMessageW(g_file_list, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_CHECKBOXES, LVS_EX_CHECKBOXES);
     int count = ListView_GetItemCount(g_file_list);
+    SendMessageW(g_file_list, WM_SETREDRAW, FALSE, 0);
     for (int i = 0; i < count; i++) {
         ListView_SetCheckState(g_file_list, i, TRUE);
     }
+    SendMessageW(g_file_list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_file_list, nullptr, TRUE);
     // Switch to unchecked icon (取消全选)
     HICON hIco = load_icon_file("res\\file-manager\\file-unchecked.png", 24, 85, 85, 85, true);
     if (hIco) set_btn_icon(g_selectall_btn, hIco);
@@ -2302,6 +2305,7 @@ void FileManagerWindow::toggle_select_all() {
     for (int i = 0; i < count; i++) {
         if (!ListView_GetCheckState(g_file_list, i)) { all_checked = false; break; }
     }
+    SendMessageW(g_file_list, WM_SETREDRAW, FALSE, 0);
     if (all_checked) {
         // Uncheck all → show checked icon (全选)
         for (int i = 0; i < count; i++) ListView_SetCheckState(g_file_list, i, FALSE);
@@ -2313,6 +2317,8 @@ void FileManagerWindow::toggle_select_all() {
         HICON hIco = load_icon_file("res\\file-manager\\file-unchecked.png", 24, 85, 85, 85, true);
         if (hIco) set_btn_icon(g_selectall_btn, hIco);
     }
+    SendMessageW(g_file_list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_file_list, nullptr, TRUE);
     update_status();
 }
 
@@ -2594,9 +2600,11 @@ std::string FileManagerWindow::build_remote_path(const std::string &dir, const s
 // ── Populate ListView ────────────────────────────────────
 
 void FileManagerWindow::populate_list() {
+    SendMessageW(g_file_list, WM_SETREDRAW, FALSE, 0);
     ListView_DeleteAllItems(g_file_list);
 
-    for (int i = 0; i < (int)g_entries.size(); i++) {
+    int n = (int)g_entries.size();
+    for (int i = 0; i < n; i++) {
         const FileEntry &e = g_entries[i];
 
         // Icon index
@@ -2642,6 +2650,9 @@ void FileManagerWindow::populate_list() {
         sub.iSubItem = 5; sub.pszText = const_cast<LPWSTR>(wdate.c_str());
         SendMessageW(g_file_list, LVM_SETITEMTEXTW, idx, (LPARAM)&sub);
     }
+
+    SendMessageW(g_file_list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_file_list, nullptr, TRUE);
 }
 
 // ── WndProc ──────────────────────────────────────────────
@@ -2752,14 +2763,14 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         SendMessageW(g_address_edit, WM_SETFONT, (WPARAM)hf, TRUE);
 
         g_go_btn = CreateWindowW(L"BUTTON", L"",
-                                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_ICON,
+                                   WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | BS_ICON,
                                    cx + 202, y1, BTN_SIZE, BTN_SIZE, hwnd, (HMENU)IDC_GO_BTN, g_inst, NULL);
         HICON hGo = load_icon_file("res\\file-manager\\go.png", 24, 85, 85, 85, true);
         if (hGo) { SendMessageW(g_go_btn, BM_SETIMAGE, IMAGE_ICON, (LPARAM)hGo); }
         else SetWindowTextW(g_go_btn, L"Go");
 
         g_back_btn = CreateWindowW(L"BUTTON", L"",
-                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_ICON,
+                                     WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | BS_ICON,
                                      cx + 232, y1, BTN_SIZE, BTN_SIZE, hwnd, (HMENU)IDC_BACK_BTN, g_inst, NULL);
         HICON hBack = load_icon_file("res\\file-manager\\nav-back.png", 24, 85, 85, 85, true);
         if (hBack) { SendMessageW(g_back_btn, BM_SETIMAGE, IMAGE_ICON, (LPARAM)hBack); }
@@ -2775,7 +2786,7 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         g_search_orig_proc = (WNDPROC)SetWindowLongPtrW(g_search_edit, GWLP_WNDPROC, (LONG_PTR)SearchEditProc);
 
         g_search_btn = CreateWindowW(L"BUTTON", L"",
-                                       WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_ICON,
+                                       WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | BS_ICON,
                                        cx + 362, y1, BTN_SIZE, BTN_SIZE, hwnd, (HMENU)IDC_SEARCH_BTN, g_inst, NULL);
         HICON hSearch = load_icon_file("res\\file-manager\\folder-search.png", 24, 85, 85, 85, true);
         if (hSearch) { SendMessageW(g_search_btn, BM_SETIMAGE, IMAGE_ICON, (LPARAM)hSearch); }
@@ -2787,7 +2798,7 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
 
         auto make_icon_btn = [&](CtrlId id, const char *icon_path, const wchar_t *fallback) -> HWND {
             HWND btn = CreateWindowW(L"BUTTON", L"",
-                                      WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_ICON,
+                                      WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | BS_ICON,
                                       bx, y2, BTN_SIZE, BTN_SIZE, hwnd, (HMENU)id, g_inst, NULL);
             HICON hIco = icon_path ? load_icon_file(icon_path, 24, 85, 85, 85, true) : nullptr;
             if (hIco) { SendMessageW(btn, BM_SETIMAGE, IMAGE_ICON, (LPARAM)hIco); }
@@ -2907,17 +2918,44 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         static HBRUSH white_brush = CreateSolidBrush(RGB(255, 255, 255));
         return (LRESULT)white_brush;
     }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT *)lp;
+        if (dis->CtlType == ODT_BUTTON) {
+            // White face (borderless — icon glyphs self-delineate, matching
+            // the main toolbar's owner-draw image buttons).
+            FillRect(dis->hDC, &dis->rcItem, (HBRUSH)GetStockObject(WHITE_BRUSH));
+            HICON icon = (HICON)SendMessageW(dis->hwndItem, BM_GETIMAGE, IMAGE_ICON, 0);
+            int ox = 2, oy = 2;
+            if (dis->itemState & ODS_SELECTED) { ox++; oy++; }
+            if (icon) {
+                UINT flags = DST_ICON | ((dis->itemState & ODS_DISABLED) ? DSS_DISABLED : DSS_NORMAL);
+                DrawState(dis->hDC, NULL, NULL, (LPARAM)icon, 0,
+                          dis->rcItem.left + ox, dis->rcItem.top + oy, 0, 0, flags);
+            } else {
+                // Text fallback (icon failed to load).
+                wchar_t buf[32] = {};
+                GetWindowTextW(dis->hwndItem, buf, 32);
+                SetBkMode(dis->hDC, TRANSPARENT);
+                SetTextColor(dis->hDC, (dis->itemState & ODS_DISABLED) ? RGB(160, 160, 160) : RGB(0, 0, 0));
+                RECT tr = dis->rcItem;
+                if (dis->itemState & ODS_SELECTED) { tr.left++; tr.top++; }
+                DrawTextW(dis->hDC, buf, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+            return TRUE;
+        }
+        break;
+    }
     case WM_CTLCOLORSTATIC: {
         HDC hdc = (HDC)wp;
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, RGB(0, 0, 0));
-        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
     }
     case WM_ERASEBKGND: {
         HDC hdc = (HDC)wp;
         RECT rc;
         GetClientRect(hwnd, &rc);
-        FillRect(hdc, &rc, (HBRUSH)(COLOR_BTNFACE + 1));
+        FillRect(hdc, &rc, GetSysColorBrush(COLOR_WINDOW));
         return 1;
     }
     case WM_NOTIFY: {
@@ -3008,7 +3046,10 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
             if (g_check_mode) {
                 // Check all items
                 int count = ListView_GetItemCount(g_file_list);
+                SendMessageW(g_file_list, WM_SETREDRAW, FALSE, 0);
                 for (int i = 0; i < count; i++) ListView_SetCheckState(g_file_list, i, TRUE);
+                SendMessageW(g_file_list, WM_SETREDRAW, TRUE, 0);
+                InvalidateRect(g_file_list, nullptr, TRUE);
                 HICON hIco = load_icon_file("res\\file-manager\\file-unchecked.png", 24, 85, 85, 85, true);
                 if (hIco) set_btn_icon(g_selectall_btn, hIco);
                 update_status();
@@ -3019,7 +3060,10 @@ LRESULT CALLBACK FileManagerWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPAR
         case IDM_DESELECTALL: {
             // Uncheck all items
             int count = ListView_GetItemCount(g_file_list);
+            SendMessageW(g_file_list, WM_SETREDRAW, FALSE, 0);
             for (int i = 0; i < count; i++) ListView_SetCheckState(g_file_list, i, FALSE);
+            SendMessageW(g_file_list, WM_SETREDRAW, TRUE, 0);
+            InvalidateRect(g_file_list, nullptr, TRUE);
             HICON hIco = load_icon_file("res\\file-manager\\file-checked.png", 24, 85, 85, 85, true);
             if (hIco) set_btn_icon(g_selectall_btn, hIco);
             update_status();
