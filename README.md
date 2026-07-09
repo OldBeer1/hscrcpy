@@ -18,7 +18,7 @@ Windows 端鸿蒙设备投屏控制工具，Base On [HOScrcpy](https://gitcode.c
 - **录像**：手机端 `aa start screenrecorder` 录制屏幕，停止后通过 `mediatool` 拉取到 Downloads 并自动播放，30 分钟超时自动停止
 - **云手机模拟面板**：电池状态注入、GNSS 模拟定位，支持 CPH 云手机自动检测
 - **多实例**：支持同时打开多个 hscrcpy 窗口，分别连接不同设备
-- **USB / TCP 连接**：支持 USB 直连和 WiFi 无线连接
+- **USB / TCP 连接**：支持 USB 直连和 TCP 无线连接
 - **参数配置**：独立 USB/TCP 编码参数（缩放、码率、帧率），INI 持久化存储
 
 ## 系统架构
@@ -122,7 +122,7 @@ Options:
 :: USB 设备自动投屏
 hscrcpy.exe -a -s FMR0224B14009124
 
-:: WiFi 设备
+:: TCP 设备
 hscrcpy.exe -s 192.168.1.100:5555
 ```
 
@@ -181,21 +181,18 @@ hscrcpy/
 │   ├── hdc_wrapper.cpp     # HDC 命令封装
 │   ├── layout_window.cpp   # UI 布局检查面板（TreeView + ListView）
 │   ├── file_manager_window.cpp  # 文件管理器面板
-│   ├── cph_window.cpp      # 云手机模拟面板（电池/GNSS）
+│   ├── cph_window.cpp      # 云手机模拟面板（电池/GNSS/Haps）
 │   ├── config.cpp          # INI 配置读写
 │   ├── cli.cpp             # 命令行参数解析
+│   ├── net_util.h          # 网络工具（TCP keepalive 等）
 │   └── window_renderer.cpp # Win32 窗口渲染（备用）
 ├── common/                 # 公共头文件
 │   ├── protocol.h          # 协议常量、端口定义
 │   ├── log.h               # 日志宏
-│   ├── net_util.h          # 网络工具（TCP keepalive 等）
 │   └── version.h           # 版本号
 ├── res/                    # 资源文件
-│   ├── settings_icon.png   # 设置按钮图标
-│   ├── layout_icon.png     # 布局按钮图标
-│   └── toolbar/            # 工具栏按钮图标
-│       ├── record.png      # 录像按钮图标
-│       └── screenshot.png  # 截屏按钮图标
+│   ├── toolbar/            # 工具栏按钮图标
+│   └── file-manager/       # 文件管理器图标
 ├── server/                 # 设备端二进制
 │   ├── libscrcpy_server*.z.so  # uitest 扩展（虚拟屏 H264 编码）
 │   └── uitest_agent*.so        # uitest agent（输入注入）
