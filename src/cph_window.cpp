@@ -306,16 +306,16 @@ void CphWindow::show_toast(const char *text, bool success) {
 
 // Hook to center MessageBox on CPH window
 static HWND s_msgbox_parent = nullptr;
+static HHOOK s_msgbox_hook = nullptr;
 static LRESULT CALLBACK MsgBoxCenterHook(int nCode, WPARAM wp, LPARAM lp) {
-    if (nCode == HCBT_CREATEWND && s_msgbox_parent) {
+    if (nCode == HCBT_ACTIVATE && s_msgbox_parent) {
         HWND mb = (HWND)wp;
         RECT prc, mrc;
         GetWindowRect(s_msgbox_parent, &prc);
         GetWindowRect(mb, &mrc);
-        int mw = mrc.right - mrc.left, mh = mrc.bottom - mrc.top;
-        int x = prc.left + (prc.right - prc.left - mw) / 2;
-        int y = prc.top + (prc.bottom - prc.top - mh) / 2;
-        MoveWindow(mb, x, y, mw, mh, FALSE);
+        int x = prc.left + (prc.right - prc.left - (mrc.right - mrc.left)) / 2;
+        int y = prc.top + (prc.bottom - prc.top - (mrc.bottom - mrc.top)) / 2;
+        SetWindowPos(mb, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
     }
     return CallNextHookEx(NULL, nCode, wp, lp);
 }
@@ -327,9 +327,9 @@ void CphWindow::msg_box(const char *title, const char *fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     s_msgbox_parent = g_hwnd;
-    HHOOK hook = SetWindowsHookExW(WH_CBT, MsgBoxCenterHook, NULL, GetCurrentThreadId());
+    s_msgbox_hook = SetWindowsHookExW(WH_CBT, MsgBoxCenterHook, NULL, GetCurrentThreadId());
     MessageBoxA(g_hwnd, buf, title, MB_OK);
-    if (hook) UnhookWindowsHookEx(hook);
+    if (s_msgbox_hook) { UnhookWindowsHookEx(s_msgbox_hook); s_msgbox_hook = nullptr; }
     s_msgbox_parent = nullptr;
 }
 

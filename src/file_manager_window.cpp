@@ -795,6 +795,23 @@ void FileManagerWindow::hide() {
     if (g_hwnd) ShowWindow(g_hwnd, SW_HIDE);
 }
 
+void FileManagerWindow::reset() {
+    if (g_check_mode) {
+        g_check_mode = false;
+        if (g_file_list) SendMessageW(g_file_list, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_CHECKBOXES, 0);
+    }
+    if (g_file_list) ListView_DeleteAllItems(g_file_list);
+    if (g_address_edit) SetWindowTextW(g_address_edit, L"");
+    if (g_search_edit) SetWindowTextW(g_search_edit, L"");
+    if (g_status_label) SetWindowTextW(g_status_label, L"");
+    g_current_dir.clear();
+    g_entries.clear();
+    g_history.clear();
+    g_clipboard = FileClipboard{};
+    g_select_after_refresh.clear();
+    g_busy = false;
+}
+
 void FileManagerWindow::destroy() {
     if (g_hwnd) {
         DestroyWindow(g_hwnd);

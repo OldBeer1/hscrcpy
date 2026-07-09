@@ -34,6 +34,7 @@ public:
     static void create(HINSTANCE inst, HWND parent, int width = 420);
     static void show(OnNodeSelected on_select, OnRefresh on_refresh);
     static void hide();
+    static void reset();
     static void destroy();
     static bool is_visible();
     static HWND hwnd();

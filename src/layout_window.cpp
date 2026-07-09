@@ -103,6 +103,16 @@ void LayoutWindow::hide() {
     }
 }
 
+void LayoutWindow::reset() {
+    if (g_tree) TreeView_DeleteAllItems(g_tree);
+    if (g_list) ListView_DeleteAllItems(g_list);
+    if (g_search_edit) SetWindowTextW(g_search_edit, L"");
+    if (g_status_label) SetWindowTextW(g_status_label, L"");
+    g_root = LayoutNode{};
+    g_json.clear();
+    g_has_hl = false;
+}
+
 void LayoutWindow::destroy() {
     if (g_hwnd) {
         DestroyWindow(g_hwnd);
