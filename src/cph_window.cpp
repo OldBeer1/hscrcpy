@@ -601,6 +601,38 @@ void CphWindow::hide() {
     }
 }
 
+void CphWindow::reset() {
+    // GNSS — clear edit boxes and current location label
+    HWND gnss_edits[] = {g_gnss_lat_edit, g_gnss_lng_edit, g_gnss_alt_edit,
+        g_gnss_speed_edit, g_gnss_bearing_edit, g_gnss_hacc_edit,
+        g_gnss_vacc_edit, g_gnss_sacc_edit, g_gnss_bacc_edit, g_gnss_traj_edit};
+    for (HWND h : gnss_edits) { if (h) SetWindowTextW(h, L""); }
+    if (g_gnss_current_label) SetWindowTextW(g_gnss_current_label, L"—");
+
+    // Battery — clear edit boxes, reset combos to first item, clear label
+    HWND bat_edits[] = {g_bat_capacity_edit, g_bat_temp_edit, g_bat_voltage_edit,
+        g_bat_voltage_max_edit, g_bat_current_edit, g_bat_current_avg_edit,
+        g_bat_current_max_edit, g_bat_total_energy_edit, g_bat_technology_edit};
+    for (HWND h : bat_edits) { if (h) SetWindowTextW(h, L""); }
+    HWND bat_combos[] = {g_bat_health_combo, g_bat_present_combo, g_bat_plugged_combo,
+        g_bat_charger_combo, g_bat_chargestate_combo, g_bat_scene_combo};
+    for (HWND h : bat_combos) { if (h) SendMessageW(h, CB_SETCURSEL, 0, 0); }
+    if (g_bat_current_label) SetWindowTextW(g_bat_current_label, L"—");
+
+    // Haps — clear ListViews and cached data
+    if (g_haps_pkg_list) SendMessageW(g_haps_pkg_list, LVM_DELETEALLITEMS, 0, 0);
+    if (g_haps_perm_list) SendMessageW(g_haps_perm_list, LVM_DELETEALLITEMS, 0, 0);
+    g_haps_packages.clear();
+    g_haps_selected_pkg.clear();
+    g_haps_user_id.clear();
+    g_haps_loaded = false;
+
+    // Reset refresh state
+    s_refresh_fill_edits = false;
+    s_refresh_fail_count = 0;
+    if (g_status_label) SetWindowTextW(g_status_label, L"");
+}
+
 void CphWindow::destroy() {
     if (g_hwnd) {
         DestroyWindow(g_hwnd);

@@ -1595,6 +1595,7 @@ static void stop_mirroring() {
                      wr.bottom - wr.top,
                      SWP_NOMOVE | SWP_NOZORDER);
     }
+    CphWindow::reset();
 
     InvalidateRect(g_canvas_hwnd, NULL, TRUE);
 

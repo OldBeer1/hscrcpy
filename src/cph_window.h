@@ -30,6 +30,7 @@ public:
     static void create(HINSTANCE inst, HWND parent, int width = 440);
     static void show(OnShellCommand on_shell, OnPushFile on_push, OnBusy on_busy);
     static void hide();
+    static void reset();
     static void destroy();
     static bool is_visible();
     static HWND hwnd();
