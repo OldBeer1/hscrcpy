@@ -65,6 +65,18 @@ HWND CphWindow::g_bat_scene_btn = nullptr;
 
 HWND CphWindow::g_status_label = nullptr;
 
+HWND CphWindow::g_haps_pkg_list = nullptr;
+HWND CphWindow::g_haps_perm_list = nullptr;
+HWND CphWindow::g_haps_refresh_btn = nullptr;
+HWND CphWindow::g_haps_grant_all_btn = nullptr;
+HWND CphWindow::g_haps_grant_btn = nullptr;
+HWND CphWindow::g_haps_revoke_btn = nullptr;
+HWND CphWindow::g_haps_revoke_all_btn = nullptr;
+std::vector<std::string> CphWindow::g_haps_packages;
+std::string CphWindow::g_haps_selected_pkg;
+std::string CphWindow::g_haps_user_id;
+bool CphWindow::g_haps_loaded = false;
+
 HWND CphWindow::g_tab_pages[TAB_COUNT] = {};
 
 CphWindow::OnShellCommand CphWindow::g_on_shell;
@@ -109,11 +121,21 @@ static LRESULT CALLBACK TabSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     return CallWindowProcW(g_tab_orig_proc, hwnd, msg, wp, lp);
 }
 
-// Page WndProc: forward WM_COMMAND to the CPH main window
+// Page WndProc: forward WM_COMMAND and WM_NOTIFY to the CPH main window
 static LRESULT CALLBACK CphPageWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_COMMAND) {
         HWND cph_hwnd = GetParent(GetParent(hwnd));  // page -> tab -> cph window
         if (cph_hwnd) SendMessageW(cph_hwnd, WM_COMMAND, wp, lp);
+        return 0;
+    }
+    if (msg == WM_NOTIFY) {
+        HWND cph_hwnd = GetParent(GetParent(hwnd));
+        if (cph_hwnd) SendMessageW(cph_hwnd, WM_NOTIFY, wp, lp);
+        return 0;
+    }
+    if (msg == WM_CONTEXTMENU) {
+        HWND cph_hwnd = GetParent(GetParent(hwnd));
+        if (cph_hwnd) SendMessageW(cph_hwnd, WM_CONTEXTMENU, wp, lp);
         return 0;
     }
     if (msg == WM_ERASEBKGND) {
@@ -365,6 +387,168 @@ static HWND make_group(HWND parent, const wchar_t *text, int x, int y, int w, in
     return hw;
 }
 
+// ── Haps: Parse helpers ─────────────────────────────────────
+
+// Parse "bm dump -a" output → package names
+// Output format: "ID: 100:" header + indented package names
+static std::vector<std::string> parse_packages(const std::string &output) {
+    std::vector<std::string> pkgs;
+    std::istringstream iss(output);
+    std::string line;
+    while (std::getline(iss, line)) {
+        size_t start = line.find_first_not_of(" \t");
+        if (start == std::string::npos) continue;
+        std::string trimmed = line.substr(start);
+        if (trimmed.rfind("ID:", 0) == 0) continue;  // skip "ID: 100:" header
+        size_t end = trimmed.find_last_not_of(" \t\r\n");
+        if (end != std::string::npos) trimmed = trimmed.substr(0, end + 1);
+        if (!trimmed.empty()) pkgs.push_back(trimmed);
+    }
+    return pkgs;
+}
+
+// Parse "bm dump-permissions -n <pkg>" output → (name, granted) pairs
+// Output format: header line + "  <perm>  [GRANTED|DENIED]"
+static std::vector<HapsPermission> parse_permissions(const std::string &output) {
+    std::vector<HapsPermission> perms;
+    std::istringstream iss(output);
+    std::string line;
+    while (std::getline(iss, line)) {
+        auto bracket = line.find('[');
+        if (bracket == std::string::npos) continue;
+        std::string name = line.substr(0, bracket);
+        size_t s = name.find_first_not_of(" \t");
+        size_t e = name.find_last_not_of(" \t");
+        if (s == std::string::npos) continue;
+        name = name.substr(s, e - s + 1);
+        bool is_granted = (line.find("[GRANTED]", bracket) != std::string::npos);
+        perms.push_back({name, is_granted});
+    }
+    return perms;
+}
+
+// ── Haps: Populate ListViews ────────────────────────────────
+
+void CphWindow::haps_populate_packages() {
+    if (!g_haps_pkg_list) return;
+    SendMessageW(g_haps_pkg_list, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(g_haps_pkg_list, LVM_DELETEALLITEMS, 0, 0);
+    for (int i = 0; i < (int)g_haps_packages.size(); i++) {
+        int len = MultiByteToWideChar(CP_UTF8, 0, g_haps_packages[i].c_str(), -1, nullptr, 0);
+        std::vector<wchar_t> wname(len);
+        MultiByteToWideChar(CP_UTF8, 0, g_haps_packages[i].c_str(), -1, wname.data(), len);
+        LVITEMW lvi = {};
+        lvi.mask = LVIF_TEXT;
+        lvi.iItem = i;
+        lvi.iSubItem = 0;
+        lvi.pszText = wname.data();
+        SendMessageW(g_haps_pkg_list, LVM_INSERTITEMW, 0, (LPARAM)&lvi);
+    }
+    SendMessageW(g_haps_pkg_list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_haps_pkg_list, nullptr, TRUE);
+    // Auto-select first item → triggers LVN_ITEMCHANGED → loads permissions
+    if (!g_haps_packages.empty()) {
+        LVITEMW lvi = {};
+        lvi.state = LVIS_SELECTED;
+        lvi.stateMask = LVIS_SELECTED;
+        SendMessageW(g_haps_pkg_list, LVM_SETITEMSTATE, 0, (LPARAM)&lvi);
+    }
+}
+
+void CphWindow::haps_populate_permissions(const std::vector<HapsPermission> &perms) {
+    if (!g_haps_perm_list) return;
+    SendMessageW(g_haps_perm_list, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(g_haps_perm_list, LVM_DELETEALLITEMS, 0, 0);
+    for (int i = 0; i < (int)perms.size(); i++) {
+        int len = MultiByteToWideChar(CP_UTF8, 0, perms[i].name.c_str(), -1, nullptr, 0);
+        std::vector<wchar_t> wname(len);
+        MultiByteToWideChar(CP_UTF8, 0, perms[i].name.c_str(), -1, wname.data(), len);
+        LVITEMW lvi = {};
+        lvi.mask = LVIF_TEXT;
+        lvi.iItem = i;
+        lvi.iSubItem = 0;
+        lvi.pszText = wname.data();
+        SendMessageW(g_haps_perm_list, LVM_INSERTITEMW, 0, (LPARAM)&lvi);
+
+        const char *status = perms[i].granted ? "Granted" : "Denied";
+        int slen = MultiByteToWideChar(CP_UTF8, 0, status, -1, nullptr, 0);
+        std::vector<wchar_t> wstatus(slen);
+        MultiByteToWideChar(CP_UTF8, 0, status, -1, wstatus.data(), slen);
+        lvi.iSubItem = 1;
+        lvi.pszText = wstatus.data();
+        SendMessageW(g_haps_perm_list, LVM_SETITEMTEXTW, i, (LPARAM)&lvi);
+    }
+    SendMessageW(g_haps_perm_list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_haps_perm_list, nullptr, TRUE);
+}
+
+// Collect selected permission names from the permissions ListView as CSV
+std::string CphWindow::haps_get_selected_perms_csv() {
+    if (!g_haps_perm_list) return "";
+    std::string csv;
+    int idx = -1;
+    for (;;) {
+        idx = (int)SendMessageW(g_haps_perm_list, LVM_GETNEXTITEM, idx, LVNI_SELECTED);
+        if (idx == -1) break;
+        wchar_t wname[256] = {};
+        LVITEMW lvi = {};
+        lvi.iSubItem = 0;
+        lvi.pszText = wname;
+        lvi.cchTextMax = 256;
+        SendMessageW(g_haps_perm_list, LVM_GETITEMTEXTW, idx, (LPARAM)&lvi);
+        if (!csv.empty()) csv += ",";
+        int len = WideCharToMultiByte(CP_UTF8, 0, wname, -1, nullptr, 0, nullptr, nullptr);
+        std::string name(len, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, wname, -1, &name[0], len, nullptr, nullptr);
+        if (!name.empty() && name.back() == '\0') name.pop_back();
+        csv += name;
+    }
+    return csv;
+}
+
+// ── Haps: Async operations ──────────────────────────────────
+
+void CphWindow::haps_list_packages() {
+    std::string cmd = "bm dump -a";
+    if (!g_haps_user_id.empty()) cmd += " -u " + g_haps_user_id;
+    run_async(ASYNC_HAPS_LIST_PACKAGES, cmd);
+}
+
+void CphWindow::haps_list_permissions() {
+    if (g_haps_selected_pkg.empty()) return;
+    std::string cmd = "bm dump-permissions -n " + g_haps_selected_pkg;
+    if (!g_haps_user_id.empty()) cmd += " -u " + g_haps_user_id;
+    run_async(ASYNC_HAPS_LIST_PERMISSIONS, cmd);
+}
+
+void CphWindow::haps_grant(const std::string &perms_csv) {
+    if (g_haps_selected_pkg.empty()) return;
+    std::string cmd = "bm grant -n " + g_haps_selected_pkg + " -p " + perms_csv;
+    if (!g_haps_user_id.empty()) cmd += " -u " + g_haps_user_id;
+    run_async(ASYNC_HAPS_GRANT, cmd);
+}
+
+void CphWindow::haps_revoke(const std::string &perms_csv) {
+    if (g_haps_selected_pkg.empty()) return;
+    std::string cmd = "bm revoke -n " + g_haps_selected_pkg + " -p " + perms_csv;
+    if (!g_haps_user_id.empty()) cmd += " -u " + g_haps_user_id;
+    run_async(ASYNC_HAPS_REVOKE, cmd);
+}
+
+void CphWindow::haps_grant_all() {
+    if (g_haps_selected_pkg.empty()) return;
+    std::string cmd = "bm grant -n " + g_haps_selected_pkg + " -a";
+    if (!g_haps_user_id.empty()) cmd += " -u " + g_haps_user_id;
+    run_async(ASYNC_HAPS_GRANT_ALL, cmd);
+}
+
+void CphWindow::haps_revoke_all() {
+    if (g_haps_selected_pkg.empty()) return;
+    std::string cmd = "bm revoke -n " + g_haps_selected_pkg + " -a";
+    if (!g_haps_user_id.empty()) cmd += " -u " + g_haps_user_id;
+    run_async(ASYNC_HAPS_REVOKE_ALL, cmd);
+}
+
 // ── Public API ─────────────────────────────────────────────
 
 void CphWindow::create(HINSTANCE inst, HWND parent, int width) {
@@ -374,7 +558,7 @@ void CphWindow::create(HINSTANCE inst, HWND parent, int width) {
 
     static bool registered = false;
     if (!registered) {
-        INITCOMMONCONTROLSEX icex = {sizeof(icex), ICC_TAB_CLASSES};
+        INITCOMMONCONTROLSEX icex = {sizeof(icex), ICC_TAB_CLASSES | ICC_LISTVIEW_CLASSES};
         InitCommonControlsEx(&icex);
 
         WNDCLASSEXW wc = {};
@@ -407,6 +591,7 @@ void CphWindow::show(OnShellCommand on_shell, OnPushFile on_push, OnBusy on_busy
     // Initial refresh
     if (g_current_tab == TAB_GNSS) refresh_gnss();
     else if (g_current_tab == TAB_BATTERY) { s_refresh_fill_edits = true; refresh_battery(); }
+    else if (g_current_tab == TAB_HAPS) { if (!g_haps_loaded) haps_list_packages(); }
 }
 
 void CphWindow::hide() {
@@ -459,6 +644,7 @@ void CphWindow::on_tab_change() {
         show_tab_page(sel);
         if (sel == TAB_GNSS) refresh_gnss();
         else if (sel == TAB_BATTERY) refresh_battery();
+        else if (sel == TAB_HAPS) { if (!g_haps_loaded) haps_list_packages(); }
     }
 }
 
@@ -479,7 +665,8 @@ void CphWindow::show_tab_page(int page) {
 void CphWindow::run_async(AsyncOp op, const std::string &cmd) {
     if (!g_on_shell || !g_hwnd) return;
     // Inject/reset/scene operations take priority over refresh
-    bool is_refresh = (op == ASYNC_REFRESH_GNSS || op == ASYNC_REFRESH_BATTERY);
+    bool is_refresh = (op == ASYNC_REFRESH_GNSS || op == ASYNC_REFRESH_BATTERY
+        || op == ASYNC_HAPS_LIST_PACKAGES || op == ASYNC_HAPS_LIST_PERMISSIONS);
     if (g_async_busy.exchange(true)) {
         if (!is_refresh) {
             // For user-initiated actions, try once more without blocking UI
@@ -504,6 +691,9 @@ void CphWindow::run_async(AsyncOp op, const std::string &cmd) {
         AsyncResult *r = new AsyncResult{op, false, "", shell_cmd};
         int timeout = (op == ASYNC_REFRESH_GNSS || op == ASYNC_REFRESH_BATTERY) ? 5 : 10;
         if (op == ASYNC_INJECT_SCENE) timeout = 3;
+        if (op == ASYNC_HAPS_LIST_PERMISSIONS || op == ASYNC_HAPS_GRANT
+            || op == ASYNC_HAPS_REVOKE || op == ASYNC_HAPS_GRANT_ALL
+            || op == ASYNC_HAPS_REVOKE_ALL) timeout = 5;
         r->ok = on_shell(shell_cmd, &r->output, timeout);
         LOGE("CPH async result: op=%d ok=%d cmd=[%s] output=[%s]", (int)op, r->ok, shell_cmd.c_str(), r->output.c_str());
         PostMessageW(hwnd, WM_CPH_ASYNC_DONE, 0, reinterpret_cast<LPARAM>(r));
@@ -632,6 +822,61 @@ void CphWindow::handle_async_done(AsyncResult *r) {
             set_status(r->output.empty() ? "No response" : r->output.c_str());
         }
         break;
+
+    case ASYNC_HAPS_LIST_PACKAGES: {
+        if (r->ok) {
+            // Parse user_id from "ID: <number>:" header line
+            size_t id_pos = r->output.find("ID:");
+            if (id_pos != std::string::npos) {
+                size_t num_start = r->output.find_first_not_of(" \t", id_pos + 3);
+                if (num_start != std::string::npos) {
+                    size_t colon = r->output.find(':', num_start);
+                    if (colon != std::string::npos) {
+                        g_haps_user_id = r->output.substr(num_start, colon - num_start);
+                        while (!g_haps_user_id.empty() && (g_haps_user_id.back() == ' ' || g_haps_user_id.back() == '\t'))
+                            g_haps_user_id.pop_back();
+                    }
+                }
+            }
+            g_haps_packages = parse_packages(r->output);
+            haps_populate_packages();
+            g_haps_loaded = true;
+            set_status("Packages loaded");
+        } else {
+            show_toast("Failed to list packages", false);
+            set_status(r->output.empty() ? "List packages failed" : r->output.c_str());
+        }
+        break;
+    }
+
+    case ASYNC_HAPS_LIST_PERMISSIONS: {
+        if (r->ok) {
+            auto perms = parse_permissions(r->output);
+            haps_populate_permissions(perms);
+            set_status("Permissions loaded");
+        }
+        break;
+    }
+
+    case ASYNC_HAPS_GRANT:
+    case ASYNC_HAPS_REVOKE:
+    case ASYNC_HAPS_GRANT_ALL:
+    case ASYNC_HAPS_REVOKE_ALL: {
+        bool succeeded = r->output.find("succeeded") != std::string::npos;
+        if (succeeded) {
+            const char *action = (r->op == ASYNC_HAPS_GRANT_ALL) ? "All permissions granted"
+                : (r->op == ASYNC_HAPS_REVOKE_ALL) ? "All permissions revoked"
+                : (r->op == ASYNC_HAPS_GRANT) ? "Permissions granted" : "Permissions revoked";
+            show_toast(action, true);
+            set_status(action);
+            haps_list_permissions();
+        } else {
+            std::string err = r->output.empty() ? "Unknown error" : r->output;
+            while (!err.empty() && (err.back() == '\n' || err.back() == '\r')) err.pop_back();
+            msg_box("Haps", "Operation failed:\n%s", err.c_str());
+        }
+        break;
+    }
     }
 
     delete r;
@@ -1039,6 +1284,8 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         TabCtrl_InsertItem(g_tab, TAB_GNSS, &tie);
         tie.pszText = const_cast<LPWSTR>(L"Battery");
         TabCtrl_InsertItem(g_tab, TAB_BATTERY, &tie);
+        tie.pszText = const_cast<LPWSTR>(L"Haps");
+        TabCtrl_InsertItem(g_tab, TAB_HAPS, &tie);
         // Force tab item width to fit text
         SendMessageW(g_tab, TCM_SETITEMSIZE, 0, MAKELPARAM(80, 24));
 
@@ -1283,6 +1530,79 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                         edit_x + edit_w - 82, sy, 80, BTN_H);
         }
 
+        // ── Haps page ─────────────────────────────────────
+        {
+            ensure_page_class_registered(g_inst);
+            HWND page = CreateWindowW(CPH_PAGE_W, L"",
+                                       WS_CHILD | WS_CLIPSIBLINGS,
+                                       px, py, pw, ph,
+                                       g_tab, nullptr, nullptr, nullptr);
+            g_tab_pages[TAB_HAPS] = page;
+
+            // Packages group (compact height, top gap like GNSS)
+            int pkg_grp_y = 6;
+            int pkg_grp_h = 350;
+            make_group(page, L"Packages", grp_x, pkg_grp_y, grp_w, pkg_grp_h);
+            int pkg_list_h = pkg_grp_h - 20 - BTN_H - 12;
+            g_haps_pkg_list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+                                               WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                                               grp_x + 4, pkg_grp_y + 20, grp_w - 8, pkg_list_h,
+                                               page, (HMENU)IDC_HAPS_PKG_LIST, nullptr, nullptr);
+            SendMessageW(g_haps_pkg_list, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+            SendMessageW(g_haps_pkg_list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0,
+                         (LPARAM)(LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER));
+            {
+                LVCOLUMNW col = {};
+                col.mask = LVCF_TEXT | LVCF_WIDTH;
+                col.pszText = const_cast<LPWSTR>(L"Package");
+                col.cx = grp_w - 28;
+                SendMessageW(g_haps_pkg_list, LVM_INSERTCOLUMNW, 0, (LPARAM)&col);
+            }
+            // Refresh button at bottom of packages group (horizontally centered)
+            int refresh_x = grp_x + (grp_w - 80) / 2;
+            g_haps_refresh_btn = make_btn(page, L"Refresh", IDC_HAPS_REFRESH_BTN,
+                                           refresh_x, pkg_grp_y + pkg_grp_h - BTN_H - 6, 80, BTN_H);
+
+            // Permissions group (compact, same height as packages)
+            int perm_grp_y = pkg_grp_y + pkg_grp_h + ROW_GAP;
+            int perm_grp_h = 300;
+            make_group(page, L"Permissions", grp_x, perm_grp_y, grp_w, perm_grp_h);
+            int perm_list_h = perm_grp_h - 20 - BTN_H - 12;
+            g_haps_perm_list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+                                                WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS,
+                                                grp_x + 4, perm_grp_y + 20, grp_w - 8, perm_list_h,
+                                                page, (HMENU)IDC_HAPS_PERM_LIST, nullptr, nullptr);
+            SendMessageW(g_haps_perm_list, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+            SendMessageW(g_haps_perm_list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0,
+                         (LPARAM)(LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER));
+            {
+                int perm_col_w = grp_w - 12;
+                LVCOLUMNW col = {};
+                col.mask = LVCF_TEXT | LVCF_WIDTH;
+                col.pszText = const_cast<LPWSTR>(L"Permission");
+                col.cx = perm_col_w * 3 / 5;
+                SendMessageW(g_haps_perm_list, LVM_INSERTCOLUMNW, 0, (LPARAM)&col);
+                col.pszText = const_cast<LPWSTR>(L"Status");
+                col.cx = perm_col_w * 2 / 5;
+                SendMessageW(g_haps_perm_list, LVM_INSERTCOLUMNW, 1, (LPARAM)&col);
+            }
+
+            // Action buttons at bottom of permissions group (horizontally centered)
+            int btn_y = perm_grp_y + perm_grp_h - BTN_H - 6;
+            int hbtn_w = 80;
+            int hbtn_gap = 4;
+            int hbtn_total = hbtn_w * 4 + hbtn_gap * 3;
+            int hbtn_x = grp_x + (grp_w - hbtn_total) / 2;
+            g_haps_grant_all_btn = make_btn(page, L"Grant All", IDC_HAPS_GRANT_ALL_BTN,
+                                             hbtn_x, btn_y, hbtn_w, BTN_H);
+            g_haps_grant_btn = make_btn(page, L"Grant", IDC_HAPS_GRANT_BTN,
+                                         hbtn_x + hbtn_w + hbtn_gap, btn_y, hbtn_w, BTN_H);
+            g_haps_revoke_all_btn = make_btn(page, L"Revoke All", IDC_HAPS_REVOKE_ALL_BTN,
+                                               hbtn_x + (hbtn_w + hbtn_gap) * 2, btn_y, hbtn_w, BTN_H);
+            g_haps_revoke_btn = make_btn(page, L"Revoke", IDC_HAPS_REVOKE_BTN,
+                                           hbtn_x + (hbtn_w + hbtn_gap) * 3, btn_y, hbtn_w, BTN_H);
+        }
+
         // Status label at bottom
         g_status_label = CreateWindowW(L"STATIC", L"Ready",
                                         WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
@@ -1300,6 +1620,15 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         auto *nm = reinterpret_cast<NMHDR *>(lp);
         if (nm->idFrom == IDC_TAB && nm->code == TCN_SELCHANGE) {
             on_tab_change();
+        }
+        if (nm->idFrom == IDC_HAPS_PKG_LIST && nm->code == LVN_ITEMCHANGED) {
+            auto *pn = reinterpret_cast<LPNMLISTVIEW>(lp);
+            if ((pn->uNewState & LVIS_SELECTED) && !(pn->uOldState & LVIS_SELECTED)) {
+                if (pn->iItem >= 0 && pn->iItem < (int)g_haps_packages.size()) {
+                    g_haps_selected_pkg = g_haps_packages[pn->iItem];
+                    haps_list_permissions();
+                }
+            }
         }
         return 0;
     }
@@ -1374,6 +1703,46 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_BAT_SCENE_BTN:
             inject_charge_scene();
             break;
+        case IDC_HAPS_REFRESH_BTN:
+            g_haps_loaded = false;
+            haps_list_packages();
+            break;
+        case IDC_HAPS_GRANT_ALL_BTN:
+            haps_grant_all();
+            break;
+        case IDC_HAPS_REVOKE_ALL_BTN:
+            haps_revoke_all();
+            break;
+        case IDC_HAPS_GRANT_BTN: {
+            std::string csv = haps_get_selected_perms_csv();
+            if (!csv.empty()) haps_grant(csv);
+            break;
+        }
+        case IDC_HAPS_REVOKE_BTN: {
+            std::string csv = haps_get_selected_perms_csv();
+            if (!csv.empty()) haps_revoke(csv);
+            break;
+        }
+        }
+        return 0;
+    }
+
+    case WM_CONTEXTMENU: {
+        HWND ctrl = (HWND)wp;
+        if (ctrl && GetDlgCtrlID(ctrl) == IDC_HAPS_PERM_LIST) {
+            POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            // Use screen-to-list hit test if right-click via keyboard (-1,-1)
+            if (pt.x == -1 && pt.y == -1) {
+                RECT rc;
+                GetWindowRect(ctrl, &rc);
+                pt.x = rc.left + 20;
+                pt.y = rc.top + 20;
+            }
+            HMENU menu = CreatePopupMenu();
+            AppendMenuW(menu, MF_STRING, IDC_HAPS_GRANT_BTN, L"Grant");
+            AppendMenuW(menu, MF_STRING, IDC_HAPS_REVOKE_BTN, L"Revoke");
+            TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, hwnd, nullptr);
+            DestroyMenu(menu);
         }
         return 0;
     }
@@ -1473,6 +1842,12 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_bat_inject_btn = g_bat_reset_btn = g_bat_refresh_btn = nullptr;
         g_bat_current_label = nullptr;
         g_bat_scene_combo = g_bat_scene_btn = nullptr;
+        g_haps_pkg_list = g_haps_perm_list = nullptr;
+        g_haps_refresh_btn = g_haps_grant_all_btn = g_haps_grant_btn = g_haps_revoke_btn = g_haps_revoke_all_btn = nullptr;
+        g_haps_packages.clear();
+        g_haps_selected_pkg.clear();
+        g_haps_user_id.clear();
+        g_haps_loaded = false;
         g_status_label = nullptr;
         for (auto &p : g_tab_pages) p = nullptr;
         return 0;

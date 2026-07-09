@@ -5,11 +5,18 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <string>
+#include <vector>
 #include <functional>
 #include <thread>
 #include <atomic>
 
 namespace hscrcpy {
+
+// Haps permission entry: name + granted flag (parsed from bm dump-permissions)
+struct HapsPermission {
+    std::string name;
+    bool granted;
+};
 
 // CPH (Cloud Phone Host) simulation window
 // Provides device simulation injection: GNSS, Battery, and future expansions
@@ -86,14 +93,22 @@ private:
         IDC_BAT_SCENE_BTN,
         // Status
         IDC_STATUS_LABEL,
+        // Haps tab
+        IDC_HAPS_PKG_LIST,
+        IDC_HAPS_PERM_LIST,
+        IDC_HAPS_REFRESH_BTN,
+        IDC_HAPS_GRANT_ALL_BTN,
+        IDC_HAPS_GRANT_BTN,
+        IDC_HAPS_REVOKE_BTN,
+        IDC_HAPS_REVOKE_ALL_BTN,
     };
 
     // Tab page indices
     enum TabPage : int {
         TAB_GNSS = 0,
         TAB_BATTERY = 1,
-        // Future tabs: TAB_SENSOR, TAB_CAMERA, TAB_AUDIO, etc.
-        TAB_COUNT = 2,
+        TAB_HAPS = 2,
+        TAB_COUNT = 3,
     };
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
@@ -111,6 +126,12 @@ private:
         ASYNC_INJECT_BATTERY,
         ASYNC_RESET_BATTERY,
         ASYNC_INJECT_SCENE,
+        ASYNC_HAPS_LIST_PACKAGES,
+        ASYNC_HAPS_LIST_PERMISSIONS,
+        ASYNC_HAPS_GRANT,
+        ASYNC_HAPS_REVOKE,
+        ASYNC_HAPS_GRANT_ALL,
+        ASYNC_HAPS_REVOKE_ALL,
     };
     struct AsyncResult {
         AsyncOp op;
@@ -135,6 +156,17 @@ private:
     static void refresh_battery();
     static void inject_charge_scene();
     static void parse_battery_info(const std::string &output, bool fill_edits = false);
+
+    // Haps - Package & permission management via bm command
+    static void haps_list_packages();
+    static void haps_list_permissions();
+    static void haps_grant(const std::string &perms_csv);
+    static void haps_revoke(const std::string &perms_csv);
+    static void haps_grant_all();
+    static void haps_revoke_all();
+    static void haps_populate_packages();
+    static void haps_populate_permissions(const std::vector<HapsPermission> &perms);
+    static std::string haps_get_selected_perms_csv();
 
     static void msg_box(const char *title, const char *fmt, ...);
     static void show_toast(const char *text, bool success = true);
@@ -192,6 +224,19 @@ private:
 
     // Status
     static HWND g_status_label;
+
+    // Haps - Package & permission management
+    static HWND g_haps_pkg_list;
+    static HWND g_haps_perm_list;
+    static HWND g_haps_refresh_btn;
+    static HWND g_haps_grant_all_btn;
+    static HWND g_haps_grant_btn;
+    static HWND g_haps_revoke_btn;
+    static HWND g_haps_revoke_all_btn;
+    static std::vector<std::string> g_haps_packages;
+    static std::string g_haps_selected_pkg;
+    static std::string g_haps_user_id;
+    static bool g_haps_loaded;
 
     // Tab page containers
     static HWND g_tab_pages[TAB_COUNT];
