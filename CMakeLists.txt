@@ -21,6 +21,7 @@ add_executable(hscrcpy WIN32
     src/layout_window.cpp
     src/file_manager_window.cpp
     src/cph_window.cpp
+    src/msgbox_util.cpp
 )
 
 # ============================================

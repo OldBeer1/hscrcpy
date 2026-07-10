@@ -1,4 +1,5 @@
 #include "file_manager_window.h"
+#include "msgbox_util.h"
 #include "log.h"
 #include <windowsx.h>
 #include <commctrl.h>
@@ -474,9 +475,12 @@ static bool show_custom_dialog(const std::wstring &title, const std::wstring &te
     data.is_confirm = is_confirm;
     data.yes_clicked = false;
 
-    // Center on file manager panel
+    // Center on main window
     RECT orr = {};
-    if (s_fm_hwnd_for_dialog)
+    HWND main_wnd = s_fm_hwnd_for_dialog ? GetParent(s_fm_hwnd_for_dialog) : nullptr;
+    if (main_wnd)
+        GetWindowRect(main_wnd, &orr);
+    else if (s_fm_hwnd_for_dialog)
         GetWindowRect(s_fm_hwnd_for_dialog, &orr);
     else if (GetForegroundWindow())
         GetWindowRect(GetForegroundWindow(), &orr);
@@ -628,7 +632,8 @@ static LRESULT CALLBACK TextViewerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             {
                 std::ofstream ofs(local_tmp, std::ios::binary | std::ios::trunc);
                 if (!ofs) {
-                    MessageBoxW(hwnd, L"Cannot write temp file.", L"Save Failed", MB_OK | MB_ICONERROR);
+                    HWND main_wnd_tv = s_fm_hwnd_for_dialog ? GetParent(s_fm_hwnd_for_dialog) : nullptr;
+                    hscrcpy::centered_msgbox_w(hwnd, L"Cannot write temp file.", L"Save Failed", MB_OK | MB_ICONERROR, main_wnd_tv);
                     return 0;
                 }
                 ofs.write(utf8.data(), utf8.size());
@@ -651,8 +656,8 @@ static LRESULT CALLBACK TextViewerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         // Check dirty state — ask to discard if unsaved
         BOOL dirty = (BOOL)(LONG_PTR)GetPropW(hwnd, L"tv_dirty");
         if (dirty) {
-            int r = MessageBoxW(hwnd, L"Discard unsaved changes?", L"Confirm",
-                                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+            int r = hscrcpy::centered_msgbox_w(hwnd, L"Discard unsaved changes?", L"Confirm",
+                                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2, s_fm_hwnd_for_dialog ? GetParent(s_fm_hwnd_for_dialog) : nullptr);
             if (r != IDYES) return 0;  // stay open
         }
         DestroyWindow(hwnd);
@@ -689,9 +694,12 @@ static void show_text_viewer(const std::wstring &title, const std::wstring &cont
     data.remote_path = remote_path;
     data.editable = editable && !remote_path.empty();
 
-    // Center on file manager panel
+    // Center on main window
     RECT orr = {};
-    if (s_fm_hwnd_for_dialog)
+    HWND main_wnd = s_fm_hwnd_for_dialog ? GetParent(s_fm_hwnd_for_dialog) : nullptr;
+    if (main_wnd)
+        GetWindowRect(main_wnd, &orr);
+    else if (s_fm_hwnd_for_dialog)
         GetWindowRect(s_fm_hwnd_for_dialog, &orr);
     else if (GetForegroundWindow())
         GetWindowRect(GetForegroundWindow(), &orr);

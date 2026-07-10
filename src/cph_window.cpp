@@ -1,4 +1,5 @@
 #include "cph_window.h"
+#include "msgbox_util.h"
 #include "log.h"
 #include <windowsx.h>
 #include <commctrl.h>
@@ -83,7 +84,9 @@ CphWindow::OnShellCommand CphWindow::g_on_shell;
 CphWindow::OnPushFile CphWindow::g_on_push;
 CphWindow::OnBusy CphWindow::g_on_busy;
 int CphWindow::g_current_tab = TAB_GNSS;
-std::atomic<bool> CphWindow::g_async_busy{false};
+std::atomic<bool> CphWindow::g_gnss_busy{false};
+std::atomic<bool> CphWindow::g_battery_busy{false};
+std::atomic<bool> CphWindow::g_haps_busy{false};
 UINT_PTR CphWindow::g_refresh_timer = 0;
 
 // Timer ID for auto-refresh
@@ -304,33 +307,14 @@ void CphWindow::show_toast(const char *text, bool success) {
     SetWindowPos(g_toast_hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
-// Hook to center MessageBox on CPH window
-static HWND s_msgbox_parent = nullptr;
-static HHOOK s_msgbox_hook = nullptr;
-static LRESULT CALLBACK MsgBoxCenterHook(int nCode, WPARAM wp, LPARAM lp) {
-    if (nCode == HCBT_ACTIVATE && s_msgbox_parent) {
-        HWND mb = (HWND)wp;
-        RECT prc, mrc;
-        GetWindowRect(s_msgbox_parent, &prc);
-        GetWindowRect(mb, &mrc);
-        int x = prc.left + (prc.right - prc.left - (mrc.right - mrc.left)) / 2;
-        int y = prc.top + (prc.bottom - prc.top - (mrc.bottom - mrc.top)) / 2;
-        SetWindowPos(mb, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-    }
-    return CallNextHookEx(NULL, nCode, wp, lp);
-}
-
 void CphWindow::msg_box(const char *title, const char *fmt, ...) {
     char buf[512];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    s_msgbox_parent = g_hwnd;
-    s_msgbox_hook = SetWindowsHookExW(WH_CBT, MsgBoxCenterHook, NULL, GetCurrentThreadId());
-    MessageBoxA(g_hwnd, buf, title, MB_OK);
-    if (s_msgbox_hook) { UnhookWindowsHookEx(s_msgbox_hook); s_msgbox_hook = nullptr; }
-    s_msgbox_parent = nullptr;
+    HWND parent = g_parent ? g_parent : g_hwnd;
+    hscrcpy::centered_msgbox_a(parent, buf, title, MB_OK);
 }
 
 void CphWindow::set_status(const char *text) {
@@ -446,6 +430,7 @@ void CphWindow::haps_populate_packages() {
     }
     SendMessageW(g_haps_pkg_list, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(g_haps_pkg_list, nullptr, TRUE);
+    UpdateWindow(g_haps_pkg_list);
     // Auto-select first item → triggers LVN_ITEMCHANGED → loads permissions
     if (!g_haps_packages.empty()) {
         LVITEMW lvi = {};
@@ -480,6 +465,7 @@ void CphWindow::haps_populate_permissions(const std::vector<HapsPermission> &per
     }
     SendMessageW(g_haps_perm_list, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(g_haps_perm_list, nullptr, TRUE);
+    UpdateWindow(g_haps_perm_list);
 }
 
 // Collect selected permission names from the permissions ListView as CSV
@@ -509,6 +495,7 @@ std::string CphWindow::haps_get_selected_perms_csv() {
 // ── Haps: Async operations ──────────────────────────────────
 
 void CphWindow::haps_list_packages() {
+    set_status("Loading packages...");
     std::string cmd = "bm dump -a";
     if (!g_haps_user_id.empty()) cmd += " -u " + g_haps_user_id;
     run_async(ASYNC_HAPS_LIST_PACKAGES, cmd);
@@ -694,17 +681,34 @@ void CphWindow::show_tab_page(int page) {
 
 // ── Async shell runner ─────────────────────────────────────
 
+// Per-tab busy flags: same-tab ops are serialized, cross-tab ops run in parallel.
+std::atomic<bool>* CphWindow::busy_flag_for(AsyncOp op) {
+    switch (op) {
+    case ASYNC_REFRESH_GNSS:
+    case ASYNC_INJECT_GNSS:
+    case ASYNC_START_TRAJ:
+    case ASYNC_STOP_TRAJ:
+    case ASYNC_INJECT_SCENE:
+        return &g_gnss_busy;
+    case ASYNC_REFRESH_BATTERY:
+    case ASYNC_INJECT_BATTERY:
+    case ASYNC_RESET_BATTERY:
+        return &g_battery_busy;
+    default:
+        return &g_haps_busy;
+    }
+}
+
 void CphWindow::run_async(AsyncOp op, const std::string &cmd) {
     if (!g_on_shell || !g_hwnd) return;
-    // Inject/reset/scene operations take priority over refresh
+    // Refresh ops are silently dropped if the same tab is busy;
+    // user-initiated ops (inject/grant/revoke) are retried.
     bool is_refresh = (op == ASYNC_REFRESH_GNSS || op == ASYNC_REFRESH_BATTERY
         || op == ASYNC_HAPS_LIST_PACKAGES || op == ASYNC_HAPS_LIST_PERMISSIONS);
-    if (g_async_busy.exchange(true)) {
+    auto *busy = busy_flag_for(op);
+    if (busy->exchange(true)) {
         if (!is_refresh) {
-            // For user-initiated actions, try once more without blocking UI
-            // The pending async will complete and post WM_CPH_ASYNC_DONE
             LOGE("CPH run_async: op=%d queued (busy), will retry", (int)op);
-            // Post a retry message to the UI thread after a short delay
             std::string *cmd_copy = new std::string(cmd);
             int op_int = (int)op;
             std::thread([hwnd = g_hwnd, op_int, cmd_copy]() {
@@ -712,7 +716,7 @@ void CphWindow::run_async(AsyncOp op, const std::string &cmd) {
                 PostMessageW(hwnd, WM_CPH_RETRY_ASYNC, (WPARAM)op_int, (LPARAM)cmd_copy);
             }).detach();
         }
-        return;  // Don't block UI thread
+        return;
     }
 
     std::string shell_cmd = cmd;
@@ -733,7 +737,7 @@ void CphWindow::run_async(AsyncOp op, const std::string &cmd) {
 }
 
 void CphWindow::handle_async_done(AsyncResult *r) {
-    g_async_busy = false;
+    busy_flag_for(r->op)->store(false);
 
     switch (r->op) {
     case ASYNC_REFRESH_GNSS: {

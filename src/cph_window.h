@@ -142,6 +142,7 @@ private:
     };
     static void run_async(AsyncOp op, const std::string &cmd = "");
     static void handle_async_done(AsyncResult *r);
+    static std::atomic<bool>* busy_flag_for(AsyncOp op);
 
     // GNSS
     static void inject_gnss();
@@ -246,7 +247,9 @@ private:
     static OnPushFile g_on_push;
     static OnBusy g_on_busy;
     static int g_current_tab;
-    static std::atomic<bool> g_async_busy;
+    static std::atomic<bool> g_gnss_busy;
+    static std::atomic<bool> g_battery_busy;
+    static std::atomic<bool> g_haps_busy;
     static UINT_PTR g_refresh_timer;
 
     static HWND g_toast_hwnd;

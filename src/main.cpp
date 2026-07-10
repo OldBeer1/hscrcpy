@@ -17,6 +17,7 @@
 #include "layout_window.h"
 #include "file_manager_window.h"
 #include "cph_window.h"
+#include "msgbox_util.h"
 #include "log.h"
 #include "version.h"
 #include <cmath>
@@ -347,35 +348,9 @@ static HICON load_png_icon(const char *relative_path, int size,
     return icon;
 }
 
-static HHOOK g_msgbox_hook = NULL;
-static HWND g_msgbox_parent = NULL;
-
-static LRESULT CALLBACK MsgBoxCBTProc(int nCode, WPARAM wp, LPARAM lp) {
-    if (nCode == HCBT_ACTIVATE) {
-        HWND hMsg = (HWND)wp;
-        if (g_msgbox_parent) {
-            RECT pr, mr;
-            GetWindowRect(g_msgbox_parent, &pr);
-            GetWindowRect(hMsg, &mr);
-            int x = pr.left + (pr.right - pr.left - (mr.right - mr.left)) / 2;
-            int y = pr.top + (pr.bottom - pr.top - (mr.bottom - mr.top)) / 2;
-            SetWindowPos(hMsg, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-        }
-        UnhookWindowsHookEx(g_msgbox_hook);
-        g_msgbox_hook = NULL;
-    }
-    return CallNextHookEx(g_msgbox_hook, nCode, wp, lp);
-}
-
 static int center_msgbox(const char *text, const char *title, UINT type, HWND hParent = NULL) {
-    g_msgbox_parent = hParent ? hParent : g_hwnd;
-    g_msgbox_hook = SetWindowsHookExA(WH_CBT, MsgBoxCBTProc, NULL, GetCurrentThreadId());
-    int ret = MessageBoxA(g_msgbox_parent, text, title, type);
-    if (g_msgbox_hook) {
-        UnhookWindowsHookEx(g_msgbox_hook);
-        g_msgbox_hook = NULL;
-    }
-    return ret;
+    HWND parent = hParent ? hParent : g_hwnd;
+    return hscrcpy::centered_msgbox_a(parent, text, title, type);
 }
 
 static void show_error(const char *msg) {
@@ -2328,6 +2303,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         LOGE("Cloud phone detection: is_tcp=%d is_cloud_phone=%d serial=%s",
              g_hdc ? g_hdc->is_tcp() : -1, g_is_cloud_phone,
              g_hdc ? g_hdc->serial().c_str() : "null");
+        // Cloud phone images auto-disconnect hdc after 3min idle; set never-timeout.
+        // Ignore failures — some images without this feature reject the param.
+        if (g_is_cloud_phone && g_hdc) {
+            std::string out;
+            g_hdc->shell_command("param set persist.hdc.tcp.idle_never_timeout true", &out, 5);
+        }
         g_capture->set_notify_hwnd(g_hwnd);
         {
             HICON hPrev = (HICON)SendMessageA(g_btn_start_hwnd, BM_GETIMAGE, IMAGE_ICON, 0);
