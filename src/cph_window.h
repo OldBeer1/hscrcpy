@@ -16,6 +16,7 @@ namespace hscrcpy {
 struct HapsPermission {
     std::string name;
     bool granted;
+    bool system_fixed;
 };
 
 // CPH (Cloud Phone Host) simulation window
@@ -102,6 +103,8 @@ private:
         IDC_HAPS_GRANT_BTN,
         IDC_HAPS_REVOKE_BTN,
         IDC_HAPS_REVOKE_ALL_BTN,
+        IDC_HAPS_COPY_PERM_BTN,
+        IDC_HAPS_COPY_PKG_BTN,
     };
 
     // Tab page indices
@@ -239,6 +242,7 @@ private:
     static std::string g_haps_selected_pkg;
     static std::string g_haps_user_id;
     static bool g_haps_loaded;
+    static bool g_bat_inject_filled;
 
     // Tab page containers
     static HWND g_tab_pages[TAB_COUNT];

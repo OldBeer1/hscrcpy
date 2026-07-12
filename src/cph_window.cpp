@@ -77,6 +77,7 @@ std::vector<std::string> CphWindow::g_haps_packages;
 std::string CphWindow::g_haps_selected_pkg;
 std::string CphWindow::g_haps_user_id;
 bool CphWindow::g_haps_loaded = false;
+bool CphWindow::g_bat_inject_filled = false;
 
 HWND CphWindow::g_tab_pages[TAB_COUNT] = {};
 
@@ -391,8 +392,8 @@ static std::vector<std::string> parse_packages(const std::string &output) {
     return pkgs;
 }
 
-// Parse "bm dump-permissions -n <pkg>" output → (name, granted) pairs
-// Output format: header line + "  <perm>  [GRANTED|DENIED]"
+// Parse "bm dump-permissions -n <pkg>" output → (name, granted, system_fixed) triples
+// Output format: header line + "  <perm>  [GRANTED|DENIED]  <- system-fixed"
 static std::vector<HapsPermission> parse_permissions(const std::string &output) {
     std::vector<HapsPermission> perms;
     std::istringstream iss(output);
@@ -406,7 +407,8 @@ static std::vector<HapsPermission> parse_permissions(const std::string &output) 
         if (s == std::string::npos) continue;
         name = name.substr(s, e - s + 1);
         bool is_granted = (line.find("[GRANTED]", bracket) != std::string::npos);
-        perms.push_back({name, is_granted});
+        bool is_fixed = (line.find("system-fixed", bracket) != std::string::npos);
+        perms.push_back({name, is_granted, is_fixed});
     }
     return perms;
 }
@@ -462,6 +464,14 @@ void CphWindow::haps_populate_permissions(const std::vector<HapsPermission> &per
         lvi.iSubItem = 1;
         lvi.pszText = wstatus.data();
         SendMessageW(g_haps_perm_list, LVM_SETITEMTEXTW, i, (LPARAM)&lvi);
+
+        const char *fixed = perms[i].system_fixed ? "Yes" : "";
+        int flen = MultiByteToWideChar(CP_UTF8, 0, fixed, -1, nullptr, 0);
+        std::vector<wchar_t> wfixed(flen);
+        MultiByteToWideChar(CP_UTF8, 0, fixed, -1, wfixed.data(), flen);
+        lvi.iSubItem = 2;
+        lvi.pszText = wfixed.data();
+        SendMessageW(g_haps_perm_list, LVM_SETITEMTEXTW, i, (LPARAM)&lvi);
     }
     SendMessageW(g_haps_perm_list, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(g_haps_perm_list, nullptr, TRUE);
@@ -490,6 +500,29 @@ std::string CphWindow::haps_get_selected_perms_csv() {
         csv += name;
     }
     return csv;
+}
+
+// Copy text to Windows clipboard. Returns true on success.
+static bool copy_text_to_clipboard(HWND hwnd, const std::string &text) {
+    if (!OpenClipboard(hwnd)) return false;
+    EmptyClipboard();
+    bool ok = false;
+    HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, text.size() + 1);
+    if (hg) {
+        char *p = (char *)GlobalLock(hg);
+        if (p) {
+            memcpy(p, text.data(), text.size());
+            p[text.size()] = 0;
+            GlobalUnlock(hg);
+            // SetClipboardData transfers ownership to clipboard on success
+            ok = SetClipboardData(CF_TEXT, hg) != NULL;
+            if (!ok) GlobalFree(hg);
+        } else {
+            GlobalFree(hg);
+        }
+    }
+    CloseClipboard();
+    return ok;
 }
 
 // ── Haps: Async operations ──────────────────────────────────
@@ -617,6 +650,7 @@ void CphWindow::reset() {
     // Reset refresh state
     s_refresh_fill_edits = false;
     s_refresh_fail_count = 0;
+    g_bat_inject_filled = false;
     if (g_status_label) SetWindowTextW(g_status_label, L"");
 }
 
@@ -899,12 +933,38 @@ void CphWindow::handle_async_done(AsyncResult *r) {
     case ASYNC_HAPS_GRANT_ALL:
     case ASYNC_HAPS_REVOKE_ALL: {
         bool succeeded = r->output.find("succeeded") != std::string::npos;
+        // Detect system-fixed warning: "warning: the following permissions are fixed
+        // by system and cannot be modified" followed by "  - <perm>" lines.
+        std::string fixed_perms;
+        auto wpos = r->output.find("warning:");
+        if (wpos != std::string::npos) {
+            std::istringstream iss(r->output.substr(wpos));
+            std::string line;
+            while (std::getline(iss, line)) {
+                // Lines like "  - ohos.permission.XXX"
+                auto dash = line.find("- ");
+                if (dash == std::string::npos) continue;
+                // Stop at non-indented lines (e.g. "grant permission succeeded")
+                if (!line.empty() && line[0] != ' ') break;
+                std::string perm = line.substr(dash + 2);
+                // trim trailing whitespace
+                while (!perm.empty() && (perm.back() == ' ' || perm.back() == '\r'
+                       || perm.back() == '\t')) perm.pop_back();
+                if (perm.empty()) continue;
+                if (!fixed_perms.empty()) fixed_perms += ", ";
+                fixed_perms += perm;
+            }
+        }
         if (succeeded) {
             const char *action = (r->op == ASYNC_HAPS_GRANT_ALL) ? "All permissions granted"
                 : (r->op == ASYNC_HAPS_REVOKE_ALL) ? "All permissions revoked"
                 : (r->op == ASYNC_HAPS_GRANT) ? "Permissions granted" : "Permissions revoked";
             show_toast(action, true);
             set_status(action);
+            if (!fixed_perms.empty()) {
+                msg_box("Haps", "The following permissions are fixed by system "
+                        "and cannot be modified:\n%s", fixed_perms.c_str());
+            }
             haps_list_permissions();
         } else {
             std::string err = r->output.empty() ? "Unknown error" : r->output;
@@ -1097,8 +1157,7 @@ void CphWindow::parse_battery_info(const std::string &output, bool fill_edits) {
     };
 
     // Fill inject controls only on first parse or when Refresh button clicked
-    static bool inject_filled = false;
-    if (!inject_filled || fill_edits) {
+    if (!g_bat_inject_filled || fill_edits) {
         std::string cap = parse_val("capacity");
         std::string temp = parse_val("temperature");
         std::string plugged = parse_val("pluggedType");
@@ -1145,7 +1204,7 @@ void CphWindow::parse_battery_info(const std::string &output, bool fill_edits) {
         set_combo_by_val(g_bat_present_combo, present, present_map, 2);
 
         bool has_data = !cap.empty();
-        if (has_data) inject_filled = true;
+        if (has_data) g_bat_inject_filled = true;
     }
 
     // Build current display - all 14 fields, one per line, left-aligned
@@ -1435,7 +1494,7 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             y += 237;
 
             // Inject group
-            make_group(page, L"Inject Battery Info", grp_x, y, grp_w, 370);
+            make_group(page, L"Inject Battery Info", grp_x, y, grp_w, 315);
             int iy = y + 20;
             // Two-column layout: each column = label + edit, equal edit widths
             int col2_label_w = 42;       // right-side label width
@@ -1545,7 +1604,7 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                         edit_x + 88, iy, 80, BTN_H);
             g_bat_refresh_btn = make_btn(page, L"Refresh", IDC_BAT_REFRESH_BTN,
                                           edit_x + 176, iy, 80, BTN_H);
-            y += 378;
+            y += 323;
 
             // Charge scene group
             make_group(page, L"Charge Scene Simulation", grp_x, y, grp_w, 60);
@@ -1590,7 +1649,7 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             {
                 LVCOLUMNW col = {};
                 col.mask = LVCF_TEXT | LVCF_WIDTH;
-                col.pszText = const_cast<LPWSTR>(L"Package");
+                col.pszText = const_cast<LPWSTR>(L"Bundle Name");
                 col.cx = grp_w - 28;
                 SendMessageW(g_haps_pkg_list, LVM_INSERTCOLUMNW, 0, (LPARAM)&col);
             }
@@ -1619,8 +1678,11 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 col.cx = perm_col_w * 3 / 5;
                 SendMessageW(g_haps_perm_list, LVM_INSERTCOLUMNW, 0, (LPARAM)&col);
                 col.pszText = const_cast<LPWSTR>(L"Status");
-                col.cx = perm_col_w * 2 / 5;
+                col.cx = perm_col_w * 1 / 5;
                 SendMessageW(g_haps_perm_list, LVM_INSERTCOLUMNW, 1, (LPARAM)&col);
+                col.pszText = const_cast<LPWSTR>(L"SystemFixed");
+                col.cx = perm_col_w * 1 / 5;
+                SendMessageW(g_haps_perm_list, LVM_INSERTCOLUMNW, 2, (LPARAM)&col);
             }
 
             // Action buttons at bottom of permissions group (horizontally centered)
@@ -1759,6 +1821,40 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!csv.empty()) haps_revoke(csv);
             break;
         }
+        case IDC_HAPS_COPY_PERM_BTN: {
+            // Collect selected permission names (one per line) → clipboard
+            std::string csv = haps_get_selected_perms_csv();
+            if (csv.empty()) break;
+            // Convert comma-separated to newline-separated for clipboard
+            std::string text;
+            for (size_t i = 0; i < csv.size(); ++i) {
+                if (csv[i] == ',') text += "\r\n";
+                else text += csv[i];
+            }
+            text += "\r\n";
+            if (copy_text_to_clipboard(hwnd, text))
+                show_toast("Permission name copied", true);
+            break;
+        }
+        case IDC_HAPS_COPY_PKG_BTN: {
+            // Collect selected package names from g_haps_packages → clipboard
+            if (!g_haps_pkg_list) break;
+            std::string text;
+            int idx = -1;
+            for (;;) {
+                idx = (int)SendMessageW(g_haps_pkg_list, LVM_GETNEXTITEM, idx, LVNI_SELECTED);
+                if (idx == -1) break;
+                if (idx >= 0 && idx < (int)g_haps_packages.size()) {
+                    if (!text.empty()) text += "\r\n";
+                    text += g_haps_packages[idx];
+                }
+            }
+            if (text.empty()) break;
+            text += "\r\n";
+            if (copy_text_to_clipboard(hwnd, text))
+                show_toast("Bundle name copied", true);
+            break;
+        }
         }
         return 0;
     }
@@ -1777,6 +1873,21 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             HMENU menu = CreatePopupMenu();
             AppendMenuW(menu, MF_STRING, IDC_HAPS_GRANT_BTN, L"Grant");
             AppendMenuW(menu, MF_STRING, IDC_HAPS_REVOKE_BTN, L"Revoke");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_STRING, IDC_HAPS_COPY_PERM_BTN, L"Copy Permission Name");
+            TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, hwnd, nullptr);
+            DestroyMenu(menu);
+        }
+        if (ctrl && GetDlgCtrlID(ctrl) == IDC_HAPS_PKG_LIST) {
+            POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            if (pt.x == -1 && pt.y == -1) {
+                RECT rc;
+                GetWindowRect(ctrl, &rc);
+                pt.x = rc.left + 20;
+                pt.y = rc.top + 20;
+            }
+            HMENU menu = CreatePopupMenu();
+            AppendMenuW(menu, MF_STRING, IDC_HAPS_COPY_PKG_BTN, L"Copy Bundle Name");
             TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, hwnd, nullptr);
             DestroyMenu(menu);
         }
