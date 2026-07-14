@@ -1276,10 +1276,18 @@ static void stop_recording(bool download_and_open) {
 
         std::string qcmd = "mediatool query " + name + " -u";
         std::string qout;
-        hdc.shell_command(qcmd, &qout, 10);
-        LOGI("record query: out=%s", qout.c_str());
         std::string uri, direct_path;
-        bool found = parse_media_query(qout, uri, direct_path);
+        bool found = false;
+        // Retry: screenrecorder finalizes the file asynchronously after aa stop
+        // returns — the media library entry may not be registered yet.
+        for (int attempt = 1; attempt <= 4; attempt++) {
+            qout.clear();
+            hdc.shell_command(qcmd, &qout, 10);
+            LOGI("record query (attempt %d): out=%s", attempt, qout.c_str());
+            found = parse_media_query(qout, uri, direct_path);
+            if (found) break;
+            if (attempt < 4) Sleep(2000);
+        }
 
         if (!download_and_open) {
             // Exit cleanup: just delete from media library.

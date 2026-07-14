@@ -172,6 +172,7 @@ private:
     static void haps_populate_packages();
     static void haps_populate_permissions(const std::vector<HapsPermission> &perms);
     static std::string haps_get_selected_perms_csv();
+    static void haps_enable_perm_buttons(bool enable);
 
     static void msg_box(const char *title, const char *fmt, ...);
     static void show_toast(const char *text, bool success = true);
@@ -243,6 +244,8 @@ private:
     static std::string g_haps_user_id;
     static bool g_haps_loaded;
     static bool g_bat_inject_filled;
+    static bool g_gnss_inject_filled;
+    static bool g_haps_bm_unsupported;
 
     // Tab page containers
     static HWND g_tab_pages[TAB_COUNT];

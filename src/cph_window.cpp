@@ -78,6 +78,8 @@ std::string CphWindow::g_haps_selected_pkg;
 std::string CphWindow::g_haps_user_id;
 bool CphWindow::g_haps_loaded = false;
 bool CphWindow::g_bat_inject_filled = false;
+bool CphWindow::g_gnss_inject_filled = false;
+bool CphWindow::g_haps_bm_unsupported = false;
 
 HWND CphWindow::g_tab_pages[TAB_COUNT] = {};
 
@@ -125,6 +127,32 @@ static LRESULT CALLBACK TabSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     return CallWindowProcW(g_tab_orig_proc, hwnd, msg, wp, lp);
 }
 
+// Trajectory edit hint: gray placeholder text (no manifest → no EM_SETCUEBANNER)
+static HWND s_traj_edit_hwnd = nullptr;
+static bool s_traj_hint_active = true;
+
+static LRESULT CALLBACK TrajEditSubProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                        UINT_PTR /*id*/, DWORD_PTR /*ref*/) {
+    if (msg == WM_SETFOCUS) {
+        if (s_traj_hint_active) {
+            s_traj_hint_active = false;
+            SetWindowTextW(hwnd, L"");
+            InvalidateRect(hwnd, nullptr, TRUE);
+        }
+    } else if (msg == WM_KILLFOCUS) {
+        wchar_t buf[256] = {};
+        GetWindowTextW(hwnd, buf, 256);
+        if (buf[0] == 0) {
+            s_traj_hint_active = true;
+            SetWindowTextW(hwnd, L"/data/local/tmp/gpx.xml");
+            InvalidateRect(hwnd, nullptr, TRUE);
+        }
+    } else if (msg == WM_NCDESTROY) {
+        RemoveWindowSubclass(hwnd, TrajEditSubProc, 0);
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
 // Page WndProc: forward WM_COMMAND and WM_NOTIFY to the CPH main window
 static LRESULT CALLBACK CphPageWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_COMMAND) {
@@ -148,6 +176,17 @@ static LRESULT CALLBACK CphPageWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         GetClientRect(hwnd, &rc);
         FillRect(hdc, &rc, GetSysColorBrush(COLOR_WINDOW));
         return 1;
+    }
+    if (msg == WM_CTLCOLOREDIT) {
+        HDC hdc = (HDC)wp;
+        HWND hEdit = (HWND)lp;
+        SetBkColor(hdc, RGB(255, 255, 255));
+        if (hEdit == s_traj_edit_hwnd && s_traj_hint_active) {
+            SetTextColor(hdc, RGB(160, 160, 160));  // gray hint
+        } else {
+            SetTextColor(hdc, RGB(0, 0, 0));  // normal black
+        }
+        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
     }
     if (msg == WM_CTLCOLORSTATIC) {
         HDC hdc = (HDC)wp;
@@ -525,6 +564,20 @@ static bool copy_text_to_clipboard(HWND hwnd, const std::string &text) {
     return ok;
 }
 
+// Detect "bm: '<cmd>' is not a valid bm command" (low-version HarmonyOS
+// where grant/revoke/dump-permissions subcommands don't exist yet)
+static bool bm_perm_unsupported(const std::string &output) {
+    return output.find("is not a valid bm command") != std::string::npos;
+}
+
+// Enable/disable Haps permission action buttons
+void CphWindow::haps_enable_perm_buttons(bool enable) {
+    if (g_haps_grant_btn) EnableWindow(g_haps_grant_btn, enable);
+    if (g_haps_revoke_btn) EnableWindow(g_haps_revoke_btn, enable);
+    if (g_haps_grant_all_btn) EnableWindow(g_haps_grant_all_btn, enable);
+    if (g_haps_revoke_all_btn) EnableWindow(g_haps_revoke_all_btn, enable);
+}
+
 // ── Haps: Async operations ──────────────────────────────────
 
 void CphWindow::haps_list_packages() {
@@ -609,7 +662,7 @@ void CphWindow::show(OnShellCommand on_shell, OnPushFile on_push, OnBusy on_busy
     if (g_refresh_timer) KillTimer(g_hwnd, CPH_REFRESH_TIMER_ID);
     g_refresh_timer = SetTimer(g_hwnd, CPH_REFRESH_TIMER_ID, CPH_REFRESH_INTERVAL_MS, nullptr);
     // Initial refresh
-    if (g_current_tab == TAB_GNSS) refresh_gnss();
+    if (g_current_tab == TAB_GNSS) { s_refresh_fill_edits = true; refresh_gnss(); }
     else if (g_current_tab == TAB_BATTERY) { s_refresh_fill_edits = true; refresh_battery(); }
     else if (g_current_tab == TAB_HAPS) { if (!g_haps_loaded) haps_list_packages(); }
 }
@@ -623,10 +676,15 @@ void CphWindow::hide() {
 
 void CphWindow::reset() {
     // GNSS — clear edit boxes and current location label
+    // (traj edit keeps its hint — restored below, not cleared)
     HWND gnss_edits[] = {g_gnss_lat_edit, g_gnss_lng_edit, g_gnss_alt_edit,
         g_gnss_speed_edit, g_gnss_bearing_edit, g_gnss_hacc_edit,
-        g_gnss_vacc_edit, g_gnss_sacc_edit, g_gnss_bacc_edit, g_gnss_traj_edit};
+        g_gnss_vacc_edit, g_gnss_sacc_edit, g_gnss_bacc_edit};
     for (HWND h : gnss_edits) { if (h) SetWindowTextW(h, L""); }
+    if (g_gnss_traj_edit) {
+        s_traj_hint_active = true;
+        SetWindowTextW(g_gnss_traj_edit, L"/data/local/tmp/gpx.xml");
+    }
     if (g_gnss_current_label) SetWindowTextW(g_gnss_current_label, L"—");
 
     // Battery — clear edit boxes, reset combos to first item, clear label
@@ -646,10 +704,13 @@ void CphWindow::reset() {
     g_haps_selected_pkg.clear();
     g_haps_user_id.clear();
     g_haps_loaded = false;
+    g_haps_bm_unsupported = false;
+    haps_enable_perm_buttons(true);
 
     // Reset refresh state
     s_refresh_fill_edits = false;
     s_refresh_fail_count = 0;
+    g_gnss_inject_filled = false;
     g_bat_inject_filled = false;
     if (g_status_label) SetWindowTextW(g_status_label, L"");
 }
@@ -894,7 +955,8 @@ void CphWindow::handle_async_done(AsyncResult *r) {
         break;
 
     case ASYNC_HAPS_LIST_PACKAGES: {
-        if (r->ok) {
+        // hdc returns exit 0 even on failure; check output for bm error
+        if (r->ok && r->output.find("error:") == std::string::npos) {
             // Parse user_id from "ID: <number>:" header line
             size_t id_pos = r->output.find("ID:");
             if (id_pos != std::string::npos) {
@@ -920,10 +982,25 @@ void CphWindow::handle_async_done(AsyncResult *r) {
     }
 
     case ASYNC_HAPS_LIST_PERMISSIONS: {
-        if (r->ok) {
+        // hdc returns exit 0 even on failure; check output for bm error.
+        // "no user-grant permissions found" is not an error — the bundle
+        // simply has no user-grantable permissions (system apps, uninstalled, etc.)
+        if (r->ok && (r->output.find("error:") == std::string::npos
+                      || r->output.find("no user-grant permissions found") != std::string::npos)) {
             auto perms = parse_permissions(r->output);
             haps_populate_permissions(perms);
-            set_status("Permissions loaded");
+            set_status(perms.empty() ? "No user-grantable permissions" : "Permissions loaded");
+        } else if (bm_perm_unsupported(r->output)) {
+            // Low-version HarmonyOS: bm grant/revoke/dump-permissions don't exist
+            g_haps_bm_unsupported = true;
+            haps_populate_permissions({});
+            haps_enable_perm_buttons(false);
+            set_status("bm permission commands not supported on this HarmonyOS");
+            show_toast("bm permission commands not supported on this HarmonyOS", false);
+        } else {
+            haps_populate_permissions({});  // clear stale list
+            show_toast("Failed to load permissions", false);
+            set_status(r->output.empty() ? "Permissions load failed" : r->output.c_str());
         }
         break;
     }
@@ -966,6 +1043,16 @@ void CphWindow::handle_async_done(AsyncResult *r) {
                         "and cannot be modified:\n%s", fixed_perms.c_str());
             }
             haps_list_permissions();
+        } else if (!fixed_perms.empty()) {
+            // All selected permissions were system-fixed → operation failed
+            msg_box("Haps", "The following permissions are fixed by system "
+                    "and cannot be modified:\n%s", fixed_perms.c_str());
+        } else if (bm_perm_unsupported(r->output)) {
+            g_haps_bm_unsupported = true;
+            haps_enable_perm_buttons(false);
+            set_status("bm permission commands not supported on this HarmonyOS");
+            msg_box("Haps", "This HarmonyOS version does not support "
+                    "bm permission commands (grant/revoke/dump-permissions).");
         } else {
             std::string err = r->output.empty() ? "Unknown error" : r->output;
             while (!err.empty() && (err.back() == '\n' || err.back() == '\r')) err.pop_back();
@@ -1003,8 +1090,7 @@ void CphWindow::parse_gnss_location(const std::string &output, bool fill_edits) 
     };
 
     // Fill inject edit controls on first parse or when Refresh button clicked
-    static bool inject_filled = false;
-    if (!inject_filled || fill_edits) {
+    if (!g_gnss_inject_filled || fill_edits) {
         const char *edit_ids[] = {"latitude", "longitude", "altitude", "speed", "bearing",
                                    "horizontalAccuracy", "verticalAccuracy", "speedAccuracy", "bearingAccuracy"};
         HWND edit_hwnds[] = {g_gnss_lat_edit, g_gnss_lng_edit, g_gnss_alt_edit,
@@ -1015,7 +1101,7 @@ void CphWindow::parse_gnss_location(const std::string &output, bool fill_edits) 
             std::string val = parse_val(edit_ids[i]);
             if (!val.empty()) { SetWindowTextA(edit_hwnds[i], val.c_str()); has_data = true; }
         }
-        if (has_data) inject_filled = true;
+        if (has_data) g_gnss_inject_filled = true;
     }
 
     // Build current display - all 13 fields, one per line, left-aligned
@@ -1034,7 +1120,6 @@ void CphWindow::parse_gnss_location(const std::string &output, bool fill_edits) 
 }
 
 void CphWindow::refresh_gnss() {
-    s_refresh_fill_edits = false;
     s_refresh_fail_count = 0;  // Reset on manual refresh
     run_async(ASYNC_REFRESH_GNSS, "cmd gnss location -l");
 }
@@ -1117,7 +1202,7 @@ void CphWindow::start_trajectory() {
     char path[512];
     GetWindowTextA(g_gnss_traj_edit, path, sizeof(path));
 
-    if (!path[0]) {
+    if (s_traj_hint_active || !path[0]) {
         msg_box("Trajectory", "Please browse a GPX trajectory file first");
         return;
     }
@@ -1463,8 +1548,12 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int ty = y + 20;
             make_label(page, L"GPX/XML:", label_x, ty + 3, LABEL_W, 18);
             int browse_w = 50;
-            g_gnss_traj_edit = make_edit(page, IDC_GNSS_TRAJ_EDIT, L"/data/local/tmp/",
+            g_gnss_traj_edit = make_edit(page, IDC_GNSS_TRAJ_EDIT, L"/data/local/tmp/gpx.xml",
                                           edit_x, ty, edit_w - browse_w - 4, EDIT_H);
+            // Gray placeholder hint for traj edit (no manifest → manual cue banner)
+            s_traj_edit_hwnd = g_gnss_traj_edit;
+            s_traj_hint_active = true;
+            SetWindowSubclass(g_gnss_traj_edit, TrajEditSubProc, 0, 0);
             g_gnss_traj_browse_btn = make_btn(page, L"...", IDC_GNSS_TRAJ_BROWSE_BTN,
                                                edit_x + edit_w - browse_w, ty, browse_w, EDIT_H);
             ty += row_h + 8;
@@ -1672,16 +1761,19 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                          (LPARAM)(LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER));
             {
                 int perm_col_w = grp_w - 12;
+                int col0_w = perm_col_w * 3 / 5;
+                int col1_w = perm_col_w * 1 / 5;
+                int col2_w = perm_col_w - col0_w - col1_w;  // absorb remainder
                 LVCOLUMNW col = {};
                 col.mask = LVCF_TEXT | LVCF_WIDTH;
                 col.pszText = const_cast<LPWSTR>(L"Permission");
-                col.cx = perm_col_w * 3 / 5;
+                col.cx = col0_w;
                 SendMessageW(g_haps_perm_list, LVM_INSERTCOLUMNW, 0, (LPARAM)&col);
                 col.pszText = const_cast<LPWSTR>(L"Status");
-                col.cx = perm_col_w * 1 / 5;
+                col.cx = col1_w;
                 SendMessageW(g_haps_perm_list, LVM_INSERTCOLUMNW, 1, (LPARAM)&col);
                 col.pszText = const_cast<LPWSTR>(L"SystemFixed");
-                col.cx = perm_col_w * 1 / 5;
+                col.cx = col2_w;
                 SendMessageW(g_haps_perm_list, LVM_INSERTCOLUMNW, 2, (LPARAM)&col);
             }
 
@@ -1724,7 +1816,7 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if ((pn->uNewState & LVIS_SELECTED) && !(pn->uOldState & LVIS_SELECTED)) {
                 if (pn->iItem >= 0 && pn->iItem < (int)g_haps_packages.size()) {
                     g_haps_selected_pkg = g_haps_packages[pn->iItem];
-                    haps_list_permissions();
+                    if (!g_haps_bm_unsupported) haps_list_permissions();
                 }
             }
         }
@@ -1773,6 +1865,7 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     std::string chmod_cmd = "chmod a+r '" + remote_path + "'";
                     std::string chmod_out;
                     if (g_on_shell) g_on_shell(chmod_cmd, &chmod_out, 5);
+                    s_traj_hint_active = false;
                     SetWindowTextA(g_gnss_traj_edit, remote_path.c_str());
                     show_toast("File pushed to device", true);
                     set_status(remote_path.c_str());
@@ -1803,6 +1896,8 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case IDC_HAPS_REFRESH_BTN:
             g_haps_loaded = false;
+            g_haps_bm_unsupported = false;
+            haps_enable_perm_buttons(true);
             haps_list_packages();
             break;
         case IDC_HAPS_GRANT_ALL_BTN:
@@ -1980,6 +2075,8 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_gnss_inject_btn = g_gnss_refresh_btn = nullptr;
         g_gnss_current_label = nullptr;
         g_gnss_traj_edit = nullptr;
+        s_traj_edit_hwnd = nullptr;
+        s_traj_hint_active = true;
         g_gnss_traj_browse_btn = g_gnss_traj_start_btn = g_gnss_traj_stop_btn = nullptr;
         g_bat_capacity_edit = g_bat_temp_edit = g_bat_voltage_edit = nullptr;
         g_bat_voltage_max_edit = g_bat_current_edit = g_bat_current_avg_edit = nullptr;
@@ -1995,6 +2092,7 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_haps_selected_pkg.clear();
         g_haps_user_id.clear();
         g_haps_loaded = false;
+        g_haps_bm_unsupported = false;
         g_status_label = nullptr;
         for (auto &p : g_tab_pages) p = nullptr;
         return 0;
