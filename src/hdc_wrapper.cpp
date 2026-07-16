@@ -237,6 +237,28 @@ int HdcWrapper::run_process(const std::string &cmd, std::string *output, int tim
     si.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION pi = {};
 
+    // Per-call Job Object: on timeout, TerminateJobObject kills BOTH cmd.exe
+    // AND its child hdc.exe (which inherited the pipe write handle). Without
+    // this, killing only cmd.exe leaves hdc.exe orphaned with the pipe write
+    // end open → reader thread's ReadFile blocks forever → deadlock under
+    // INFINITE wait. Each run_process call creates its own job, so killing
+    // this job only affects THIS command's processes — other hdc.exe clients
+    // (other devices, other hscrcpy instances, the hdc daemon, fport streams)
+    // are NOT in this job and are untouched. KILL_ON_JOB_CLOSE also acts as a
+    // safety net if hscrcpy itself crashes mid-call (Windows reaps the handle
+    // and kills any survivors).
+    HANDLE hJob = CreateJobObjectW(NULL, NULL);
+    if (hJob) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
+        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
+                                     &jeli, sizeof(jeli))) {
+            LOGW("SetInformationJobObject failed (err=%lu) — kill-on-close disabled", GetLastError());
+        }
+    } else {
+        LOGW("CreateJobObjectW failed (err=%lu) — timeout may leave hdc.exe orphaned", GetLastError());
+    }
+
     char exe_path[MAX_PATH];
     GetModuleFileNameA(NULL, exe_path, MAX_PATH);
     std::string exe_dir(exe_path);
@@ -257,7 +279,20 @@ int HdcWrapper::run_process(const std::string &cmd, std::string *output, int tim
             LOGE("CreateProcess failed for: %s (err=%lu)", cmd.c_str(), GetLastError());
             CloseHandle(hRead);
             CloseHandle(hWrite);
+            if (hJob) CloseHandle(hJob);
             return -1;
+        }
+    }
+
+    // Bind the spawned process tree (cmd.exe + its hdc.exe child, which
+    // inherits job membership as a descendant) to this job. Win8+ supports
+    // nested jobs, so this works even if hscrcpy itself already runs inside
+    // a job (e.g., IDE-launched). On rare failure, fall through — the
+    // TerminateProcess branch below still kills cmd.exe (orphaned hdc.exe
+    // risk returns, but better than blocking).
+    if (hJob) {
+        if (!AssignProcessToJobObject(hJob, pi.hProcess)) {
+            LOGW("AssignProcessToJobObject failed (err=%lu) — timeout fallback may orphan hdc.exe", GetLastError());
         }
     }
 
@@ -288,11 +323,26 @@ int HdcWrapper::run_process(const std::string &cmd, std::string *output, int tim
     DWORD wait = static_cast<DWORD>(timeout_ms);
     DWORD waitResult = WaitForSingleObject(pi.hProcess, wait);
     if (waitResult == WAIT_TIMEOUT) {
-        TerminateProcess(pi.hProcess, 1);
+        // TerminateJobObject kills ALL processes in the job (cmd.exe AND its
+        // child hdc.exe), releasing the inherited pipe write handle so the
+        // reader thread's ReadFile returns FALSE/EOF and the thread exits.
+        // Fall back to TerminateProcess if the job wasn't created/assigned —
+        // only kills cmd.exe, leaves hdc.exe orphaned, but unblocks the wait.
+        if (hJob) {
+            TerminateJobObject(hJob, 1);
+        } else {
+            TerminateProcess(pi.hProcess, 1);
+        }
         LOGW("Process timed out: %s (%d ms)", cmd.c_str(), timeout_ms);
     }
 
-    WaitForSingleObject(hThread, 3000);
+    // INFINITE is safe: timeout path killed both cmd.exe and hdc.exe (via
+    // job) releasing the pipe write handle, normal path had both exit
+    // cleanly. Either way, ReadFile returns and the reader thread exits.
+    // A finite timeout here risks the reader outliving run_process's stack
+    // frame (where ReadCtx lives) → access violation writing c->done.
+    // See crash at VA 0x14001612e (c->done = true).
+    WaitForSingleObject(hThread, INFINITE);
     CloseHandle(hThread);
     CloseHandle(hRead);
 
@@ -300,6 +350,10 @@ int HdcWrapper::run_process(const std::string &cmd, std::string *output, int tim
     GetExitCodeProcess(pi.hProcess, &exitCode);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+    // Close hJob last. If KILL_ON_JOB_CLOSE is set and any process in the job
+    // is still alive (shouldn't happen — either exited normally or was
+    // terminated above), this kills them as a safety net. Otherwise no-op.
+    if (hJob) CloseHandle(hJob);
 
     if (output) *output = std::move(result);
     return static_cast<int>(exitCode);
