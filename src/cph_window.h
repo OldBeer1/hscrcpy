@@ -105,14 +105,27 @@ private:
         IDC_HAPS_REVOKE_ALL_BTN,
         IDC_HAPS_COPY_PERM_BTN,
         IDC_HAPS_COPY_PKG_BTN,
+        // I18n tab
+        IDC_I18N_LANG_COMBO,
+        IDC_I18N_REGION_COMBO,
+        IDC_I18N_TZ_COMBO,
+        IDC_I18N_24HOUR_CHECK,
+        IDC_I18N_APPLY_BTN,
+        IDC_I18N_REFRESH_BTN,
+        IDC_I18N_DATE_EDIT,
+        IDC_I18N_TIME_EDIT,
+        IDC_I18N_SET_DATETIME_BTN,
+        IDC_I18N_AUTOTIME_BTN,
+        IDC_I18N_CURRENT_LABEL,
     };
 
     // Tab page indices
     enum TabPage : int {
-        TAB_GNSS = 0,
-        TAB_BATTERY = 1,
+        TAB_BATTERY = 0,
+        TAB_GNSS = 1,
         TAB_HAPS = 2,
-        TAB_COUNT = 3,
+        TAB_I18N = 3,
+        TAB_COUNT = 4,
     };
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
@@ -136,6 +149,12 @@ private:
         ASYNC_HAPS_REVOKE,
         ASYNC_HAPS_GRANT_ALL,
         ASYNC_HAPS_REVOKE_ALL,
+        ASYNC_I18N_GET,
+        ASYNC_I18N_APPLY,
+        ASYNC_I18N_SET_DATETIME,
+        ASYNC_I18N_SET_AUTOTIME,
+        ASYNC_I18N_DISABLE_AUTOTIME,
+        ASYNC_I18N_SET_24HOUR,
     };
     struct AsyncResult {
         AsyncOp op;
@@ -173,6 +192,21 @@ private:
     static void haps_populate_permissions(const std::vector<HapsPermission> &perms);
     static std::string haps_get_selected_perms_csv();
     static void haps_enable_perm_buttons(bool enable);
+
+    // I18n - Language/region/timezone/datetime/24hour/autotime via cmd i18n
+    static void i18n_refresh();
+    static void i18n_apply();
+    static void i18n_set_datetime();
+    static void i18n_set_autotime();
+    static void i18n_disable_autotime();
+    static void i18n_set_24hour(bool enabled);
+    static void i18n_parse_and_populate(const std::string &output);
+    // Live-filter the editable combobox list by the current edit text.
+    // Called on CBN_EDITCHANGE for the Language/Region/Timezone combos.
+    static void i18n_filter_combo(int combo_id);
+    // Extract all "error: ..." lines from a cmd i18n output blob so the UI
+    // can surface the server-side error verbatim instead of a generic toast.
+    static std::string i18n_extract_errors(const std::string &output);
 
     static void msg_box(const char *title, const char *fmt, ...);
     static void show_toast(const char *text, bool success = true);
@@ -247,6 +281,20 @@ private:
     static bool g_gnss_inject_filled;
     static bool g_haps_bm_unsupported;
 
+    // I18n controls
+    static HWND g_i18n_lang_combo;
+    static HWND g_i18n_region_combo;
+    static HWND g_i18n_tz_combo;
+    static HWND g_i18n_24hour_check;
+    static HWND g_i18n_apply_btn;
+    static HWND g_i18n_refresh_btn;
+    static HWND g_i18n_date_edit;
+    static HWND g_i18n_time_edit;
+    static HWND g_i18n_set_datetime_btn;
+    static HWND g_i18n_autotime_btn;
+    static HWND g_i18n_current_label;
+    static bool g_i18n_loaded;
+
     // Tab page containers
     static HWND g_tab_pages[TAB_COUNT];
 
@@ -257,6 +305,7 @@ private:
     static std::atomic<bool> g_gnss_busy;
     static std::atomic<bool> g_battery_busy;
     static std::atomic<bool> g_haps_busy;
+    static std::atomic<bool> g_i18n_busy;
     static UINT_PTR g_refresh_timer;
 
     static HWND g_toast_hwnd;

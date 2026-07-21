@@ -516,6 +516,23 @@ static bool show_custom_dialog(const std::wstring &title, const std::wstring &te
 static std::string shell_escape(const std::string &s);
 static std::string wide_to_utf8(const std::wstring &ws);
 
+// SHBrowseForFolder callback: center on g_parent + optional initial dir.
+// pData = char* path for BFFM_SETSELECTIONA (pass 0 to skip).
+// Shared by download / import_files / import_folder / export_files.
+int CALLBACK FileManagerWindow::browse_center_callback(HWND hwnd, UINT uMsg, LPARAM, LPARAM pData) {
+    if (uMsg != BFFM_INITIALIZED) return 0;
+    if (pData) SendMessageA(hwnd, BFFM_SETSELECTIONA, TRUE, pData);
+    if (g_parent) {
+        RECT orr, mr;
+        if (GetWindowRect(g_parent, &orr) && GetWindowRect(hwnd, &mr)) {
+            int cx = orr.left + ((orr.right - orr.left) - (mr.right - mr.left)) / 2;
+            int cy = orr.top + ((orr.bottom - orr.top) - (mr.bottom - mr.top)) / 2;
+            SetWindowPos(hwnd, NULL, cx, cy, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+        }
+    }
+    return 0;
+}
+
 struct TextViewerData {
     std::wstring title;
     std::wstring content;     // already \r\n converted
@@ -528,6 +545,17 @@ enum TvCtrlId : int {
     TV_EDIT = 4001,
     TV_SAVE_BTN = 4002,
 };
+
+// EDIT control subclass procedure to handle Ctrl+A
+static WNDPROC g_orig_edit_proc = nullptr;
+static LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_KEYDOWN && wp == 'A' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+        // Ctrl+A: select all text
+        SendMessageW(hwnd, EM_SETSEL, 0, -1);
+        return 0;
+    }
+    return CallWindowProcW(g_orig_edit_proc, hwnd, msg, wp, lp);
+}
 
 static LRESULT CALLBACK TextViewerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     auto *data = reinterpret_cast<TextViewerData*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -550,6 +578,8 @@ static LRESULT CALLBACK TextViewerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         if (!data->editable) edit_style |= ES_READONLY;
         HWND edit = CreateWindowExW(0, L"EDIT", L"", edit_style,
             0, 0, rc.right, rc.bottom - 36, hwnd, (HMENU)TV_EDIT, cs->hInstance, NULL);
+        // Subclass EDIT to handle Ctrl+A
+        g_orig_edit_proc = (WNDPROC)SetWindowLongPtrW(edit, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
         SendMessageW(edit, WM_SETFONT, (WPARAM)hf, TRUE);
         // Allow large text (default EDIT limit is ~32K)
         SendMessageW(edit, EM_SETLIMITTEXT, 0, 0);
@@ -598,6 +628,8 @@ static LRESULT CALLBACK TextViewerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             HWND btn = GetDlgItem(hwnd, IDOK);
             if (btn) MoveWindow(btn, rc.right / 2 - 40, rc.bottom - 32, 80, 26, TRUE);
         }
+        // Force repaint to prevent ghosting artifacts
+        InvalidateRect(hwnd, NULL, TRUE);
         return 0;
     }
     case WM_COMMAND: {
@@ -664,6 +696,12 @@ static LRESULT CALLBACK TextViewerProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         return 0;
     }
     case WM_DESTROY: {
+        // Restore EDIT control's original window procedure
+        HWND edit = GetDlgItem(hwnd, TV_EDIT);
+        if (edit && g_orig_edit_proc) {
+            SetWindowLongPtrW(edit, GWLP_WNDPROC, (LONG_PTR)g_orig_edit_proc);
+            g_orig_edit_proc = nullptr;
+        }
         HFONT hf = (HFONT)GetPropW(hwnd, L"tv_font");
         if (hf) { DeleteObject(hf); RemovePropW(hwnd, L"tv_font"); }
         RemovePropW(hwnd, L"tv_dirty");
@@ -1086,16 +1124,11 @@ void FileManagerWindow::enter_selected() {
             std::string default_dir = get_download_dir();
             if (!default_dir.empty() && default_dir.back() == '\\') default_dir.pop_back();
             BROWSEINFOA bi = {};
-            bi.hwndOwner = g_hwnd;
+            bi.hwndOwner = g_parent;
             bi.lpszTitle = "Select folder to save file";
             bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
             bi.lParam = (LPARAM)default_dir.c_str();
-            bi.lpfn = [](HWND hwnd, UINT uMsg, LPARAM, LPARAM pData) -> int {
-                if (uMsg == BFFM_INITIALIZED) {
-                    SendMessageA(hwnd, BFFM_SETSELECTIONA, TRUE, pData);
-                }
-                return 0;
-            };
+            bi.lpfn = browse_center_callback;
             LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
             if (!pidl) return;
             SHGetPathFromIDListA(pidl, save_dir);
@@ -1685,6 +1718,7 @@ void FileManagerWindow::import_files() {
         bi.hwndOwner = g_parent;
         bi.lpszTitle = "Select folder to push to device";
         bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+        bi.lpfn = browse_center_callback;
         LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
         if (!pidl) return;
         char folder_buf[MAX_PATH] = {};
@@ -1757,6 +1791,7 @@ void FileManagerWindow::import_folder() {
     bi.hwndOwner = g_parent;
     bi.lpszTitle = "Select folder to push to device";
     bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    bi.lpfn = browse_center_callback;
     LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
     if (!pidl) return;
     char folder_buf[MAX_PATH] = {};
@@ -1839,14 +1874,8 @@ void FileManagerWindow::export_files() {
     bi.hwndOwner = g_parent;
     bi.lpszTitle = "Select destination folder on PC";
     bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-    bi.lParam = (LPARAM)folder_buf;
-    // Set initial selection to Downloads
-    bi.lpfn = [](HWND hwnd, UINT uMsg, LPARAM lp, LPARAM pData) -> int {
-        if (uMsg == BFFM_INITIALIZED) {
-            SendMessageA(hwnd, BFFM_SETSELECTIONA, TRUE, pData);
-        }
-        return 0;
-    };
+    bi.lParam = (LPARAM)folder_buf;  // initial selection (Downloads)
+    bi.lpfn = browse_center_callback;
     LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
     if (!pidl) return;
     char selected_buf[MAX_PATH] = {};

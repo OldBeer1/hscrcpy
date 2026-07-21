@@ -2422,11 +2422,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         break;
     }
     case kMsgDeviceDisconnected: {
-        // Device disconnected (hdc unreachable) — stop mirroring and notify user
+        // Device disconnected (hdc unreachable) — stop mirroring and notify user.
+        // Must stop BEFORE show_error: stop_mirroring() synchronously hides
+        // sub-windows and shrinks the main window. If show_error runs first,
+        // the MessageBox centers on the wide window (with panel), then the
+        // window shrinks — leaving the box off-center.
         if (g_mirroring) {
-            show_error("Device disconnected. Please reconnect and try again.");
-            EnableWindow(g_btn_start_hwnd, FALSE);
             stop_mirroring();
+            show_error("Device disconnected. Please reconnect and try again.");
         }
         break;
     }

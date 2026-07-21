@@ -1,4 +1,5 @@
 #include "cph_window.h"
+#include "cph_i18n_data.h"
 #include "msgbox_util.h"
 #include "log.h"
 #include <windowsx.h>
@@ -11,6 +12,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <cwctype>
 #include <thread>
 #include <atomic>
 
@@ -81,6 +83,20 @@ bool CphWindow::g_bat_inject_filled = false;
 bool CphWindow::g_gnss_inject_filled = false;
 bool CphWindow::g_haps_bm_unsupported = false;
 
+// I18n controls
+HWND CphWindow::g_i18n_lang_combo = nullptr;
+HWND CphWindow::g_i18n_region_combo = nullptr;
+HWND CphWindow::g_i18n_tz_combo = nullptr;
+HWND CphWindow::g_i18n_24hour_check = nullptr;
+HWND CphWindow::g_i18n_apply_btn = nullptr;
+HWND CphWindow::g_i18n_refresh_btn = nullptr;
+HWND CphWindow::g_i18n_date_edit = nullptr;
+HWND CphWindow::g_i18n_time_edit = nullptr;
+HWND CphWindow::g_i18n_set_datetime_btn = nullptr;
+HWND CphWindow::g_i18n_autotime_btn = nullptr;
+HWND CphWindow::g_i18n_current_label = nullptr;
+bool CphWindow::g_i18n_loaded = false;
+
 HWND CphWindow::g_tab_pages[TAB_COUNT] = {};
 
 CphWindow::OnShellCommand CphWindow::g_on_shell;
@@ -90,6 +106,7 @@ int CphWindow::g_current_tab = TAB_GNSS;
 std::atomic<bool> CphWindow::g_gnss_busy{false};
 std::atomic<bool> CphWindow::g_battery_busy{false};
 std::atomic<bool> CphWindow::g_haps_busy{false};
+std::atomic<bool> CphWindow::g_i18n_busy{false};
 UINT_PTR CphWindow::g_refresh_timer = 0;
 
 // Timer ID for auto-refresh
@@ -112,6 +129,11 @@ HWND CphWindow::g_toast_hwnd = nullptr;
 
 static const wchar_t CPH_CLASS_W[] = L"HScrcpyCphClass";
 static const wchar_t CPH_PAGE_W[] = L"HScrcpyCphPageClass";
+
+// I18n reference data (454 locales, 473 timezones, 245 regions) now in
+// cph_i18n_data.h. The old hardcoded arrays here were incomplete (83 langs,
+// 24 tzs, 249 regions) and used CBS_DROPDOWNLIST — replaced by CBS_DROPDOWN
+// with live filtering in i18n_filter_combo().
 
 // Tab control subclass: fill white background instead of system COLOR_BTNFACE gray
 static WNDPROC g_tab_orig_proc = nullptr;
@@ -265,10 +287,16 @@ bool CphWindow::is_cloud_phone(OnShellCommand on_shell) {
 
 // ── Toast notification ─────────────────────────────────────
 
+struct ToastData {
+    wchar_t *text;
+    bool success;
+};
+
 static LRESULT CALLBACK CphToastWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_CREATE) {
         auto *cs = reinterpret_cast<CREATESTRUCTW *>(lp);
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+        auto *data = reinterpret_cast<ToastData *>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)data);
         SetTimer(hwnd, 1, 2000, nullptr);
         return 0;
     }
@@ -277,16 +305,34 @@ static LRESULT CALLBACK CphToastWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         DestroyWindow(hwnd);
         return 0;
     }
+    if (msg == WM_DESTROY) {
+        auto *data = reinterpret_cast<ToastData *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (data) {
+            delete[] data->text;
+            delete data;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        }
+        return 0;
+    }
     if (msg == WM_PAINT) {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
-        auto *text = reinterpret_cast<const wchar_t *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        auto *data = reinterpret_cast<ToastData *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (!data) {
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
         RECT rc;
         GetClientRect(hwnd, &rc);
+        // Fill background with success/failure color
+        COLORREF bg_color = data->success ? RGB(102, 187, 106) : RGB(239, 154, 154);
+        HBRUSH bg_brush = CreateSolidBrush(bg_color);
+        FillRect(hdc, &rc, bg_brush);
+        DeleteObject(bg_brush);
         SetBkMode(hdc, TRANSPARENT);
         HFONT hf = CreateFontW(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
         HFONT old = (HFONT)SelectObject(hdc, hf);
-        DrawTextW(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(hdc, data->text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SelectObject(hdc, old);
         DeleteObject(hf);
         EndPaint(hwnd, &ps);
@@ -303,7 +349,7 @@ void CphWindow::show_toast(const char *text, bool success) {
         wc.cbSize = sizeof(wc);
         wc.lpfnWndProc = CphToastWndProc;
         wc.hInstance = g_inst;
-        wc.hbrBackground = CreateSolidBrush(success ? RGB(102, 187, 106) : RGB(239, 154, 154));
+        wc.hbrBackground = nullptr;  // Background drawn in WM_PAINT
         wc.lpszClassName = L"HScrcpyCphToastClass";
         RegisterClassExW(&wc);
         reg = true;
@@ -312,6 +358,7 @@ void CphWindow::show_toast(const char *text, bool success) {
     int len = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
     auto *wtext = new wchar_t[len];
     MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, len);
+    auto *data = new ToastData{wtext, success};
     // Calculate width based on text length
     HDC dc = GetDC(g_hwnd);
     HFONT hf = CreateFontW(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
@@ -343,7 +390,7 @@ void CphWindow::show_toast(const char *text, bool success) {
                                     (prc.left + prc.right) / 2 - tw / 2,
                                     (prc.top + prc.bottom) / 2 - 15,
                                     tw, 30,
-                                    g_hwnd, nullptr, g_inst, wtext);
+                                    g_hwnd, nullptr, g_inst, data);
     SetWindowPos(g_toast_hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
@@ -400,6 +447,19 @@ static HWND make_combo(HWND parent, int id, int x, int y, int w, int h) {
                              WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
                              x, y, w, h, parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
     if (g_cph_font) SendMessageW(hw, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+    return hw;
+}
+
+// Editable combobox (CBS_DROPDOWN): user can type arbitrary text, and the
+// list is filtered live by i18n_filter_combo() on CBN_EDITCHANGE. Used for
+// the i18n Language / Region / Timezone pickers where the full list has
+// hundreds of entries and a plain CBS_DROPDOWNLIST would be unusable.
+static HWND make_editable_combo(HWND parent, int id, int x, int y, int w, int h) {
+    HWND hw = CreateWindowW(L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWN | WS_VSCROLL | CBS_AUTOHSCROLL,
+        x, y, w, h, parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
+    if (g_cph_font) SendMessageW(hw, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+    SendMessageW(hw, CB_SETMINVISIBLE, 30, 0);  // cap dropdown height for 473-tz list
     return hw;
 }
 
@@ -665,6 +725,7 @@ void CphWindow::show(OnShellCommand on_shell, OnPushFile on_push, OnBusy on_busy
     if (g_current_tab == TAB_GNSS) { s_refresh_fill_edits = true; refresh_gnss(); }
     else if (g_current_tab == TAB_BATTERY) { s_refresh_fill_edits = true; refresh_battery(); }
     else if (g_current_tab == TAB_HAPS) { if (!g_haps_loaded) haps_list_packages(); }
+    else if (g_current_tab == TAB_I18N) { if (!g_i18n_loaded) i18n_refresh(); }
 }
 
 void CphWindow::hide() {
@@ -706,6 +767,19 @@ void CphWindow::reset() {
     g_haps_loaded = false;
     g_haps_bm_unsupported = false;
     haps_enable_perm_buttons(true);
+
+    // I18n — reset combos, checkboxes, edits, current label
+    HWND i18n_combos[] = {g_i18n_lang_combo, g_i18n_region_combo, g_i18n_tz_combo};
+    for (HWND h : i18n_combos) { if (h) SendMessageW(h, CB_SETCURSEL, (WPARAM)-1, 0); }
+    if (g_i18n_24hour_check) SendMessageW(g_i18n_24hour_check, BM_SETCHECK, BST_UNCHECKED, 0);
+    if (g_i18n_autotime_btn) SendMessageW(g_i18n_autotime_btn, BM_SETCHECK, BST_UNCHECKED, 0);
+    // Re-enable mutex controls (AutoTime unchecked → all enabled)
+    HWND mutex_ctrls[] = {g_i18n_tz_combo, g_i18n_date_edit, g_i18n_time_edit, g_i18n_set_datetime_btn};
+    for (HWND h : mutex_ctrls) { if (h) EnableWindow(h, TRUE); }
+    if (g_i18n_date_edit) SetWindowTextW(g_i18n_date_edit, L"");
+    if (g_i18n_time_edit) SetWindowTextW(g_i18n_time_edit, L"");
+    if (g_i18n_current_label) SetWindowTextW(g_i18n_current_label, L"--");
+    g_i18n_loaded = false;
 
     // Reset refresh state
     s_refresh_fill_edits = false;
@@ -759,6 +833,7 @@ void CphWindow::on_tab_change() {
         if (sel == TAB_GNSS) refresh_gnss();
         else if (sel == TAB_BATTERY) refresh_battery();
         else if (sel == TAB_HAPS) { if (!g_haps_loaded) haps_list_packages(); }
+        else if (sel == TAB_I18N) { i18n_refresh(); }
     }
 }
 
@@ -789,6 +864,13 @@ std::atomic<bool>* CphWindow::busy_flag_for(AsyncOp op) {
     case ASYNC_INJECT_BATTERY:
     case ASYNC_RESET_BATTERY:
         return &g_battery_busy;
+    case ASYNC_I18N_GET:
+    case ASYNC_I18N_APPLY:
+    case ASYNC_I18N_SET_DATETIME:
+    case ASYNC_I18N_SET_AUTOTIME:
+    case ASYNC_I18N_DISABLE_AUTOTIME:
+    case ASYNC_I18N_SET_24HOUR:
+        return &g_i18n_busy;
     default:
         return &g_haps_busy;
     }
@@ -799,7 +881,8 @@ void CphWindow::run_async(AsyncOp op, const std::string &cmd) {
     // Refresh ops are silently dropped if the same tab is busy;
     // user-initiated ops (inject/grant/revoke) are retried.
     bool is_refresh = (op == ASYNC_REFRESH_GNSS || op == ASYNC_REFRESH_BATTERY
-        || op == ASYNC_HAPS_LIST_PACKAGES || op == ASYNC_HAPS_LIST_PERMISSIONS);
+        || op == ASYNC_HAPS_LIST_PACKAGES || op == ASYNC_HAPS_LIST_PERMISSIONS
+        || op == ASYNC_I18N_GET);
     auto *busy = busy_flag_for(op);
     if (busy->exchange(true)) {
         if (!is_refresh) {
@@ -1060,9 +1143,489 @@ void CphWindow::handle_async_done(AsyncResult *r) {
         }
         break;
     }
+
+    case ASYNC_I18N_GET: {
+        if (r->ok && r->output.find("Current locale settings") != std::string::npos) {
+            i18n_parse_and_populate(r->output);
+            g_i18n_loaded = true;
+            set_status("i18n settings loaded");
+        } else {
+            show_toast("Failed to load i18n settings", false);
+            set_status(r->output.empty() ? "i18n load failed" : r->output.c_str());
+        }
+        break;
+    }
+
+    case ASYNC_I18N_APPLY: {
+        // i18n_apply only sends -l/-r/-t (not -z/-a — those go through their
+        // own checkboxes), so only check those three success markers.
+        int success_count = 0;
+        if (r->output.find("language succeeded") != std::string::npos) success_count++;
+        if (r->output.find("region succeeded") != std::string::npos) success_count++;
+        if (r->output.find("timezone succeeded") != std::string::npos) success_count++;
+        std::string errors = i18n_extract_errors(r->output);
+        if (success_count > 0 && errors.empty()) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "i18n: %d setting(s) applied", success_count);
+            show_toast(buf, true);
+            set_status(buf);
+        } else if (success_count > 0 && !errors.empty()) {
+            // Partial success: some fields applied, some failed. Show both the
+            // count and the verbatim server error lines in the toast.
+            std::string toast = "i18n: " + std::to_string(success_count) + " applied, some failed";
+            show_toast(toast.c_str(), false);
+            set_status(errors.c_str());
+        } else {
+            // All failed — surface server error verbatim.
+            std::string toast = "i18n apply failed";
+            if (!errors.empty()) toast += ": " + errors;
+            show_toast(toast.c_str(), false);
+            set_status(errors.empty() ? "i18n apply failed" : errors.c_str());
+        }
+        // Refresh in all cases so combos reflect the server's true state.
+        i18n_refresh();
+        break;
+    }
+
+    case ASYNC_I18N_SET_DATETIME: {
+        if (r->output.find("set datetime succeeded") != std::string::npos) {
+            show_toast("Datetime set", true);
+            set_status("i18n datetime set");
+        } else {
+            std::string errors = i18n_extract_errors(r->output);
+            std::string toast = "Set datetime failed";
+            if (!errors.empty()) toast += ": " + errors;
+            show_toast(toast.c_str(), false);
+            set_status(errors.empty() ? "i18n datetime failed" : errors.c_str());
+        }
+        i18n_refresh();
+        break;
+    }
+
+    case ASYNC_I18N_SET_AUTOTIME: {
+        if (r->output.find("set autotime succeeded") != std::string::npos) {
+            show_toast("Auto-time enabled", true);
+            set_status("i18n autotime enabled");
+        } else {
+            std::string errors = i18n_extract_errors(r->output);
+            std::string toast = "Enable autotime failed";
+            if (!errors.empty()) toast += ": " + errors;
+            show_toast(toast.c_str(), false);
+            set_status(errors.empty() ? "i18n autotime failed" : errors.c_str());
+        }
+        // Refresh to restore checkbox/combo to the server's true state on
+        // failure (instead of manually reverting just the checkbox).
+        i18n_refresh();
+        break;
+    }
+
+    case ASYNC_I18N_DISABLE_AUTOTIME: {
+        // Triggered by unchecking AutoTime (sends -t tz -d datetime, which
+        // implicitly disables autotime per design 4.1). Distinct from
+        // ASYNC_I18N_SET_DATETIME so the toast reflects user intent.
+        if (r->output.find("set datetime succeeded") != std::string::npos) {
+            show_toast("Auto-time disabled", true);
+            set_status("i18n autotime disabled");
+        } else {
+            std::string errors = i18n_extract_errors(r->output);
+            std::string toast = "Disable autotime failed";
+            if (!errors.empty()) toast += ": " + errors;
+            show_toast(toast.c_str(), false);
+            set_status(errors.empty() ? "i18n disable autotime failed" : errors.c_str());
+        }
+        i18n_refresh();
+        break;
+    }
+
+    case ASYNC_I18N_SET_24HOUR: {
+        if (r->output.find("24-hour clock succeeded") != std::string::npos) {
+            show_toast("24-hour clock updated", true);
+            set_status("i18n 24-hour clock set");
+        } else {
+            std::string errors = i18n_extract_errors(r->output);
+            std::string toast = "Set 24-hour clock failed";
+            if (!errors.empty()) toast += ": " + errors;
+            show_toast(toast.c_str(), false);
+            set_status(errors.empty() ? "i18n 24-hour failed" : errors.c_str());
+        }
+        i18n_refresh();
+        break;
+    }
     }
 
     delete r;
+}
+
+// ── I18n: Language/region/timezone/datetime/24hour/autotime ─
+
+void CphWindow::i18n_refresh() {
+    run_async(ASYNC_I18N_GET, "cmd i18n get");
+}
+
+void CphWindow::i18n_apply() {
+    // Apply button handles Language/Region/Timezone only.
+    // AutoTime and 24-hour are applied immediately by their checkboxes.
+    std::string cmd = "cmd i18n set";
+    bool has_opt = false;
+
+    // Language combo — CBS_DROPDOWN: user may type a value not in the list,
+    // so fall back to GetWindowText when CB_GETCURSEL returns CB_ERR.
+    if (g_i18n_lang_combo) {
+        wchar_t wbuf[32] = {};
+        int sel = (int)SendMessageW(g_i18n_lang_combo, CB_GETCURSEL, 0, 0);
+        if (sel != CB_ERR) {
+            SendMessageW(g_i18n_lang_combo, CB_GETLBTEXT, sel, (LPARAM)wbuf);
+        } else {
+            GetWindowTextW(g_i18n_lang_combo, wbuf, 32);
+        }
+        char buf[32] = {};
+        WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, buf, sizeof(buf), nullptr, nullptr);
+        if (buf[0]) { cmd += " -l "; cmd += buf; has_opt = true; }
+    }
+
+    // Region combo
+    if (g_i18n_region_combo) {
+        wchar_t wbuf[8] = {};
+        int sel = (int)SendMessageW(g_i18n_region_combo, CB_GETCURSEL, 0, 0);
+        if (sel != CB_ERR) {
+            SendMessageW(g_i18n_region_combo, CB_GETLBTEXT, sel, (LPARAM)wbuf);
+        } else {
+            GetWindowTextW(g_i18n_region_combo, wbuf, 8);
+        }
+        char buf[8] = {};
+        WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, buf, sizeof(buf), nullptr, nullptr);
+        if (buf[0]) { cmd += " -r "; cmd += buf; has_opt = true; }
+    }
+
+    // Timezone combo — only when AutoTime is not checked (mutex)
+    bool autotime = g_i18n_autotime_btn &&
+        (SendMessageW(g_i18n_autotime_btn, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    if (!autotime && g_i18n_tz_combo) {
+        wchar_t wbuf[64] = {};
+        int sel = (int)SendMessageW(g_i18n_tz_combo, CB_GETCURSEL, 0, 0);
+        if (sel != CB_ERR) {
+            SendMessageW(g_i18n_tz_combo, CB_GETLBTEXT, sel, (LPARAM)wbuf);
+        } else {
+            GetWindowTextW(g_i18n_tz_combo, wbuf, 64);
+        }
+        char buf[64] = {};
+        WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, buf, sizeof(buf), nullptr, nullptr);
+        if (buf[0]) { cmd += " -t "; cmd += buf; has_opt = true; }
+    }
+
+    if (!has_opt) {
+        show_toast("Select at least one setting", false);
+        return;
+    }
+
+    run_async(ASYNC_I18N_APPLY, cmd);
+}
+
+void CphWindow::i18n_set_datetime() {
+    wchar_t wdate[16] = {};
+    wchar_t wtime[16] = {};
+    if (g_i18n_date_edit) GetWindowTextW(g_i18n_date_edit, wdate, 16);
+    if (g_i18n_time_edit) GetWindowTextW(g_i18n_time_edit, wtime, 16);
+
+    if (!wdate[0] || !wtime[0]) {
+        show_toast("Please enter date and time", false);
+        return;
+    }
+
+    char date[16] = {};
+    char time[16] = {};
+    WideCharToMultiByte(CP_UTF8, 0, wdate, -1, date, sizeof(date), nullptr, nullptr);
+    WideCharToMultiByte(CP_UTF8, 0, wtime, -1, time, sizeof(time), nullptr, nullptr);
+
+    // Include timezone if set (user expectation: Apply sets both datetime and timezone)
+    std::string cmd = "cmd i18n set";
+    if (g_i18n_tz_combo) {
+        wchar_t wtz[64] = {};
+        int sel = (int)SendMessageW(g_i18n_tz_combo, CB_GETCURSEL, 0, 0);
+        if (sel != CB_ERR) {
+            SendMessageW(g_i18n_tz_combo, CB_GETLBTEXT, sel, (LPARAM)wtz);
+        } else {
+            GetWindowTextW(g_i18n_tz_combo, wtz, 64);
+        }
+        if (wtz[0]) {
+            char tz[64] = {};
+            WideCharToMultiByte(CP_UTF8, 0, wtz, -1, tz, sizeof(tz), nullptr, nullptr);
+            cmd += " -t ";
+            cmd += tz;
+        }
+    }
+    cmd += " -d \"";
+    cmd += date;
+    cmd += "T";
+    cmd += time;
+    cmd += "\"";
+
+    run_async(ASYNC_I18N_SET_DATETIME, cmd);
+}
+
+void CphWindow::i18n_set_autotime() {
+    run_async(ASYNC_I18N_SET_AUTOTIME, "cmd i18n set -a");
+}
+
+void CphWindow::i18n_disable_autotime() {
+    // Disable autotime by setting timezone and datetime
+    // Read current timezone from combo (CBS_DROPDOWN: fall back to edit text
+    // when the user typed a value not present in the filtered list).
+    wchar_t wtz[64] = {};
+    int tz_sel = (int)SendMessageW(g_i18n_tz_combo, CB_GETCURSEL, 0, 0);
+    if (tz_sel != CB_ERR) {
+        SendMessageW(g_i18n_tz_combo, CB_GETLBTEXT, tz_sel, (LPARAM)wtz);
+    } else {
+        GetWindowTextW(g_i18n_tz_combo, wtz, 64);
+    }
+    if (!wtz[0]) {
+        show_toast("Please select a timezone first", false);
+        // BS_AUTOCHECKBOX already toggled the checkbox off; refresh to restore
+        // the server's true state (AutoTime still ON) instead of leaving the
+        // UI desynced.
+        i18n_refresh();
+        return;
+    }
+    char tz[64] = {};
+    WideCharToMultiByte(CP_UTF8, 0, wtz, -1, tz, sizeof(tz), nullptr, nullptr);
+
+    // Read current date and time from edits
+    wchar_t wdate[16] = {};
+    wchar_t wtime[16] = {};
+    if (g_i18n_date_edit) GetWindowTextW(g_i18n_date_edit, wdate, 16);
+    if (g_i18n_time_edit) GetWindowTextW(g_i18n_time_edit, wtime, 16);
+
+    if (!wdate[0] || !wtime[0]) {
+        show_toast("Please enter date and time", false);
+        i18n_refresh();
+        return;
+    }
+
+    char date[16] = {};
+    char time[16] = {};
+    WideCharToMultiByte(CP_UTF8, 0, wdate, -1, date, sizeof(date), nullptr, nullptr);
+    WideCharToMultiByte(CP_UTF8, 0, wtime, -1, time, sizeof(time), nullptr, nullptr);
+
+    // Build combined command: -t timezone -d "datetime"
+    std::string cmd = "cmd i18n set -t ";
+    cmd += tz;
+    cmd += " -d \"";
+    cmd += date;
+    cmd += "T";
+    cmd += time;
+    cmd += "\"";
+
+    run_async(ASYNC_I18N_DISABLE_AUTOTIME, cmd);
+}
+
+void CphWindow::i18n_set_24hour(bool enabled) {
+    std::string cmd = "cmd i18n set -z ";
+    cmd += enabled ? "true" : "false";
+    run_async(ASYNC_I18N_SET_24HOUR, cmd);
+}
+
+// Live-filter an editable combobox by the current edit text.
+// Called on CBN_EDITCHANGE for the i18n Language / Region / Timezone combos.
+// Rebuilds the dropdown list with only entries that case-insensitively
+// contain the current edit text. Reentry-guarded because SetWindowTextW
+// below would retrigger CBN_EDITCHANGE and recurse.
+void CphWindow::i18n_filter_combo(int combo_id) {
+    HWND combo = nullptr;
+    const wchar_t *const *wide_list = nullptr;
+    int wide_count = 0;
+    const char *const *narrow_list = nullptr;
+    int narrow_count = 0;
+
+    if (combo_id == IDC_I18N_LANG_COMBO) {
+        combo = g_i18n_lang_combo;
+        wide_list = I18N_LOCALES;
+        wide_count = I18N_LOCALES_COUNT;
+    } else if (combo_id == IDC_I18N_TZ_COMBO) {
+        combo = g_i18n_tz_combo;
+        wide_list = I18N_TIMEZONES;
+        wide_count = I18N_TIMEZONES_COUNT;
+    } else if (combo_id == IDC_I18N_REGION_COMBO) {
+        combo = g_i18n_region_combo;
+        narrow_list = I18N_REGIONS;
+        narrow_count = I18N_REGIONS_COUNT;
+    }
+    if (!combo) return;
+
+    // Reentry guard: SetWindowTextW below would retrigger CBN_EDITCHANGE.
+    static int s_filtering = 0;
+    if (s_filtering) return;
+    s_filtering = 1;
+
+    // Read current edit text and lowercase it for case-insensitive matching.
+    wchar_t wbuf[128] = {};
+    GetWindowTextW(combo, wbuf, 128);
+    std::wstring needle;
+    for (int i = 0; wbuf[i]; i++) needle.push_back((wchar_t)towlower(wbuf[i]));
+
+    // Preserve edit selection so the caret does not jump to 0 on rebuild.
+    DWORD sel = (DWORD)SendMessageW(combo, CB_GETEDITSEL, 0, 0);
+    int sel_start = LOWORD(sel);
+    int sel_end = HIWORD(sel);
+
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+
+    const int MAX_MATCH = 200;  // cap list size to avoid lag on 473-entry tz list
+    int added = 0;
+
+    if (wide_list) {
+        for (int i = 0; i < wide_count && added < MAX_MATCH; i++) {
+            std::wstring hay;
+            for (const wchar_t *p = wide_list[i]; *p; p++) hay.push_back((wchar_t)towlower(*p));
+            if (needle.empty() || hay.find(needle) != std::wstring::npos) {
+                SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)wide_list[i]);
+                added++;
+            }
+        }
+    } else if (narrow_list) {
+        for (int i = 0; i < narrow_count && added < MAX_MATCH; i++) {
+            wchar_t w[16] = {};
+            MultiByteToWideChar(CP_UTF8, 0, narrow_list[i], -1, w, 16);
+            std::wstring hay;
+            for (const wchar_t *p = w; *p; p++) hay.push_back((wchar_t)towlower(*p));
+            if (needle.empty() || hay.find(needle) != std::wstring::npos) {
+                SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)w);
+                added++;
+            }
+        }
+    }
+
+    // Restore edit text + selection (CB_RESETCONTENT cleared it).
+    SetWindowTextW(combo, wbuf);
+    SendMessageW(combo, CB_SETEDITSEL, 0, MAKELPARAM(sel_start, sel_end));
+    if (added > 0) SendMessageW(combo, CB_SHOWDROPDOWN, TRUE, 0);
+
+    s_filtering = 0;
+}
+
+// Extract all "error: ..." lines from a cmd i18n output blob so the UI
+// can surface the server-side error verbatim instead of a generic toast.
+std::string CphWindow::i18n_extract_errors(const std::string &output) {
+    std::string result;
+    size_t pos = 0;
+    while ((pos = output.find("error:", pos)) != std::string::npos) {
+        size_t line_end = output.find('\n', pos);
+        if (line_end == std::string::npos) line_end = output.size();
+        std::string line = output.substr(pos, line_end - pos);
+        while (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!result.empty()) result += "\n";
+        result += line;
+        pos = line_end;
+    }
+    return result;
+}
+
+void CphWindow::i18n_parse_and_populate(const std::string &output) {
+    // Parse "cmd i18n get" output line-by-by (v2.1 format):
+    //   Language:  zh-Hans
+    //   Region:    CN
+    //   Timezone:  Asia/Shanghai
+    //   Datetime:  2026-07-20 12:53:21
+    //   Is24Hour:  true
+    //   AutoTime:  ON
+    auto extract_val = [&](const char *key) -> std::string {
+        std::string search = std::string(key) + ":";
+        auto pos = output.find(search);
+        if (pos == std::string::npos) return "";
+        // Skip whitespace after colon
+        auto start = pos + search.size();
+        while (start < output.size() && (output[start] == ' ' || output[start] == '\t')) start++;
+        auto end = output.find('\n', start);
+        if (end == std::string::npos) end = output.size();
+        std::string val = output.substr(start, end - start);
+        // Trim trailing whitespace/CR
+        while (!val.empty() && (val.back() == ' ' || val.back() == '\t' || val.back() == '\r')) val.pop_back();
+        return val;
+    };
+
+    std::string lang = extract_val("Language");
+    std::string region = extract_val("Region");
+    std::string tz = extract_val("Timezone");
+    std::string dt = extract_val("Datetime");
+    std::string hour24 = extract_val("Is24Hour");
+    std::string autotime = extract_val("AutoTime");
+
+    // Populate language combo. CBS_DROPDOWN allows values outside the preset
+    // list, so when CB_SELECTSTRING returns CB_ERR we SetWindowTextW to show
+    // the server value verbatim — the user can still edit it before Apply.
+    if (g_i18n_lang_combo && !lang.empty()) {
+        wchar_t wbuf[32] = {};
+        MultiByteToWideChar(CP_UTF8, 0, lang.c_str(), -1, wbuf, 32);
+        LRESULT idx = SendMessageW(g_i18n_lang_combo, CB_SELECTSTRING, (WPARAM)-1, (LPARAM)wbuf);
+        if (idx == CB_ERR) SetWindowTextW(g_i18n_lang_combo, wbuf);
+    }
+
+    // Populate region combo — read directly from Region field (v2.0+)
+    if (g_i18n_region_combo && !region.empty()) {
+        wchar_t wbuf[8] = {};
+        MultiByteToWideChar(CP_UTF8, 0, region.c_str(), -1, wbuf, 8);
+        LRESULT idx = SendMessageW(g_i18n_region_combo, CB_SELECTSTRING, (WPARAM)-1, (LPARAM)wbuf);
+        if (idx == CB_ERR) SetWindowTextW(g_i18n_region_combo, wbuf);
+    }
+
+    // Populate timezone combo
+    if (g_i18n_tz_combo && !tz.empty()) {
+        wchar_t wbuf[64] = {};
+        MultiByteToWideChar(CP_UTF8, 0, tz.c_str(), -1, wbuf, 64);
+        LRESULT idx = SendMessageW(g_i18n_tz_combo, CB_SELECTSTRING, (WPARAM)-1, (LPARAM)wbuf);
+        if (idx == CB_ERR) SetWindowTextW(g_i18n_tz_combo, wbuf);
+    }
+
+    // Populate date/time edits from datetime string (e.g. "2026-07-20 20:42:25")
+    if (!dt.empty()) {
+        // Split "YYYY-MM-DD hh:mm:ss" or "YYYY-MM-DDThh:mm:ss"
+        std::string date_str, time_str;
+        auto sep = dt.find('T');
+        if (sep == std::string::npos) sep = dt.find(' ');
+        if (sep != std::string::npos) {
+            date_str = dt.substr(0, sep);
+            time_str = dt.substr(sep + 1);
+        } else {
+            date_str = dt;
+        }
+        if (g_i18n_date_edit && !date_str.empty()) {
+            wchar_t wbuf[16] = {};
+            MultiByteToWideChar(CP_UTF8, 0, date_str.c_str(), -1, wbuf, 16);
+            SetWindowTextW(g_i18n_date_edit, wbuf);
+        }
+        if (g_i18n_time_edit && !time_str.empty()) {
+            wchar_t wbuf[16] = {};
+            MultiByteToWideChar(CP_UTF8, 0, time_str.c_str(), -1, wbuf, 16);
+            SetWindowTextW(g_i18n_time_edit, wbuf);
+        }
+    }
+
+    // 24-hour checkbox
+    if (g_i18n_24hour_check) {
+        SendMessageW(g_i18n_24hour_check, BM_SETCHECK,
+                      (hour24 == "true") ? BST_CHECKED : BST_UNCHECKED, 0);
+    }
+
+    // AutoTime checkbox + mutex: ON → checked, gray out manual controls
+    if (g_i18n_autotime_btn) {
+        bool at_on = (autotime == "ON");
+        SendMessageW(g_i18n_autotime_btn, BM_SETCHECK,
+                      at_on ? BST_CHECKED : BST_UNCHECKED, 0);
+        HWND mutex_ctrls[] = {g_i18n_tz_combo, g_i18n_date_edit, g_i18n_time_edit,
+                              g_i18n_set_datetime_btn};
+        for (HWND h : mutex_ctrls) { if (h) EnableWindow(h, !at_on); }
+    }
+
+    // Update current settings label
+    if (g_i18n_current_label) {
+        std::string text;
+        text += "Language:  " + (lang.empty() ? "-" : lang) + "\r\n";
+        text += "Region:    " + (region.empty() ? "-" : region) + "\r\n";
+        text += "Timezone:  " + (tz.empty() ? "-" : tz) + "\r\n";
+        text += "Datetime:  " + (dt.empty() ? "-" : dt) + "\r\n";
+        text += "Is24Hour:  " + (hour24.empty() ? "-" : hour24) + "\r\n";
+        text += "AutoTime:  " + (autotime.empty() ? "-" : autotime);
+        SetWindowTextA(g_i18n_current_label, text.c_str());
+    }
 }
 
 // ── GNSS: Parse current location from -l output ────────────
@@ -1460,12 +2023,14 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         TCITEMW tie = {};
         tie.mask = TCIF_TEXT;
-        tie.pszText = const_cast<LPWSTR>(L"GNSS");
-        TabCtrl_InsertItem(g_tab, TAB_GNSS, &tie);
         tie.pszText = const_cast<LPWSTR>(L"Battery");
         TabCtrl_InsertItem(g_tab, TAB_BATTERY, &tie);
+        tie.pszText = const_cast<LPWSTR>(L"GNSS");
+        TabCtrl_InsertItem(g_tab, TAB_GNSS, &tie);
         tie.pszText = const_cast<LPWSTR>(L"Haps");
         TabCtrl_InsertItem(g_tab, TAB_HAPS, &tie);
+        tie.pszText = const_cast<LPWSTR>(L"I18n");
+        TabCtrl_InsertItem(g_tab, TAB_I18N, &tie);
         // Force tab item width to fit text
         SendMessageW(g_tab, TCM_SETITEMSIZE, 0, MAKELPARAM(80, 24));
 
@@ -1793,6 +2358,112 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                            hbtn_x + (hbtn_w + hbtn_gap) * 3, btn_y, hbtn_w, BTN_H);
         }
 
+        // ── I18n page ──────────────────────────────────────
+        {
+            ensure_page_class_registered(g_inst);
+            HWND page = CreateWindowW(CPH_PAGE_W, L"",
+                                       WS_CHILD | WS_CLIPSIBLINGS,
+                                       px, py, pw, ph,
+                                       g_tab, nullptr, nullptr, nullptr);
+            g_tab_pages[TAB_I18N] = page;
+            int y = 6;
+
+            // ── Current Settings group (top, like other tabs) ──
+            int cur_grp_h = 6 * 18 + 24;
+            make_group(page, L"Current Settings", grp_x, y, grp_w, cur_grp_h);
+            g_i18n_current_label = CreateWindowW(L"STATIC", L"--",
+                                                   WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX | SS_EDITCONTROL,
+                                                   grp_x + 10, y + 18, grp_w - 20, cur_grp_h - 24,
+                                                   page, (HMENU)IDC_I18N_CURRENT_LABEL, nullptr, nullptr);
+            SendMessageW(g_i18n_current_label, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+            y += cur_grp_h + 4;
+
+            // ── Locale group (Language + Region) ──
+            int locale_grp_h = 2 * row_h + BTN_H + 32;
+            make_group(page, L"Locale", grp_x, y, grp_w, locale_grp_h);
+            int sy = y + 20;
+
+            make_label(page, L"Language:", label_x, sy + 3, LABEL_W, 18);
+            g_i18n_lang_combo = make_editable_combo(page, IDC_I18N_LANG_COMBO,
+                                            edit_x, sy, edit_w, 200);
+            for (int i = 0; i < I18N_LOCALES_COUNT; i++)
+                SendMessageW(g_i18n_lang_combo, CB_ADDSTRING, 0, (LPARAM)I18N_LOCALES[i]);
+            sy += row_h;
+
+            make_label(page, L"Region:", label_x, sy + 3, LABEL_W, 18);
+            g_i18n_region_combo = make_editable_combo(page, IDC_I18N_REGION_COMBO,
+                                              edit_x, sy, edit_w, 300);
+            for (int i = 0; i < I18N_REGIONS_COUNT; i++) {
+                wchar_t wbuf[8];
+                MultiByteToWideChar(CP_UTF8, 0, I18N_REGIONS[i], -1, wbuf, 8);
+                SendMessageW(g_i18n_region_combo, CB_ADDSTRING, 0, (LPARAM)wbuf);
+            }
+            sy += row_h + 4;
+
+            // Apply button (horizontally centered)
+            g_i18n_apply_btn = make_btn(page, L"Apply", IDC_I18N_APPLY_BTN,
+                                         grp_x + (grp_w - 80) / 2, sy, 80, BTN_H);
+            y += locale_grp_h + 4;
+
+            // ── Date Time group ──
+            // Top: manual settings (Date/Time/Timezone/SetDateTime) — grayed when AutoTime on
+            // Bottom: global switches (AutoTime + 24-hour) separated by thin line
+            int dt_grp_h = 5 * row_h + 30;
+            make_group(page, L"Date Time", grp_x, y, grp_w, dt_grp_h);
+            int dy = y + 20;
+
+            // Row 1: Date + Time edits (manual)
+            int date_w = edit_w / 2 - 4;
+            int time_x = edit_x + date_w + 8;
+            int time_w = edit_w - date_w - 8;
+            make_label(page, L"Date:", label_x, dy + 3, LABEL_W, 18);
+            g_i18n_date_edit = make_edit(page, IDC_I18N_DATE_EDIT, L"2026-07-15",
+                                          edit_x, dy, date_w, EDIT_H);
+            make_label(page, L"Time:", time_x, dy + 3, 40, 18);
+            g_i18n_time_edit = make_edit(page, IDC_I18N_TIME_EDIT, L"10:30:00",
+                                          time_x + 44, dy, time_w - 44, EDIT_H);
+            dy += row_h;
+
+            // Row 2: Timezone combo (manual, grayed when AutoTime checked)
+            make_label(page, L"Timezone:", label_x, dy + 3, LABEL_W, 18);
+            g_i18n_tz_combo = make_editable_combo(page, IDC_I18N_TZ_COMBO,
+                                           edit_x, dy, edit_w, 300);
+            for (int i = 0; i < I18N_TIMEZONES_COUNT; i++)
+                SendMessageW(g_i18n_tz_combo, CB_ADDSTRING, 0, (LPARAM)I18N_TIMEZONES[i]);
+            dy += row_h;
+
+            // Row 3: Set DateTime button, centered (manual, grayed when AutoTime checked)
+            g_i18n_set_datetime_btn = make_btn(page, L"Apply", IDC_I18N_SET_DATETIME_BTN,
+                                                 grp_x + (grp_w - 80) / 2, dy, 80, BTN_H);
+            dy += row_h + 4;
+
+            // Separator line between manual and global sections
+            CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
+                           grp_x + 4, dy + 2, grp_w - 8, 2,
+                           page, nullptr, nullptr, nullptr);
+            dy += 8;
+
+            // Row 4: Enable AutoTime checkbox (global master toggle)
+            g_i18n_autotime_btn = CreateWindowW(L"BUTTON", L"Enable AutoTime",
+                                                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                                 edit_x, dy, edit_w, EDIT_H,
+                                                 page, (HMENU)IDC_I18N_AUTOTIME_BTN, nullptr, nullptr);
+            if (g_cph_font) SendMessageW(g_i18n_autotime_btn, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+            dy += row_h;
+
+            // Row 5: 24-hour checkbox (independent global toggle)
+            g_i18n_24hour_check = CreateWindowW(L"BUTTON", L"Enable 24-hour clock",
+                                                 WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                                                 edit_x, dy, edit_w, EDIT_H,
+                                                 page, (HMENU)IDC_I18N_24HOUR_CHECK, nullptr, nullptr);
+            if (g_cph_font) SendMessageW(g_i18n_24hour_check, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+            y += dt_grp_h + 4;
+
+            // Refresh button (bottom, horizontally centered)
+            g_i18n_refresh_btn = make_btn(page, L"Refresh", IDC_I18N_REFRESH_BTN,
+                                           grp_x + (grp_w - 80) / 2, y, 80, BTN_H);
+        }
+
         // Status label at bottom
         g_status_label = CreateWindowW(L"STATIC", L"Ready",
                                         WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
@@ -1800,6 +2471,9 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                         hwnd, (HMENU)IDC_STATUS_LABEL, nullptr, nullptr);
         SendMessageW(g_status_label, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
 
+        // Sync tab control selection to the default page (BS_AUTOCHECKBOX
+        // defaults to 0, but g_current_tab=TAB_GNSS=1 after tab reordering).
+        TabCtrl_SetCurSel(g_tab, TAB_GNSS);
         show_tab_page(TAB_GNSS);
 
         SetPropW(hwnd, L"cph_font", (HANDLE)g_cph_font);
@@ -1824,7 +2498,16 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_COMMAND: {
-        switch (LOWORD(wp)) {
+        int code = HIWORD(wp);
+        int id = LOWORD(wp);
+        // Editable combobox live filter: rebuild dropdown list to match the
+        // current edit text for the i18n Language / Region / Timezone combos.
+        if (code == CBN_EDITCHANGE &&
+            (id == IDC_I18N_LANG_COMBO || id == IDC_I18N_REGION_COMBO || id == IDC_I18N_TZ_COMBO)) {
+            i18n_filter_combo(id);
+            return 0;
+        }
+        switch (id) {
         case IDC_GNSS_INJECT_BTN:
             inject_gnss();
             break;
@@ -1835,11 +2518,22 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             char file[512] = {};
             OPENFILENAMEA ofn = {};
             ofn.lStructSize = sizeof(ofn);
-            ofn.hwndOwner = hwnd;
+            ofn.hwndOwner = g_parent ? g_parent : hwnd;
             ofn.lpstrFilter = "GPX/XML Files\0*.gpx;*.xml\0All Files\0*.*\0";
             ofn.lpstrFile = file;
             ofn.nMaxFile = sizeof(file);
-            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_ENABLEHOOK;
+            ofn.lpfnHook = [](HWND hDlg, UINT msg, WPARAM, LPARAM) -> UINT_PTR {
+                if (msg == WM_INITDIALOG && g_parent) {
+                    RECT orr, mr;
+                    if (GetWindowRect(g_parent, &orr) && GetWindowRect(hDlg, &mr)) {
+                        int cx = orr.left + ((orr.right - orr.left) - (mr.right - mr.left)) / 2;
+                        int cy = orr.top + ((orr.bottom - orr.top) - (mr.bottom - mr.top)) / 2;
+                        SetWindowPos(hDlg, NULL, cx, cy, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+                    }
+                }
+                return 0;
+            };
             if (GetOpenFileNameA(&ofn)) {
                 // Check file extension (.gpx or .xml, case-insensitive)
                 std::string local_path = file;
@@ -1948,6 +2642,38 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             text += "\r\n";
             if (copy_text_to_clipboard(hwnd, text))
                 show_toast("Bundle name copied", true);
+            break;
+        }
+        case IDC_I18N_REFRESH_BTN:
+            g_i18n_loaded = false;
+            i18n_refresh();
+            break;
+        case IDC_I18N_APPLY_BTN:
+            i18n_apply();
+            break;
+        case IDC_I18N_SET_DATETIME_BTN:
+            i18n_set_datetime();
+            break;
+        case IDC_I18N_AUTOTIME_BTN: {
+            // AutoTime checkbox toggled — gray out Timezone/Date/Time/SetDateTime (mutex)
+            bool autotime = (SendMessageW(g_i18n_autotime_btn, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            HWND mutex_ctrls[] = {g_i18n_tz_combo, g_i18n_date_edit, g_i18n_time_edit,
+                                  g_i18n_set_datetime_btn};
+            for (HWND h : mutex_ctrls) { if (h) EnableWindow(h, !autotime); }
+            if (autotime) {
+                // Enable AutoTime immediately when checked
+                i18n_set_autotime();
+            } else {
+                // Uncheck: send current timezone + Date/Time to indirectly turn off AutoTime
+                // (design 4.1: set -d automatically disables autotime)
+                i18n_disable_autotime();
+            }
+            break;
+        }
+        case IDC_I18N_24HOUR_CHECK: {
+            // 24-hour checkbox toggled — apply immediately
+            bool checked = (SendMessageW(g_i18n_24hour_check, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            i18n_set_24hour(checked);
             break;
         }
         }
@@ -2093,6 +2819,13 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_haps_user_id.clear();
         g_haps_loaded = false;
         g_haps_bm_unsupported = false;
+        g_i18n_lang_combo = g_i18n_region_combo = g_i18n_tz_combo = nullptr;
+        g_i18n_24hour_check = nullptr;
+        g_i18n_apply_btn = g_i18n_refresh_btn = nullptr;
+        g_i18n_date_edit = g_i18n_time_edit = nullptr;
+        g_i18n_set_datetime_btn = g_i18n_autotime_btn = nullptr;
+        g_i18n_current_label = nullptr;
+        g_i18n_loaded = false;
         g_status_label = nullptr;
         for (auto &p : g_tab_pages) p = nullptr;
         return 0;

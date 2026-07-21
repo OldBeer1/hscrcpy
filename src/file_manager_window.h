@@ -152,6 +152,10 @@ private:
     static HWND g_parent;
     static int g_panel_w;
 
+    // SHBrowseForFolder callback: center on g_parent + optional initial dir.
+    // pData = char* path for BFFM_SETSELECTIONA (pass 0 to skip).
+    static int CALLBACK browse_center_callback(HWND hwnd, UINT uMsg, LPARAM, LPARAM pData);
+
     static std::string g_current_dir;
     static std::vector<FileEntry> g_entries;
     static std::vector<std::string> g_history;  // navigation history
