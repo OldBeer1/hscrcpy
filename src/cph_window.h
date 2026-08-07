@@ -117,6 +117,17 @@ private:
         IDC_I18N_SET_DATETIME_BTN,
         IDC_I18N_AUTOTIME_BTN,
         IDC_I18N_CURRENT_LABEL,
+        // Sensor tab
+        IDC_SENSOR_DEGREE_LABEL,
+        IDC_SENSOR_SHAKING_LABEL,
+        IDC_SENSOR_SOURCE_LABEL,
+        IDC_SENSOR_ROTATE_COMBO,
+        IDC_SENSOR_ROTATE_BTN,
+        IDC_SENSOR_ROTATE_NEXT_BTN,
+        IDC_SENSOR_RESET_BTN,
+        IDC_SENSOR_SHAKE_EDIT,
+        IDC_SENSOR_SHAKE_BTN,
+        IDC_SENSOR_REFRESH_BTN,
     };
 
     // Tab page indices
@@ -125,7 +136,8 @@ private:
         TAB_GNSS = 1,
         TAB_HAPS = 2,
         TAB_I18N = 3,
-        TAB_COUNT = 4,
+        TAB_SENSOR = 4,
+        TAB_COUNT = 5,
     };
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
@@ -155,6 +167,10 @@ private:
         ASYNC_I18N_SET_AUTOTIME,
         ASYNC_I18N_DISABLE_AUTOTIME,
         ASYNC_I18N_SET_24HOUR,
+        ASYNC_SENSOR_REFRESH,
+        ASYNC_SENSOR_ROTATE,
+        ASYNC_SENSOR_ROTATE_RESET,
+        ASYNC_SENSOR_SHAKE,
     };
     struct AsyncResult {
         AsyncOp op;
@@ -207,6 +223,14 @@ private:
     // Extract all "error: ..." lines from a cmd i18n output blob so the UI
     // can surface the server-side error verbatim instead of a generic toast.
     static std::string i18n_extract_errors(const std::string &output);
+
+    // Sensor - Screen rotation & shake simulation via cmd sensor
+    static void sensor_refresh();
+    static void sensor_rotate();
+    static void sensor_rotate_next();
+    static void sensor_reset_rotation();
+    static void sensor_trigger_shake();
+    static void sensor_parse_info(const std::string &output);
 
     static void msg_box(const char *title, const char *fmt, ...);
     static void show_toast(const char *text, bool success = true);
@@ -295,6 +319,19 @@ private:
     static HWND g_i18n_current_label;
     static bool g_i18n_loaded;
 
+    // Sensor controls
+    static HWND g_sensor_degree_label;
+    static HWND g_sensor_shaking_label;
+    static HWND g_sensor_source_label;
+    static HWND g_sensor_rotate_combo;
+    static HWND g_sensor_rotate_btn;
+    static HWND g_sensor_rotate_next_btn;
+    static HWND g_sensor_reset_btn;
+    static HWND g_sensor_shake_edit;
+    static HWND g_sensor_shake_btn;
+    static HWND g_sensor_refresh_btn;
+    static bool g_sensor_loaded;
+
     // Tab page containers
     static HWND g_tab_pages[TAB_COUNT];
 
@@ -306,6 +343,7 @@ private:
     static std::atomic<bool> g_battery_busy;
     static std::atomic<bool> g_haps_busy;
     static std::atomic<bool> g_i18n_busy;
+    static std::atomic<bool> g_sensor_busy;
     static UINT_PTR g_refresh_timer;
 
     static HWND g_toast_hwnd;

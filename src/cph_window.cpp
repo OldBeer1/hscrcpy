@@ -97,6 +97,19 @@ HWND CphWindow::g_i18n_autotime_btn = nullptr;
 HWND CphWindow::g_i18n_current_label = nullptr;
 bool CphWindow::g_i18n_loaded = false;
 
+// Sensor controls
+HWND CphWindow::g_sensor_degree_label = nullptr;
+HWND CphWindow::g_sensor_shaking_label = nullptr;
+HWND CphWindow::g_sensor_source_label = nullptr;
+HWND CphWindow::g_sensor_rotate_combo = nullptr;
+HWND CphWindow::g_sensor_rotate_btn = nullptr;
+HWND CphWindow::g_sensor_rotate_next_btn = nullptr;
+HWND CphWindow::g_sensor_reset_btn = nullptr;
+HWND CphWindow::g_sensor_shake_edit = nullptr;
+HWND CphWindow::g_sensor_shake_btn = nullptr;
+HWND CphWindow::g_sensor_refresh_btn = nullptr;
+bool CphWindow::g_sensor_loaded = false;
+
 HWND CphWindow::g_tab_pages[TAB_COUNT] = {};
 
 CphWindow::OnShellCommand CphWindow::g_on_shell;
@@ -107,6 +120,7 @@ std::atomic<bool> CphWindow::g_gnss_busy{false};
 std::atomic<bool> CphWindow::g_battery_busy{false};
 std::atomic<bool> CphWindow::g_haps_busy{false};
 std::atomic<bool> CphWindow::g_i18n_busy{false};
+std::atomic<bool> CphWindow::g_sensor_busy{false};
 UINT_PTR CphWindow::g_refresh_timer = 0;
 
 // Timer ID for auto-refresh
@@ -175,8 +189,59 @@ static LRESULT CALLBACK TrajEditSubProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
+// Helper: set scroll range for a tab page
+static void set_page_scroll(HWND page, int content_height, int page_height) {
+    SCROLLINFO si = { sizeof(si), SIF_RANGE | SIF_PAGE };
+    si.nMin = 0;
+    si.nMax = content_height - 1;
+    si.nPage = page_height;
+    SetScrollInfo(page, SB_VERT, &si, TRUE);
+}
+
+// Helper: trim trailing newlines from string
+static std::string trim_trailing_newlines(std::string s) {
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    return s;
+}
+
 // Page WndProc: forward WM_COMMAND and WM_NOTIFY to the CPH main window
 static LRESULT CALLBACK CphPageWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_VSCROLL) {
+        SCROLLINFO si = { sizeof(si), SIF_POS | SIF_RANGE | SIF_PAGE };
+        GetScrollInfo(hwnd, SB_VERT, &si);
+        int old_pos = si.nPos;
+        int new_pos = si.nPos;
+        switch (LOWORD(wp)) {
+            case SB_TOP: new_pos = si.nMin; break;
+            case SB_BOTTOM: new_pos = si.nMax; break;
+            case SB_LINEUP: new_pos -= 20; break;
+            case SB_LINEDOWN: new_pos += 20; break;
+            case SB_PAGEUP: new_pos -= si.nPage; break;
+            case SB_PAGEDOWN: new_pos += si.nPage; break;
+            case SB_THUMBTRACK: new_pos = si.nTrackPos; break;
+        }
+        new_pos = std::max(si.nMin, std::min(new_pos, si.nMax - (int)si.nPage + 1));
+        if (new_pos != old_pos) {
+            ScrollWindow(hwnd, 0, old_pos - new_pos, NULL, NULL);
+            si.nPos = new_pos;
+            SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+        }
+        return 0;
+    }
+    if (msg == WM_MOUSEWHEEL) {
+        int delta = GET_WHEEL_DELTA_WPARAM(wp);
+        SCROLLINFO si = { sizeof(si), SIF_POS | SIF_RANGE | SIF_PAGE };
+        GetScrollInfo(hwnd, SB_VERT, &si);
+        int lines = delta / WHEEL_DELTA * 3;
+        int new_pos = si.nPos - lines * 20;
+        new_pos = std::max(si.nMin, std::min(new_pos, si.nMax - (int)si.nPage + 1));
+        if (new_pos != si.nPos) {
+            ScrollWindow(hwnd, 0, si.nPos - new_pos, NULL, NULL);
+            si.nPos = new_pos;
+            SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+        }
+        return 0;
+    }
     if (msg == WM_COMMAND) {
         HWND cph_hwnd = GetParent(GetParent(hwnd));  // page -> tab -> cph window
         if (cph_hwnd) SendMessageW(cph_hwnd, WM_COMMAND, wp, lp);
@@ -371,27 +436,17 @@ void CphWindow::show_toast(const char *text, bool success) {
     int tw = sz.cx + 24;
     if (tw < 160) tw = 160;
     if (tw > 420) tw = 420;
-    // Center toast on current tab page area
+    // Center toast on the entire main hscrcpy window (g_parent) - use screen coordinates for popup
     RECT prc;
-    if (g_tab && g_current_tab >= 0 && g_current_tab < TAB_COUNT && g_tab_pages[g_current_tab]) {
-        GetClientRect(g_tab_pages[g_current_tab], &prc);
-        POINT pt = {0, 0};
-        ClientToScreen(g_tab_pages[g_current_tab], &pt);
-        ScreenToClient(g_hwnd, &pt);
-        prc.left = pt.x;
-        prc.top = pt.y;
-        prc.right = pt.x + prc.right;
-        prc.bottom = pt.y + prc.bottom;
-    } else {
-        GetClientRect(g_hwnd, &prc);
-    }
-    g_toast_hwnd = CreateWindowExW(0, L"HScrcpyCphToastClass", L"",
-                                    WS_CHILD | WS_VISIBLE,
-                                    (prc.left + prc.right) / 2 - tw / 2,
-                                    (prc.top + prc.bottom) / 2 - 15,
+    GetWindowRect(g_parent, &prc);
+    int screen_x = (prc.left + prc.right) / 2 - tw / 2;
+    int screen_y = (prc.top + prc.bottom) / 2 - 15;
+    g_toast_hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                                    L"HScrcpyCphToastClass", L"",
+                                    WS_POPUP | WS_VISIBLE,
+                                    screen_x, screen_y,
                                     tw, 30,
-                                    g_hwnd, nullptr, g_inst, data);
-    SetWindowPos(g_toast_hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                                    g_parent, nullptr, g_inst, data);
 }
 
 void CphWindow::msg_box(const char *title, const char *fmt, ...) {
@@ -713,7 +768,7 @@ void CphWindow::show(OnShellCommand on_shell, OnPushFile on_push, OnBusy on_busy
 
     if (!g_hwnd) {
         g_hwnd = CreateWindowExW(0, CPH_CLASS_W, L"",
-                                  WS_CHILD | WS_BORDER | WS_CLIPCHILDREN | WS_VSCROLL,
+                                  WS_CHILD | WS_BORDER | WS_CLIPCHILDREN,
                                   0, 0, g_panel_w, 100, g_parent, nullptr, g_inst, nullptr);
     }
     ShowWindow(g_hwnd, SW_SHOW);
@@ -726,6 +781,7 @@ void CphWindow::show(OnShellCommand on_shell, OnPushFile on_push, OnBusy on_busy
     else if (g_current_tab == TAB_BATTERY) { s_refresh_fill_edits = true; refresh_battery(); }
     else if (g_current_tab == TAB_HAPS) { if (!g_haps_loaded) haps_list_packages(); }
     else if (g_current_tab == TAB_I18N) { if (!g_i18n_loaded) i18n_refresh(); }
+    else if (g_current_tab == TAB_SENSOR) { if (!g_sensor_loaded) sensor_refresh(); }
 }
 
 void CphWindow::hide() {
@@ -781,6 +837,14 @@ void CphWindow::reset() {
     if (g_i18n_current_label) SetWindowTextW(g_i18n_current_label, L"--");
     g_i18n_loaded = false;
 
+    // Sensor — clear state labels, reset combo/edit
+    if (g_sensor_degree_label) SetWindowTextW(g_sensor_degree_label, L"?");
+    if (g_sensor_shaking_label) SetWindowTextW(g_sensor_shaking_label, L"?");
+    if (g_sensor_source_label) SetWindowTextW(g_sensor_source_label, L"?");
+    if (g_sensor_rotate_combo) SendMessageW(g_sensor_rotate_combo, CB_SETCURSEL, 0, 0);
+    if (g_sensor_shake_edit) SetWindowTextW(g_sensor_shake_edit, L"1000");
+    g_sensor_loaded = false;
+
     // Reset refresh state
     s_refresh_fill_edits = false;
     s_refresh_fail_count = 0;
@@ -834,6 +898,7 @@ void CphWindow::on_tab_change() {
         else if (sel == TAB_BATTERY) refresh_battery();
         else if (sel == TAB_HAPS) { if (!g_haps_loaded) haps_list_packages(); }
         else if (sel == TAB_I18N) { i18n_refresh(); }
+        else if (sel == TAB_SENSOR) { if (!g_sensor_loaded) sensor_refresh(); }
     }
 }
 
@@ -871,6 +936,11 @@ std::atomic<bool>* CphWindow::busy_flag_for(AsyncOp op) {
     case ASYNC_I18N_DISABLE_AUTOTIME:
     case ASYNC_I18N_SET_24HOUR:
         return &g_i18n_busy;
+    case ASYNC_SENSOR_REFRESH:
+    case ASYNC_SENSOR_ROTATE:
+    case ASYNC_SENSOR_ROTATE_RESET:
+    case ASYNC_SENSOR_SHAKE:
+        return &g_sensor_busy;
     default:
         return &g_haps_busy;
     }
@@ -882,7 +952,7 @@ void CphWindow::run_async(AsyncOp op, const std::string &cmd) {
     // user-initiated ops (inject/grant/revoke) are retried.
     bool is_refresh = (op == ASYNC_REFRESH_GNSS || op == ASYNC_REFRESH_BATTERY
         || op == ASYNC_HAPS_LIST_PACKAGES || op == ASYNC_HAPS_LIST_PERMISSIONS
-        || op == ASYNC_I18N_GET);
+        || op == ASYNC_I18N_GET || op == ASYNC_SENSOR_REFRESH);
     auto *busy = busy_flag_for(op);
     if (busy->exchange(true)) {
         if (!is_refresh) {
@@ -908,6 +978,9 @@ void CphWindow::run_async(AsyncOp op, const std::string &cmd) {
         if (op == ASYNC_HAPS_LIST_PERMISSIONS || op == ASYNC_HAPS_GRANT
             || op == ASYNC_HAPS_REVOKE || op == ASYNC_HAPS_GRANT_ALL
             || op == ASYNC_HAPS_REVOKE_ALL) timeout = 5;
+        if (op == ASYNC_SENSOR_REFRESH) timeout = 5;
+        if (op == ASYNC_SENSOR_ROTATE || op == ASYNC_SENSOR_ROTATE_RESET) timeout = 10;
+        if (op == ASYNC_SENSOR_SHAKE) timeout = 15;
         r->ok = on_shell(shell_cmd, &r->output, timeout);
         LOGE("CPH async result: op=%d ok=%d cmd=[%s] output=[%s]", (int)op, r->ok, shell_cmd.c_str(), r->output.c_str());
         PostMessageW(hwnd, WM_CPH_ASYNC_DONE, 0, reinterpret_cast<LPARAM>(r));
@@ -1249,6 +1322,86 @@ void CphWindow::handle_async_done(AsyncResult *r) {
             set_status(errors.empty() ? "i18n 24-hour failed" : errors.c_str());
         }
         i18n_refresh();
+        break;
+    }
+
+    case ASYNC_SENSOR_REFRESH: {
+        std::string lower = r->output;
+        for (auto &c : lower) c = (char)tolower((unsigned char)c);
+        if (r->ok && lower.find("error") == std::string::npos &&
+            lower.find("not found") == std::string::npos &&
+            lower.find("no such") == std::string::npos) {
+            s_refresh_fail_count = 0;
+            g_sensor_loaded = true;
+            sensor_parse_info(r->output);
+            set_status("Sensor state refreshed");
+        } else {
+            s_refresh_fail_count++;
+            if (g_sensor_degree_label) SetWindowTextA(g_sensor_degree_label, "?");
+            if (g_sensor_shaking_label) SetWindowTextA(g_sensor_shaking_label, "?");
+            if (g_sensor_source_label) SetWindowTextA(g_sensor_source_label, "?");
+            set_status("cmd sensor unavailable on this device");
+        }
+        break;
+    }
+
+    case ASYNC_SENSOR_ROTATE: {
+        std::string lower = r->output;
+        for (auto &c : lower) c = (char)tolower((unsigned char)c);
+        if (lower.find("conflict") != std::string::npos ||
+            lower.find("shaking") != std::string::npos) {
+            show_toast("Shake running - rotation blocked", false);
+            set_status("Rotation blocked: shake in progress");
+        } else if (lower.find("succeeded") != std::string::npos ||
+                   lower.find("success") != std::string::npos) {
+            show_toast("Screen rotated", true);
+            set_status("Screen rotation applied");
+            sensor_refresh();
+        } else {
+            std::string err = trim_trailing_newlines(r->output.empty() ? "Rotation failed" : r->output);
+            show_toast(err.c_str(), false);
+            set_status(err.c_str());
+        }
+        break;
+    }
+
+    case ASYNC_SENSOR_ROTATE_RESET: {
+        std::string lower = r->output;
+        for (auto &c : lower) c = (char)tolower((unsigned char)c);
+        if (lower.find("conflict") != std::string::npos ||
+            lower.find("shaking") != std::string::npos) {
+            show_toast("Shake running - reset blocked", false);
+            set_status("Reset blocked: shake in progress");
+        } else if (lower.find("succeeded") != std::string::npos ||
+                   lower.find("success") != std::string::npos) {
+            show_toast("Rotation reset to 0", true);
+            set_status("Screen rotation reset");
+            sensor_refresh();
+        } else {
+            std::string err = trim_trailing_newlines(r->output.empty() ? "Reset failed" : r->output);
+            show_toast(err.c_str(), false);
+            set_status(err.c_str());
+        }
+        break;
+    }
+
+    case ASYNC_SENSOR_SHAKE: {
+        std::string lower = r->output;
+        for (auto &c : lower) c = (char)tolower((unsigned char)c);
+        if (lower.find("conflict") != std::string::npos ||
+            lower.find("already") != std::string::npos) {
+            show_toast("Shake already running", false);
+            set_status("Shake blocked: already in progress");
+        } else if (lower.find("succeeded") != std::string::npos ||
+                   lower.find("success") != std::string::npos) {
+            show_toast("Shake triggered", true);
+            set_status("Shake simulation triggered");
+            sensor_refresh();
+        } else {
+            std::string err = trim_trailing_newlines(r->output.empty() ? "Shake failed" : r->output);
+            show_toast(err.c_str(), false);
+            set_status(err.c_str());
+        }
         break;
     }
     }
@@ -1625,6 +1778,99 @@ void CphWindow::i18n_parse_and_populate(const std::string &output) {
         text += "Is24Hour:  " + (hour24.empty() ? "-" : hour24) + "\r\n";
         text += "AutoTime:  " + (autotime.empty() ? "-" : autotime);
         SetWindowTextA(g_i18n_current_label, text.c_str());
+    }
+}
+
+// ── Sensor: Screen rotation & shake simulation ─────────────
+
+void CphWindow::sensor_refresh() {
+    run_async(ASYNC_SENSOR_REFRESH, "cmd sensor info -l");
+}
+
+void CphWindow::sensor_rotate() {
+    if (!g_sensor_rotate_combo) return;
+    int sel = (int)SendMessageW(g_sensor_rotate_combo, CB_GETCURSEL, 0, 0);
+    if (sel == CB_ERR) {
+        show_toast("Select a rotation degree", false);
+        return;
+    }
+    // Degrees are 0/90/180/270 indexed by position
+    int degrees[] = {0, 90, 180, 270};
+    int deg = (sel >= 0 && sel < 4) ? degrees[sel] : 0;
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "cmd sensor rotate -d %d", deg);
+    run_async(ASYNC_SENSOR_ROTATE, cmd);
+}
+
+void CphWindow::sensor_rotate_next() {
+    // Rotate without specifying degree: cycles through 90→180→270→0→90...
+    run_async(ASYNC_SENSOR_ROTATE, "cmd sensor rotate");
+}
+
+void CphWindow::sensor_reset_rotation() {
+    run_async(ASYNC_SENSOR_ROTATE_RESET, "cmd sensor rotate -r");
+}
+
+void CphWindow::sensor_trigger_shake() {
+    if (!g_sensor_shake_edit) return;
+    wchar_t wbuf[16] = {};
+    GetWindowTextW(g_sensor_shake_edit, wbuf, 16);
+    if (!wbuf[0]) {
+        msg_box("Shake", "Enter duration in milliseconds (100-10000)");
+        return;
+    }
+    char buf[16] = {};
+    WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, buf, sizeof(buf), nullptr, nullptr);
+    // Validate integer
+    for (const char *p = buf; *p; p++) {
+        if (*p < '0' || *p > '9') {
+            msg_box("Shake", "Duration must be 100-10000 ms");
+            return;
+        }
+    }
+    int ms = atoi(buf);
+    if (ms < 100 || ms > 10000) {
+        msg_box("Shake", "Duration must be 100-10000 ms");
+        return;
+    }
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "cmd sensor shake -d %d", ms);
+    run_async(ASYNC_SENSOR_SHAKE, cmd);
+}
+
+void CphWindow::sensor_parse_info(const std::string &output) {
+    // Parse "cmd sensor info -l" output:
+    //   degree: 0
+    //   shaking: false
+    //   accel source: NONE(DB)
+    auto extract_val = [&](const char *key) -> std::string {
+        std::string search = std::string(key) + ":";
+        auto pos = output.find(search);
+        if (pos == std::string::npos) return "";
+        auto start = pos + search.size();
+        while (start < output.size() && (output[start] == ' ' || output[start] == '\t')) start++;
+        auto end = output.find('\n', start);
+        if (end == std::string::npos) end = output.size();
+        std::string val = output.substr(start, end - start);
+        while (!val.empty() && (val.back() == ' ' || val.back() == '\t' || val.back() == '\r')) val.pop_back();
+        return val;
+    };
+
+    std::string degree = extract_val("degree");
+    std::string shaking = extract_val("shaking");
+    std::string source = extract_val("accel source");
+
+    if (g_sensor_degree_label) SetWindowTextA(g_sensor_degree_label, degree.empty() ? "?" : degree.c_str());
+    if (g_sensor_shaking_label) SetWindowTextA(g_sensor_shaking_label, shaking.empty() ? "?" : shaking.c_str());
+    if (g_sensor_source_label) SetWindowTextA(g_sensor_source_label, source.empty() ? "?" : source.c_str());
+
+    // Sync the combo selection with the current degree
+    if (g_sensor_rotate_combo && !degree.empty()) {
+        int deg = atoi(degree.c_str());
+        int idx = deg / 90;  // 0→0, 90→1, 180→2, 270→3
+        if (idx >= 0 && idx < 4) {
+            SendMessageW(g_sensor_rotate_combo, CB_SETCURSEL, idx, 0);
+        }
     }
 }
 
@@ -2031,6 +2277,8 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         TabCtrl_InsertItem(g_tab, TAB_HAPS, &tie);
         tie.pszText = const_cast<LPWSTR>(L"I18n");
         TabCtrl_InsertItem(g_tab, TAB_I18N, &tie);
+        tie.pszText = const_cast<LPWSTR>(L"Sensor");
+        TabCtrl_InsertItem(g_tab, TAB_SENSOR, &tie);
         // Force tab item width to fit text
         SendMessageW(g_tab, TCM_SETITEMSIZE, 0, MAKELPARAM(80, 24));
 
@@ -2054,7 +2302,7 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         {
             ensure_page_class_registered(g_inst);
             HWND page = CreateWindowW(CPH_PAGE_W, L"",
-                                       WS_CHILD | WS_CLIPSIBLINGS,
+                                       WS_CHILD | WS_CLIPSIBLINGS | WS_VSCROLL,
                                        px, py, pw, ph,
                                        g_tab, nullptr, nullptr, nullptr);
             g_tab_pages[TAB_GNSS] = page;
@@ -2126,13 +2374,14 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                               edit_x, ty, 90, BTN_H);
             g_gnss_traj_stop_btn = make_btn(page, L"Stop", IDC_GNSS_TRAJ_STOP_BTN,
                                              edit_x + 98, ty, 90, BTN_H);
+            set_page_scroll(g_tab_pages[TAB_GNSS], y + 95, ph);
         }
 
         // ── Battery page ──────────────────────────────────
         {
             ensure_page_class_registered(g_inst);
             HWND page = CreateWindowW(CPH_PAGE_W, L"",
-                                       WS_CHILD | WS_CLIPSIBLINGS,
+                                       WS_CHILD | WS_CLIPSIBLINGS | WS_VSCROLL,
                                        px, py, pw, ph,
                                        g_tab, nullptr, nullptr, nullptr);
             g_tab_pages[TAB_BATTERY] = page;
@@ -2277,13 +2526,14 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(g_bat_scene_combo, CB_SETCURSEL, 0, 0);
             g_bat_scene_btn = make_btn(page, L"Start", IDC_BAT_SCENE_BTN,
                                         edit_x + edit_w - 82, sy, 80, BTN_H);
+            set_page_scroll(g_tab_pages[TAB_BATTERY], y + 60, ph);
         }
 
         // ── Haps page ─────────────────────────────────────
         {
             ensure_page_class_registered(g_inst);
             HWND page = CreateWindowW(CPH_PAGE_W, L"",
-                                       WS_CHILD | WS_CLIPSIBLINGS,
+                                       WS_CHILD | WS_CLIPSIBLINGS | WS_VSCROLL,
                                        px, py, pw, ph,
                                        g_tab, nullptr, nullptr, nullptr);
             g_tab_pages[TAB_HAPS] = page;
@@ -2356,13 +2606,14 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                                hbtn_x + (hbtn_w + hbtn_gap) * 2, btn_y, hbtn_w, BTN_H);
             g_haps_revoke_btn = make_btn(page, L"Revoke", IDC_HAPS_REVOKE_BTN,
                                            hbtn_x + (hbtn_w + hbtn_gap) * 3, btn_y, hbtn_w, BTN_H);
+            set_page_scroll(g_tab_pages[TAB_HAPS], perm_grp_y + perm_grp_h, ph);
         }
 
         // ── I18n page ──────────────────────────────────────
         {
             ensure_page_class_registered(g_inst);
             HWND page = CreateWindowW(CPH_PAGE_W, L"",
-                                       WS_CHILD | WS_CLIPSIBLINGS,
+                                       WS_CHILD | WS_CLIPSIBLINGS | WS_VSCROLL,
                                        px, py, pw, ph,
                                        g_tab, nullptr, nullptr, nullptr);
             g_tab_pages[TAB_I18N] = page;
@@ -2462,6 +2713,88 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // Refresh button (bottom, horizontally centered)
             g_i18n_refresh_btn = make_btn(page, L"Refresh", IDC_I18N_REFRESH_BTN,
                                            grp_x + (grp_w - 80) / 2, y, 80, BTN_H);
+            set_page_scroll(g_tab_pages[TAB_I18N], y + 30, ph);
+        }
+
+        // ── Sensor page ───────────────────────────────────
+        {
+            ensure_page_class_registered(g_inst);
+            HWND page = CreateWindowW(CPH_PAGE_W, L"",
+                                       WS_CHILD | WS_CLIPSIBLINGS | WS_VSCROLL,
+                                       px, py, pw, ph,
+                                       g_tab, nullptr, nullptr, nullptr);
+            g_tab_pages[TAB_SENSOR] = page;
+            int y = 6;
+
+            // ── Current Sensor State group ──
+            int cur_grp_h = 3 * 18 + 50 + BTN_H;  // labels(54) + title(20) + gap(8) + padding(22) + btn(28)
+            make_group(page, L"Current Sensor State", grp_x, y, grp_w, cur_grp_h);
+            int ly = y + 20;
+            make_label(page, L"Degree:", label_x, ly, LABEL_W, 18);
+            g_sensor_degree_label = CreateWindowW(L"STATIC", L"?",
+                                                    WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+                                                    edit_x, ly, edit_w, 18,
+                                                    page, (HMENU)IDC_SENSOR_DEGREE_LABEL, nullptr, nullptr);
+            if (g_cph_font) SendMessageW(g_sensor_degree_label, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+            ly += 18;
+            make_label(page, L"Shaking:", label_x, ly, LABEL_W, 18);
+            g_sensor_shaking_label = CreateWindowW(L"STATIC", L"?",
+                                                     WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+                                                     edit_x, ly, edit_w, 18,
+                                                     page, (HMENU)IDC_SENSOR_SHAKING_LABEL, nullptr, nullptr);
+            if (g_cph_font) SendMessageW(g_sensor_shaking_label, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+            ly += 18;
+            make_label(page, L"Source:", label_x, ly, LABEL_W, 18);
+            g_sensor_source_label = CreateWindowW(L"STATIC", L"?",
+                                                    WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+                                                    edit_x, ly, edit_w, 18,
+                                                    page, (HMENU)IDC_SENSOR_SOURCE_LABEL, nullptr, nullptr);
+            if (g_cph_font) SendMessageW(g_sensor_source_label, WM_SETFONT, (WPARAM)g_cph_font, TRUE);
+            ly += 18 + 8;
+            // Refresh button (inside group, at bottom)
+            g_sensor_refresh_btn = make_btn(page, L"Refresh", IDC_SENSOR_REFRESH_BTN,
+                                             grp_x + (grp_w - 80) / 2, ly, 80, BTN_H);
+            y += cur_grp_h + 4;
+
+            // ── Screen Rotation group ──
+            int rot_grp_h = 2 * row_h + 36;
+            make_group(page, L"Screen Rotation", grp_x, y, grp_w, rot_grp_h);
+            int ry = y + 20;
+            make_label(page, L"Degree:", label_x, ry + 3, LABEL_W, 18);
+            g_sensor_rotate_combo = make_combo(page, IDC_SENSOR_ROTATE_COMBO,
+                                                edit_x, ry, edit_w, 100);
+            SendMessageW(g_sensor_rotate_combo, CB_ADDSTRING, 0, (LPARAM)L"0");
+            SendMessageW(g_sensor_rotate_combo, CB_ADDSTRING, 0, (LPARAM)L"90");
+            SendMessageW(g_sensor_rotate_combo, CB_ADDSTRING, 0, (LPARAM)L"180");
+            SendMessageW(g_sensor_rotate_combo, CB_ADDSTRING, 0, (LPARAM)L"270");
+            SendMessageW(g_sensor_rotate_combo, CB_SETCURSEL, 0, 0);
+            ry += row_h;
+            // Rotate + Rotate Next + Reset buttons (3 buttons centered)
+            int rot_btn_w = 80;
+            int rot_btn_gap = 8;
+            int rot_btn_total = rot_btn_w * 3 + rot_btn_gap * 2;
+            int rot_btn_x = grp_x + (grp_w - rot_btn_total) / 2;
+            g_sensor_rotate_btn = make_btn(page, L"Rotate", IDC_SENSOR_ROTATE_BTN,
+                                            rot_btn_x, ry, rot_btn_w, BTN_H);
+            g_sensor_rotate_next_btn = make_btn(page, L"Rotate Next", IDC_SENSOR_ROTATE_NEXT_BTN,
+                                            rot_btn_x + rot_btn_w + rot_btn_gap, ry, rot_btn_w, BTN_H);
+            g_sensor_reset_btn = make_btn(page, L"Reset", IDC_SENSOR_RESET_BTN,
+                                            rot_btn_x + (rot_btn_w + rot_btn_gap) * 2, ry, rot_btn_w, BTN_H);
+            y += rot_grp_h + 4;
+
+            // ── Shake Simulation group ──
+            int shake_grp_h = 2 * row_h + 36;
+            make_group(page, L"Shake Simulation", grp_x, y, grp_w, shake_grp_h);
+            int shy = y + 20;
+            make_label(page, L"Duration (ms):", label_x, shy + 3, LABEL_W + 30, 18);
+            g_sensor_shake_edit = make_edit(page, IDC_SENSOR_SHAKE_EDIT, L"1000",
+                                             edit_x, shy, edit_w, EDIT_H);
+            shy += row_h;
+            // Trigger Shake button (centered)
+            g_sensor_shake_btn = make_btn(page, L"Trigger Shake", IDC_SENSOR_SHAKE_BTN,
+                                            grp_x + (grp_w - 100) / 2, shy, 100, BTN_H);
+            y += shake_grp_h + 4;
+            set_page_scroll(g_tab_pages[TAB_SENSOR], y, ph);
         }
 
         // Status label at bottom
@@ -2676,6 +3009,22 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             i18n_set_24hour(checked);
             break;
         }
+        case IDC_SENSOR_REFRESH_BTN:
+            g_sensor_loaded = false;
+            sensor_refresh();
+            break;
+        case IDC_SENSOR_ROTATE_BTN:
+            sensor_rotate();
+            break;
+        case IDC_SENSOR_ROTATE_NEXT_BTN:
+            sensor_rotate_next();
+            break;
+        case IDC_SENSOR_RESET_BTN:
+            sensor_reset_rotation();
+            break;
+        case IDC_SENSOR_SHAKE_BTN:
+            sensor_trigger_shake();
+            break;
         }
         return 0;
     }
@@ -2784,6 +3133,7 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // Auto-refresh current tab data (async, non-blocking)
             if (g_current_tab == TAB_GNSS) refresh_gnss();
             else if (g_current_tab == TAB_BATTERY) refresh_battery();
+            // Sensor data is static - only refresh after user actions, not on timer
             return 0;
         }
         break;
@@ -2826,6 +3176,10 @@ LRESULT CALLBACK CphWindow::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_i18n_set_datetime_btn = g_i18n_autotime_btn = nullptr;
         g_i18n_current_label = nullptr;
         g_i18n_loaded = false;
+        g_sensor_degree_label = g_sensor_shaking_label = g_sensor_source_label = nullptr;
+        g_sensor_rotate_combo = g_sensor_rotate_btn = g_sensor_rotate_next_btn = g_sensor_reset_btn = nullptr;
+        g_sensor_shake_edit = g_sensor_shake_btn = g_sensor_refresh_btn = nullptr;
+        g_sensor_loaded = false;
         g_status_label = nullptr;
         for (auto &p : g_tab_pages) p = nullptr;
         return 0;
