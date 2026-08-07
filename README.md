@@ -16,7 +16,7 @@ Windows 端鸿蒙设备投屏控制工具，Base On [HOScrcpy](https://gitcode.c
 - **文件管理器**：浏览设备文件系统，支持上传/下载/删除/新建目录
 - **截屏**：`snapshot_display` 截取设备屏幕，自动下载到 Downloads 并用默认图片查看器打开
 - **录像**：手机端 `aa start screenrecorder` 录制屏幕，停止后通过 `mediatool` 拉取到 Downloads 并自动播放，30 分钟超时自动停止
-- **云手机模拟面板**：电池状态注入、GNSS 模拟定位，支持 CPH 云手机自动检测
+- **云手机模拟面板**：电池注入、GNSS 模拟定位、Haps 权限管理、国际化设置、传感器仿真（旋转/摇一摇）
 - **多实例**：支持同时打开多个 hscrcpy 窗口，分别连接不同设备
 - **USB / TCP 连接**：支持 USB 直连和 TCP 无线连接
 - **参数配置**：独立 USB/TCP 编码参数（缩放、码率、帧率），INI 持久化存储
@@ -157,7 +157,7 @@ hscrcpy.exe -s 192.168.1.100:5555
 | ⚙ Settings | 打开参数设置（缩放、码率、帧率、端口等） |
 | 📐 Layout | 打开/关闭 UI 布局检查面板 |
 | 📁 Files | 打开/关闭文件管理器面板 |
-| ☁ CPH | 打开/关闭云手机模拟面板（电池/GNSS） |
+| ☁ CPH | 打开/关闭云手机模拟面板（Battery/GNSS/Haps/I18n/Sensor） |
 | Back | 返回键 |
 | Home | 主页键 |
 | Recent | 最近任务键 |
@@ -181,7 +181,7 @@ hscrcpy/
 │   ├── hdc_wrapper.cpp     # HDC 命令封装
 │   ├── layout_window.cpp   # UI 布局检查面板（TreeView + ListView）
 │   ├── file_manager_window.cpp  # 文件管理器面板
-│   ├── cph_window.cpp      # 云手机模拟面板（电池/GNSS/Haps）
+│   ├── cph_window.cpp      # 云手机模拟面板（Battery/GNSS/Haps/I18n/Sensor）
 │   ├── config.cpp          # INI 配置读写
 │   ├── cli.cpp             # 命令行参数解析
 │   ├── net_util.h          # 网络工具（TCP keepalive 等）
