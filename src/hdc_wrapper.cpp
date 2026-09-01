@@ -50,18 +50,25 @@ bool HdcWrapper::is_device_reachable() {
 
 bool HdcWrapper::try_reconnect_new_port() {
     // For TCP devices: when the old serial is unreachable, the device may have
-    // reconnected with a new port. Wait and retry the old serial first,
-    // then scan for TCP devices with the same IP:port prefix.
-    // Note: we cannot reliably distinguish different devices on 127.0.0.1,
-    // so we only auto-switch if there's exactly one TCP device on that IP
-    // and the old serial is gone.
+    // temporarily dropped and reconnected. Wait and retry the old serial a few
+    // times before giving up. We do NOT auto-switch to a different device on
+    // the same IP — that would silently replace device A with device B (e.g.
+    // two cloud phones on 127.0.0.1) without notifying the user.
     if (!is_tcp()) return false;
 
     // Try up to 3 times with 2s delay, waiting for the old serial to come back
     for (int attempt = 0; attempt < 3; attempt++) {
+        if (cancel_flag_.load()) {
+            LOGI("try_reconnect_new_port: cancelled");
+            return false;
+        }
         if (attempt > 0) {
             LOGI("Waiting for device %s to reappear (attempt %d/3)...", serial_.c_str(), attempt + 1);
             Sleep(2000);
+            if (cancel_flag_.load()) {
+                LOGI("try_reconnect_new_port: cancelled during sleep");
+                return false;
+            }
         }
 
         // Check if old serial is back (device may have reconnected with same port)
@@ -72,30 +79,12 @@ bool HdcWrapper::try_reconnect_new_port() {
         }
     }
 
-    // Old serial is truly gone. Check if there's exactly one TCP device on the same IP.
-    // This handles the case where the device reconnected with a different port.
-    // Only auto-switch when unambiguous (single TCP device on that IP).
-    auto devices = list_devices();
-    std::vector<HdcDevice> tcp_same_ip;
-    for (const auto &d : devices) {
-        if (d.serial.find(':') == std::string::npos) continue;  // skip USB
-        if (d.ip == ip_ && d.serial != serial_) {
-            tcp_same_ip.push_back(d);
-        }
-    }
-
-    if (tcp_same_ip.size() == 1) {
-        const auto &d = tcp_same_ip[0];
-        LOGI("Old serial %s gone, found one TCP device on same IP: %s", serial_.c_str(), d.serial.c_str());
-        update_serial(d.serial);
-        if (ensure_connected()) {
-            LOGI("Reconnected to device via new serial: %s", serial_.c_str());
-            return true;
-        }
-    } else if (tcp_same_ip.size() > 1) {
-        LOGW("Multiple TCP devices on IP %s, cannot auto-determine which one is the target", ip_.c_str());
-    }
-
+    // Old serial is gone. Do NOT auto-switch to a different device on the same
+    // IP — that silently replaces device A with device B (e.g. two cloud phones
+    // on 127.0.0.1) without notifying the user, leaving the dropdown showing
+    // A's serial while B's screen is displayed. Instead, return false so the
+    // caller declares the device disconnected and the user can manually pick
+    // the new device from the refreshed dropdown.
     LOGW("Device %s not recoverable (IP=%s)", serial_.c_str(), ip_.c_str());
     return false;
 }

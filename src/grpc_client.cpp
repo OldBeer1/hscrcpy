@@ -670,7 +670,7 @@ void GrpcClient::streaming_loop() {
     int ping_sent_count = 0;
     int stall_retries = 0;
     ping_ack_received_ = false;
-    const int kPingIntervalSec = 15;
+    const int kPingIntervalSec = 8;
     const int kMaxPingWithoutResponse = 3;
     const int kMaxEndStreamRetries = 500;
     const int kMaxStallRetries = 10;

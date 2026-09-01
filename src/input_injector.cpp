@@ -111,6 +111,16 @@ bool InputInjector::init(const std::string &uitest_version) {
     return true;
 }
 
+void InputInjector::request_stop() {
+    // Non-blocking: signal all threads to exit without joining them.
+    // Used by WM_CLOSE to immediately wake blocked threads before stop_mirroring().
+    reconnect_running_ = false;
+    task_running_ = false;
+    task_cv_.notify_all();
+    shell_bg_running_ = false;
+    shell_bg_cv_.notify_all();
+}
+
 void InputInjector::cleanup() {
     reconnect_running_ = false;
     int sock = control_sock_.exchange(-1);
@@ -125,9 +135,11 @@ void InputInjector::cleanup() {
 
 bool InputInjector::ensure_uitest_agent() {
     for (int i = 0; i < 10; i++) {
+        if (!reconnect_running_) return false;
         std::string output;
 
         hdc_.shell_command("cat /proc/net/unix", &output, 3);
+        if (!reconnect_running_) return false;
         if (output.find("uitest_socket") != std::string::npos) {
             LOGI("uitest agent listening on abstract socket uitest_socket (check %d)", i + 1);
             use_abstract_control_ = true;
@@ -142,8 +154,10 @@ bool InputInjector::ensure_uitest_agent() {
         if (i == 0) {
             LOGI("uitest agent not found yet, starting uitest daemon...");
             hdc_.shell_command("uitest start-daemon singleness", nullptr, 5);
+            if (!reconnect_running_) return false;
         }
         Sleep(300);
+        if (!reconnect_running_) return false;
     }
 
     LOGW("uitest agent still not available after checks (no abstract socket found)");
@@ -195,6 +209,7 @@ bool InputInjector::setup_control_port() {
     uint16_t end_port = start_port + 5;
 
     for (uint16_t port = start_port; port < end_port; port++) {
+        if (!reconnect_running_) return false;
         if (!is_local_port_free(port)) continue;
 
         bool ok;
@@ -204,6 +219,11 @@ bool InputInjector::setup_control_port() {
             ok = hdc_.forward_tcp(port, kDefaultControlPort);
         }
         if (!ok) continue;
+        if (!reconnect_running_) {
+            hdc_.forward_remove(port, use_abstract_control_,
+                                use_abstract_control_ ? kUitestSocketName : "");
+            return false;
+        }
 
         int sock = static_cast<int>(socket(AF_INET, SOCK_STREAM, 0));
         if (sock == static_cast<int>(INVALID_SOCK)) {
@@ -226,6 +246,12 @@ bool InputInjector::setup_control_port() {
             hdc_.forward_remove(port, use_abstract_control_,
                                 use_abstract_control_ ? kUitestSocketName : "");
             continue;
+        }
+        if (!reconnect_running_) {
+            CLOSE_SOCKET(static_cast<socket_t>(sock));
+            hdc_.forward_remove(port, use_abstract_control_,
+                                use_abstract_control_ ? kUitestSocketName : "");
+            return false;
         }
 
         // TCP_NODELAY: disable Nagle for low-latency touch event delivery

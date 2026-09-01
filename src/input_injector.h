@@ -25,6 +25,7 @@ public:
 
     bool init(const std::string &uitest_version = "");
     void cleanup();
+    void request_stop();  // Non-blocking: signal threads to exit
 
     bool inject_click(uint32_t x, uint32_t y);
     bool inject_long_click(uint32_t x, uint32_t y);

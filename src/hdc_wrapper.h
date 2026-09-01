@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <atomic>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -46,6 +47,8 @@ public:
     const std::string &port() const { return port_; }
     bool is_tcp() const;
 
+    void set_cancel(bool v) { cancel_flag_.store(v); }
+
     bool get_screen_resolution(uint32_t &width, uint32_t &height);
 
 private:
@@ -57,6 +60,7 @@ private:
     std::string ip_;
     std::string port_;
     std::vector<uint16_t> our_forward_ports_;  // Track our own forward ports for safe cleanup
+    std::atomic<bool> cancel_flag_{false};     // Set by ScreenCapture::request_stop() to interrupt blocking loops
 };
 
 } // namespace hscrcpy

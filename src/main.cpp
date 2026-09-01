@@ -1497,6 +1497,8 @@ static void try_update_frame() {
 }
 
 static bool g_stopping = false;
+static bool g_closing = false;
+static const UINT kCloseTimeoutTimerId = 99;
 static std::string g_cleanup_serial;
 static std::string g_pending_start_serial;
 static std::string g_pending_start_ip;
@@ -2184,6 +2186,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return (INT_PTR)GetStockObject(WHITE_BRUSH);
     }
     case WM_TIMER:
+        if (wp == kCloseTimeoutTimerId) {
+            // Safety timeout: WM_CLOSE couldn't complete cleanup in 5s.
+            // Force-destroy the window to prevent a permanent hang.
+            KillTimer(hwnd, kCloseTimeoutTimerId);
+            LOGW("WM_CLOSE timeout: forcing window destroy after 5s");
+            DestroyWindow(hwnd);
+            return 0;
+        }
         if (wp == 1 && g_mirroring) {
             try_update_frame();
             if (!g_cjk_buf.empty() && g_cjk_buf_time > 0 && GetTickCount64() - g_cjk_buf_time >= 100) {
@@ -2364,6 +2374,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         std::string cleaned = std::move(g_cleanup_serial);
         g_cleanup_serial.clear();
 
+        if (g_closing) {
+            KillTimer(hwnd, kCloseTimeoutTimerId);
+            DestroyWindow(hwnd);
+            break;
+        }
+
         if (!g_pending_start_serial.empty()) {
             std::string s = std::move(g_pending_start_serial);
             std::string i = std::move(g_pending_start_ip);
@@ -2429,6 +2445,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // window shrinks — leaving the box off-center.
         if (g_mirroring) {
             stop_mirroring();
+            // Refresh device dropdown so the user sees the current device
+            // list (the old serial may be gone or replaced by a new one).
+            refresh_devices();
             show_error("Device disconnected. Please reconnect and try again.");
         }
         break;
@@ -2445,6 +2464,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             LOGI("Stream ended notification received, stopping mirroring");
             stop_mirroring();
         }
+        break;
+    }
+    case kMsgReconnecting: {
+        // gRPC stream dropped, capture thread is attempting to reconnect
+        char buf[128];
+        snprintf(buf, sizeof(buf), "Reconnecting... (%d/%d)",
+                 static_cast<int>(wp), static_cast<int>(lp));
+        set_status(buf);
         break;
     }
     case kMsgRecordStarted: {
@@ -2485,6 +2512,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     }
+    case WM_CLOSE:
+        // Graceful shutdown: signal threads to stop, then wait for cleanup.
+        // If nothing is running, destroy immediately.
+        if (!g_mirroring && !g_starting && !g_stopping) {
+            DestroyWindow(hwnd);
+        } else {
+            g_closing = true;
+            set_status("Shutting down...");
+            // Immediately signal capture and input threads to exit.
+            // This makes their blocking shell calls return early.
+            if (g_capture) g_capture->request_stop();
+            if (g_input) g_input->request_stop();
+            // Trigger full cleanup if not already stopping
+            if (g_mirroring && !g_stopping) {
+                stop_mirroring();
+            }
+            // Safety timeout: force-destroy window after 5s even if threads are stuck
+            SetTimer(hwnd, kCloseTimeoutTimerId, 5000, NULL);
+        }
+        return 0;
     case WM_DESTROY:
         destroy_backbuffer();
         LayoutWindow::destroy();
@@ -2504,6 +2551,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         KillTimer(hwnd, 1);
         KillTimer(hwnd, kRecordTimerId);
+        KillTimer(hwnd, kCloseTimeoutTimerId);
         // If recording is active, stop it on the device and clean up the media
         // library entry. Do NOT download — just delete the temp recording.
         // stop_recording(false) spawns the cleanup thread; join_record_thread

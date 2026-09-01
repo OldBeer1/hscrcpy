@@ -454,9 +454,11 @@ bool ScreenCapture::wait_for_extension_ready() {
     bool extension_ready = false;
     for (int i = 0; i < 30; i++) {
         Sleep(100);
+        if (!running_) return false;
         std::string check;
         if (use_abstract_socket_) {
             hdc_.shell_command("cat /proc/net/unix", &check, 3);
+            if (!running_) return false;
             if (check.find(kGrpcSocketName) != std::string::npos) {
                 LOGI("uitest extension ready (abstract socket) after %d ms", (i + 1) * 100);
                 extension_ready = true;
@@ -466,6 +468,7 @@ bool ScreenCapture::wait_for_extension_ready() {
             // Check TCP port 5000 — HarmonyOS netstat may not show it reliably,
             // so we also check the extension process as a fallback indicator.
             hdc_.shell_command("netstat -an", &check, 3);
+            if (!running_) return false;
             bool port_listening = false;
             std::istringstream nss(check);
             std::string nline;
@@ -483,6 +486,7 @@ bool ScreenCapture::wait_for_extension_ready() {
             }
             // Fallback: check if extension process is running and abstract socket exists
             hdc_.shell_command("cat /proc/net/unix", &check, 3);
+            if (!running_) return false;
             if (check.find(kGrpcSocketName) != std::string::npos) {
                 LOGI("uitest extension ready (abstract socket fallback) after %d ms", (i + 1) * 100);
                 use_abstract_socket_ = true;
@@ -494,6 +498,7 @@ bool ScreenCapture::wait_for_extension_ready() {
             if (i >= 5) {
                 std::string ps_check;
                 hdc_.shell_command("ps -ef", &ps_check, 3);
+                if (!running_) return false;
                 std::istringstream pss(ps_check);
                 bool ext_found = false;
                 while (std::getline(pss, nline)) {
@@ -518,6 +523,7 @@ bool ScreenCapture::wait_for_extension_ready() {
 
         std::string ps_debug;
         hdc_.shell_command("ps -ef", &ps_debug, 3);
+        if (!running_) return false;
         {
             std::istringstream iss(ps_debug);
             std::string line;
@@ -673,6 +679,17 @@ bool ScreenCapture::start() {
 
     LOGI("Screen capture starting");
 
+    // Reset cancel flag so long-running operations can proceed
+    hdc_.set_cancel(false);
+
+    // Set running_ early so that wait_for_extension_ready() and
+    // kill_uitest_extension() — which check running_ for cooperative
+    // cancellation — don't bail out during initial setup. Without this,
+    // running_ is false until setup_grpc_stream() succeeds, causing
+    // wait_for_extension_ready() to return false immediately and forcing
+    // snapshot fallback on every startup.
+    running_ = true;
+
     bool grpc_ok = false;
     try {
         grpc_ok = setup_grpc_stream();
@@ -696,6 +713,7 @@ bool ScreenCapture::start() {
         }
         if (!setup_snapshot_fallback()) {
             LOGE("Snapshot fallback also failed");
+            running_ = false;
             return false;
         }
     }
@@ -759,6 +777,7 @@ bool ScreenCapture::start() {
 
 void ScreenCapture::stop() {
     running_ = false;
+    hdc_.set_cancel(true);
     if (thread_.joinable()) thread_.join();
 
     grpc_client_.disconnect();
@@ -786,6 +805,7 @@ void ScreenCapture::stop() {
 void ScreenCapture::kill_uitest_extension() {
     std::string ps_raw;
     hdc_.shell_command("ps -ef", &ps_raw, 5);
+    if (!running_) return;
     LOGI("kill_uitest_extension: ps output='%s'", ps_raw.c_str());
     std::istringstream iss(ps_raw);
     std::string line;
@@ -799,6 +819,7 @@ void ScreenCapture::kill_uitest_extension() {
             if (all_digit && !pid_str.empty()) {
                 std::string kill_result;
                 hdc_.shell_command("kill -9 " + pid_str, &kill_result, 3);
+                if (!running_) return;
                 LOGI("kill -9 %s result: '%s'", pid_str.c_str(), kill_result.c_str());
             }
         }
@@ -822,6 +843,7 @@ bool ScreenCapture::reconnect_grpc_stream() {
             return false;
         }
     }
+    if (!running_) return false;
 
     // For TCP devices, re-establish the hdc connection
     if (hdc_.is_tcp()) {
@@ -830,9 +852,11 @@ bool ScreenCapture::reconnect_grpc_stream() {
             return false;
         }
     }
+    if (!running_) return false;
 
     grpc_client_.disconnect();
     Sleep(500);
+    if (!running_) return false;
 
     // Save ports before clearing so cleanup can identify our forwards
     uint16_t old_video_port = local_video_port_;
@@ -848,28 +872,36 @@ bool ScreenCapture::reconnect_grpc_stream() {
                             use_abstract_socket_ ? kUitestSocketName : "");
         local_control_port_ = 0;
     }
+    if (!running_) return false;
 
     hdc_.cleanup_stale_forwards({old_video_port, old_control_port});
     Sleep(300);
+    if (!running_) return false;
 
     // Kill and restart extension (same as fresh connection)
     kill_uitest_extension();
+    if (!running_) return false;
     hdc_.shell_command(build_extension_cmd(), nullptr, 5);
+    if (!running_) return false;
 
     if (!wait_for_extension_ready()) {
         LOGE("Reconnect: uitest extension failed to start");
         return false;
     }
+    if (!running_) return false;
 
     Sleep(1000);
+    if (!running_) return false;
 
     if (!setup_port_forward()) {
         LOGE("Reconnect: failed to setup port forward");
         return false;
     }
+    if (!running_) return false;
 
     bool connected = false;
     for (int retry = 0; retry < 3; retry++) {
+        if (!running_) return false;
         LOGI("Reconnect gRPC attempt %d to 127.0.0.1:%u", retry + 1, local_video_port_);
         if (grpc_client_.connect("127.0.0.1", local_video_port_)) {
             connected = true;
@@ -947,6 +979,21 @@ void ScreenCapture::grpc_stream_loop() {
     uint64_t last_frame_count = frame_count_.load();
     int hdc_check_counter = 0;  // Check hdc reachability every ~10s while streaming
 
+    // Frame stall detection: if no new frames arrive for 15s while the stream
+    // is "connected" (PING ACKs still coming, hdc reachable), the uitest extension
+    // may have crashed or the device screen encoder died. Break out to trigger
+    // reconnection instead of leaving the user with a frozen screen.
+    uint64_t stall_frame_count = frame_count_.load();
+    int stall_counter = 0;
+    const int kFrameStallLimit = 30;  // 30 * 500ms = 15s
+    // Track consecutive stall-triggered reconnections. If the stall keeps
+    // recurring (device reachable but not producing frames), give up after 3.
+    int stall_reconnect_count = 0;
+    const int kMaxStallReconnects = 3;
+    // Reset stall_reconnect_count only after sustained frame flow (30s).
+    int healthy_frame_counter = 0;
+    const int kHealthyFrameThreshold = 60;  // 60 * 500ms = 30s
+
     while (running_) {
         while (running_ && grpc_client_.is_connected() && grpc_client_.is_streaming_active()) {
             // Wait for frame event with 500ms timeout — event-driven when frames arrive,
@@ -957,30 +1004,81 @@ void ScreenCapture::grpc_stream_loop() {
                 Sleep(500);
             }
 
-            // If PING keepalive is failing, break out to trigger reconnection
-            if (grpc_client_.is_ping_failing()) {
-                LOGW("PING keepalive failing, breaking out of streaming loop");
-                break;
-            }
-
-            // Periodically check hdc reachability for TCP devices (~every 5s)
-            if (hdc_.is_tcp()) {
-                hdc_check_counter++;
-                if (hdc_check_counter >= 10) {
-                    hdc_check_counter = 0;
-                    if (!hdc_.is_device_reachable()) {
-                        // Device may have reconnected with new port, try to find it
-                        if (hdc_.try_reconnect_new_port()) {
-                            LOGI("Device reconnected with new port during streaming, triggering gRPC reconnect");
-                            break;  // Break inner loop to trigger gRPC reconnection
+            // Frame stall detection: if no new frames for 15s, trigger reconnect.
+            // Even static screens produce periodic keyframes; 15s of silence means
+            // the encoder or extension has likely crashed.
+            if (frame_count_.load() > stall_frame_count) {
+                stall_frame_count = frame_count_.load();
+                stall_counter = 0;
+                // Track sustained frame flow to reset stall reconnect count.
+                // Only reset after 30s of continuous frames — prevents reset
+                // from a brief burst of frames between stalls.
+                healthy_frame_counter++;
+                if (healthy_frame_counter >= kHealthyFrameThreshold) {
+                    if (stall_reconnect_count > 0) {
+                        LOGI("Frames flowing for 30s, resetting stall reconnect count");
+                    }
+                    stall_reconnect_count = 0;
+                    healthy_frame_counter = 0;
+                }
+            } else {
+                stall_counter++;
+                healthy_frame_counter = 0;
+                if (stall_counter >= kFrameStallLimit) {
+                    stall_reconnect_count++;
+                    if (stall_reconnect_count >= kMaxStallReconnects) {
+                        // Before declaring "disconnected", verify the device is
+                        // truly unreachable via hdc. If hdc echo still works,
+                        // the device is still connected — the gRPC stream just
+                        // isn't producing frames. Don't show a false "disconnected"
+                        // dialog; let the normal reconnect path handle it.
+                        if (hdc_.is_device_reachable()) {
+                            LOGW("Stall limit reached but device still reachable via hdc, "
+                                 "continuing reconnect attempts");
+                            // Don't declare disconnected — just break to trigger
+                            // another reconnect cycle. reconnect_attempts will
+                            // eventually hit max_grpc_reconnect_ and end the stream
+                            // via kMsgStreamEnded instead.
+                            break;
                         }
-                        LOGE("Device disconnected (hdc unreachable during streaming)");
+                        LOGE("Device disconnected (no frames after %d stall reconnects)",
+                             stall_reconnect_count);
                         if (notify_hwnd_) {
                             PostMessageA(notify_hwnd_, kMsgDeviceDisconnected, 0, 0);
                         }
                         running_ = false;
                         break;
                     }
+                    LOGW("No new frames for %ds, triggering stall reconnect (%d/%d)",
+                         kFrameStallLimit / 2, stall_reconnect_count, kMaxStallReconnects);
+                    break;
+                }
+            }
+
+            // If PING keepalive is failing, break out to trigger reconnection
+            if (grpc_client_.is_ping_failing()) {
+                LOGW("PING keepalive failing, breaking out of streaming loop");
+                break;
+            }
+
+            // Periodically check hdc reachability for ALL devices
+            // TCP: every 5s (10 * 500ms), USB: every 10s (20 * 500ms)
+            hdc_check_counter++;
+            int hdc_check_interval = hdc_.is_tcp() ? 10 : 20;
+            if (hdc_check_counter >= hdc_check_interval) {
+                hdc_check_counter = 0;
+                if (!hdc_.is_device_reachable()) {
+                    // For TCP devices, may have reconnected with new port
+                    if (hdc_.is_tcp() && hdc_.try_reconnect_new_port()) {
+                        LOGI("Device reconnected with new port during streaming, triggering gRPC reconnect");
+                        break;
+                    }
+                    LOGE("Device disconnected (hdc unreachable during streaming)");
+                    if (notify_hwnd_) {
+                        PostMessageA(notify_hwnd_, kMsgDeviceDisconnected, 0, 0);
+                    }
+                    running_ = false;
+                    break;
                 }
             }
         }
@@ -988,6 +1086,11 @@ void ScreenCapture::grpc_stream_loop() {
         if (!running_) break;
 
         reconnecting_ = true;
+        if (notify_hwnd_) {
+            PostMessageA(notify_hwnd_, kMsgReconnecting,
+                         static_cast<WPARAM>(reconnect_attempts + 1),
+                         static_cast<LPARAM>(max_grpc_reconnect_));
+        }
 
         if (!grpc_client_.is_connected() || !grpc_client_.is_streaming_active()) {
             LOGW("gRPC stream disconnected (connected=%d, streaming=%d), attempting reconnect (%d/%d)",
@@ -1125,17 +1228,33 @@ void ScreenCapture::snapshot_loop() {
     LOGI("Snapshot loop started");
 
     auto interval = std::chrono::milliseconds(1000 / config_.frame_rate);
+    int consecutive_failures = 0;
+    const int kMaxConsecutiveFailures = 5;  // ~5s of failures at 1 FPS
 
     while (running_) {
         auto start = std::chrono::steady_clock::now();
 
         if (!capture_one_snapshot()) {
+            consecutive_failures++;
+            // After repeated failures, check if the device is truly disconnected
+            if (consecutive_failures >= kMaxConsecutiveFailures) {
+                if (!hdc_.is_device_reachable()) {
+                    LOGE("Device disconnected (hdc unreachable during snapshot)");
+                    if (notify_hwnd_) {
+                        PostMessageA(notify_hwnd_, kMsgDeviceDisconnected, 0, 0);
+                    }
+                    break;
+                }
+                // Device still reachable but snapshot failing — reset and keep trying
+                consecutive_failures = 0;
+            }
             auto elapsed = std::chrono::steady_clock::now() - start;
             auto wait = interval - elapsed;
             if (wait > std::chrono::milliseconds(0))
                 std::this_thread::sleep_for(wait);
             continue;
         }
+        consecutive_failures = 0;
 
         auto elapsed = std::chrono::steady_clock::now() - start;
         auto wait = interval - elapsed;
@@ -1144,6 +1263,11 @@ void ScreenCapture::snapshot_loop() {
     }
 
     LOGI("Snapshot loop stopped, frames: %llu", (unsigned long long)frame_count_.load());
+
+    // Notify UI that streaming has stopped (connection lost or max retries exceeded)
+    if (notify_hwnd_) {
+        PostMessageA(notify_hwnd_, kMsgStreamEnded, 0, 0);
+    }
 }
 
 bool ScreenCapture::get_latest_frame(std::shared_ptr<DecodedImage> &img) {

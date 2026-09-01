@@ -42,6 +42,7 @@ enum WmNotify : UINT {
     kMsgDeviceDisconnected = WM_USER + 8,  // Device disconnected (hdc unreachable)
     kMsgStreamEnded       = WM_USER + 9,  // Stream loop ended
     kMsgFrameRender       = WM_USER + 10, // Event-driven frame rendering
+    kMsgReconnecting      = WM_USER + 14, // Reconnecting stream (attempt N/M)
 };
 
 class ScreenCapture {
@@ -51,6 +52,7 @@ public:
 
     bool start();
     void stop();
+    void request_stop() { running_ = false; hdc_.set_cancel(true); }  // Non-blocking: signal threads to exit
 
     bool get_latest_frame(std::shared_ptr<DecodedImage> &img);
 
