@@ -121,6 +121,8 @@ std::string ScreenCapture::find_matching_so_with_md5(const std::string &device_m
     // Fallback list: the other category, tried if primary list is empty
     std::vector<std::string> primary = prefer_sec
         ? std::vector<std::string>{
+            "libscrcpy_server_unix_6.9-20260801.z.so",
+            "libscrcpy_server_unix_6.8-20260801.z.so",
             "libscrcpy_server_unix_6.6-20260418.z.so",
             "libscrcpy_server_unix_6.5-20260313.z.so",
             "libscrcpy_server_unix_6.4-20260113.z.so",
@@ -141,6 +143,8 @@ std::string ScreenCapture::find_matching_so_with_md5(const std::string &device_m
             "libscrcpy_server3.z.so",
         }
         : std::vector<std::string>{
+            "libscrcpy_server_unix_6.9-20260801.z.so",
+            "libscrcpy_server_unix_6.8-20260801.z.so",
             "libscrcpy_server_unix_6.6-20260418.z.so",
             "libscrcpy_server_unix_6.5-20260313.z.so",
             "libscrcpy_server_unix_6.4-20260113.z.so",
