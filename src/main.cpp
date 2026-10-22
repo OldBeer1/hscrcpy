@@ -2349,7 +2349,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         std::string serial = g_hdc->serial();
         char buf[256];
-        const char *mode_str = g_capture->mode() == CaptureMode::kGrpcStream ? "gRPC" : "snapshot";
+        const char *mode_str = g_capture->mode() == CaptureMode::kGrpcStream ? "gRPC"
+                              : (g_capture->mode() == CaptureMode::kWebSocketStream ? "WebSocket" : "snapshot");
         snprintf(buf, sizeof(buf), "HScrcpy - %s | Device %ux%u | Stream %ux%u (%s, scale=%d, %s, %dfps)",
                  serial.c_str(), g_device_screen_w, g_device_screen_h, g_screen_w, g_screen_h, mode_str,
                  g_capture_config.scale, bitrate_label(g_capture_config.bit_rate),
@@ -2405,7 +2406,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         std::string serial = g_hdc->serial();
         char buf[256];
-        const char *mode_str = g_capture->mode() == CaptureMode::kGrpcStream ? "gRPC" : "snapshot";
+        const char *mode_str = g_capture->mode() == CaptureMode::kGrpcStream ? "gRPC"
+                              : (g_capture->mode() == CaptureMode::kWebSocketStream ? "WebSocket" : "snapshot");
         snprintf(buf, sizeof(buf), "HScrcpy - %s | Device %ux%u | Stream %ux%u (%s, scale=%d, %s, %dfps)",
                  serial.c_str(), g_device_screen_w, g_device_screen_h, g_screen_w, g_screen_h, mode_str,
                  g_capture_config.scale, bitrate_label(g_capture_config.bit_rate),

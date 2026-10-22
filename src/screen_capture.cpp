@@ -109,6 +109,17 @@ std::string ScreenCapture::get_local_so_md5(const std::string &filepath) {
     return md5;
 }
 
+// Cloud device detection (HOScrcpy checkIsCloudDevice): a CPH (cloud phone)
+// has /system/lib64/libCPHMediaEngine.z.so. HOScrcpy 2.13.1 uses the emulator
+// SO for cloud devices (unless forceUseMobileSo=true).
+bool ScreenCapture::is_cloud_device() {
+    std::string out;
+    hdc_.shell_command("file /system/lib64/libCPHMediaEngine.z.so", &out, 5);
+    bool is_cloud = !out.empty() && out.find("No such file") == std::string::npos;
+    LOGI("Cloud device detection: is_cloud=%s (output='%s')", is_cloud ? "true" : "false", out.c_str());
+    return is_cloud;
+}
+
 std::string ScreenCapture::find_matching_so_with_md5(const std::string &device_md5) {
     // HOScrcpy: isUseSecSo = compareUitestVersion("6.0.2.1", uitestVersion) < 0
     // i.e. uitest >= 6.0.2.1 → sec SO (unix_6.*) → abstract socket
@@ -121,6 +132,8 @@ std::string ScreenCapture::find_matching_so_with_md5(const std::string &device_m
     // Fallback list: the other category, tried if primary list is empty
     std::vector<std::string> primary = prefer_sec
         ? std::vector<std::string>{
+            // 7.0 优先: 新版 7.0 SO 走 WebSocket 通道 (HOScrcpy 2.13 行为)。
+            "libscrcpy_server_unix_7.0-20260930.z.so",
             "libscrcpy_server_unix_6.9-20260801.z.so",
             "libscrcpy_server_unix_6.8-20260801.z.so",
             "libscrcpy_server_unix_6.6-20260418.z.so",
@@ -137,12 +150,14 @@ std::string ScreenCapture::find_matching_so_with_md5(const std::string &device_m
 
     std::vector<std::string> fallback = prefer_sec
         ? std::vector<std::string>{
+            "libscrcpy_server_unix_7.0-20260930.z.so",
             "libscrcpy_server1.z.so",
             "libscrcpy_server0.z.so",
             "libscrcpy_server2.z.so",
             "libscrcpy_server3.z.so",
         }
         : std::vector<std::string>{
+            "libscrcpy_server_unix_7.0-20260930.z.so",
             "libscrcpy_server_unix_6.9-20260801.z.so",
             "libscrcpy_server_unix_6.8-20260801.z.so",
             "libscrcpy_server_unix_6.6-20260418.z.so",
@@ -150,6 +165,29 @@ std::string ScreenCapture::find_matching_so_with_md5(const std::string &device_m
             "libscrcpy_server_unix_6.4-20260113.z.so",
             "libscrcpy_server_unix_6.3.1-20260113.z.so",
         };
+
+    // Forced SO (emulator fallback after 7.0 WebSocket failure): return it directly.
+    if (!forced_so_path_.empty()) {
+        if (GetFileAttributesA(forced_so_path_.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            LOGI("Selected server SO: %s (forced fallback)", forced_so_path_.c_str());
+            return forced_so_path_;
+        }
+        LOGW("Forced SO missing: %s", forced_so_path_.c_str());
+    }
+
+    // HOScrcpy ①: if the device SO MD5 matches the emulator SO, reuse it
+    // (cloud devices get emulator SO pushed by HOScrcpy; MD5 match avoids re-push).
+    {
+        std::string emulator_path = server_dir_ + "\\libscrcpy_server_emulator.z.so";
+        if (!device_md5.empty() &&
+            GetFileAttributesA(emulator_path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            std::string emu_md5 = get_local_so_md5(emulator_path);
+            if (emu_md5 == device_md5) {
+                LOGI("Selected server SO: libscrcpy_server_emulator.z.so (device SO is cloud/emulator resource, MD5 match)");
+                return emulator_path;
+            }
+        }
+    }
 
     // First pass: MD5 match (device already has a working SO from a previous session).
     // HOScrcpy also checks MD5 first and overrides isUseSecSo based on which map matches.
@@ -194,7 +232,85 @@ std::string ScreenCapture::find_matching_so_with_md5(const std::string &device_m
         if (!result.empty()) return result;
     }
 
+    // Absolute last resort: the emulator SO (cloud devices) — kept out of the
+    // priority lists so it's only used when nothing else is available.
+    {
+        std::string emulator_path = server_dir_ + "\\libscrcpy_server_emulator.z.so";
+        if (GetFileAttributesA(emulator_path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            LOGI("Selected server SO: libscrcpy_server_emulator.z.so (last resort)");
+            return emulator_path;
+        }
+    }
+
     return "";
+}
+
+// Build the strict priority ladder of server SOs to try, from best to worst:
+//   1. 7.0 SO — WebSocket channel (virtual screen, HOScrcpy 2.13 behavior)
+//   2. 6.x unix SOs — gRPC virtual screen (abstract socket), by version
+//   3. emulator SO — cloud-device main-screen output (gRPC over TCP 5000)
+//   4. (caller falls back to snapshot if all fail)
+// Only files that exist locally are included.
+std::vector<std::string> ScreenCapture::build_so_candidates(const std::string &device_md5) {
+    std::vector<std::string> candidates;
+
+    auto add_if_exists = [&](const char *name) {
+        std::string path = server_dir_ + "\\" + name;
+        if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            candidates.push_back(path);
+        }
+    };
+
+    bool prefer_sec = version_compare_result(uitest_version_, "6.0.2.1") != "less";
+    // Cloud device (CPH): prefer the emulator SO for the main-screen output.
+    // On old-arch cloud phones (uitest < 6.0.2.1) the non-sec SOs (server1/2/3)
+    // connect but produce 0 frames, while the emulator SO actually streams.
+    bool cloud_device = is_cloud_device();
+
+    // Tier 1: 7.0 WebSocket (all devices — unconditional priority)
+    add_if_exists("libscrcpy_server_unix_7.0-20260930.z.so");
+
+    // Tier 2: 6.x unix SOs — gRPC virtual screen (abstract socket).
+    // These are SEC SOs; skip them on old devices (uitest < 6.0.2.1) where they
+    // cannot load — the non-sec variants below are the correct tier there.
+    if (prefer_sec) {
+        add_if_exists("libscrcpy_server_unix_6.9-20260801.z.so");
+        add_if_exists("libscrcpy_server_unix_6.8-20260801.z.so");
+        add_if_exists("libscrcpy_server_unix_6.6-20260418.z.so");
+        add_if_exists("libscrcpy_server_unix_6.5-20260313.z.so");
+        add_if_exists("libscrcpy_server_unix_6.4-20260113.z.so");
+        add_if_exists("libscrcpy_server_unix_6.3.1-20260113.z.so");
+    } else {
+        LOGI("uitest %s < 6.0.2.1, skipping 6.x sec SOs (non-sec gRPC tiers next)", uitest_version_.c_str());
+    }
+
+    // Tier 3: cloud-device main-screen output (emulator SO, TCP 5000 gRPC).
+    // For cloud devices on old architecture (non-sec path), emulator comes
+    // BEFORE the non-sec server variants: those connect but stream 0 frames.
+    if (cloud_device && !prefer_sec) {
+        add_if_exists("libscrcpy_server_emulator.z.so");
+    }
+
+    // Non-sec variants (uitest < 6.0.2.1 devices) — gRPC over TCP 5000
+    add_if_exists("libscrcpy_server1.z.so");
+    add_if_exists("libscrcpy_server2.z.so");
+    add_if_exists("libscrcpy_server3.z.so");
+    add_if_exists("libscrcpy_server_5.10-20260114.z.so");
+    add_if_exists("libscrcpy_server0.z.so");
+
+    // Tier 4: emulator SO (fallback for all other cases)
+    add_if_exists("libscrcpy_server_emulator.z.so");
+
+    // Deduplicate
+    std::vector<std::string> uniq;
+    for (auto &p : candidates) {
+        if (std::find(uniq.begin(), uniq.end(), p) == uniq.end()) uniq.push_back(p);
+    }
+
+    if (uniq.empty()) {
+        LOGW("No server SO candidates found in %s", server_dir_.c_str());
+    }
+    return uniq;
 }
 
 std::string ScreenCapture::find_matching_agent_so() {
@@ -242,26 +358,30 @@ std::string ScreenCapture::build_extension_cmd() const {
     // as a command-line argument. Passing it explicitly can cause the extension to fail
     // to create the abstract socket on some 5.x devices.
     // Trailing '&' runs uitest in background on the device, matching HOScrcpy behavior.
+    // The whole device command is wrapped in double quotes because run_process()
+    // executes it via `cmd.exe /C hdc ... shell <cmd>`. Without the quotes, cmd.exe
+    // intercepts `>/dev/null 2>&1 </dev/null` as a WINDOWS-side redirection to the
+    // non-existent path \dev\null → "The system cannot find the path specified" and
+    // the command never reaches the device → extension never starts → no
+    // scrcpy_grpc_socket → gRPC stream fails. With quotes, cmd passes the string
+    // verbatim to hdc and the device-side sh handles the redirection.
+    // nohup + full redirect keeps the extension alive after the hdc session ends
+    // (otherwise the process gets killed when hdc waits for EOF on the pipe).
     snprintf(cmd, sizeof(cmd),
-             "/system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so "
+             "\"nohup /system/bin/uitest start-daemon singleness --extension-name libscreen_casting.z.so "
              "-scale %d -frameRate %d -bitRate %d -p 5000 -screenId 0 -encodeType 0 "
-             "-iFrameInterval %d -repeatInterval %d &",
+             "-iFrameInterval %d -repeatInterval %d >/dev/null 2>&1 </dev/null &\"",
              config_.scale, config_.frame_rate, config_.bit_rate,
              config_.iframe_interval,
              1000 / config_.frame_rate);
     return cmd;
 }
 
-bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
-    hdc_.ensure_connected();
-
-    for (int precheck = 0; precheck < 3; precheck++) {
-        std::string check;
-        hdc_.shell_command("echo ok", &check, 3);
-        if (check.find("ok") != std::string::npos) break;
-        LOGW("hdc not ready (attempt %d/3): '%s'", precheck + 1, check.c_str());
-        Sleep(2000);
-    }
+// Fetch uitest version + device SO md5 once per connection (cached). Called by
+// setup_grpc_stream before building the candidate list, and reused by every
+// capture-tier attempt of start_uitest_with_extension.
+void ScreenCapture::query_device_facts() {
+    if (version_queried_) return;
 
     std::string ver_raw;
     {
@@ -295,7 +415,6 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
         }
     }
 
-    std::string device_md5;
     {
         for (int attempt = 0; attempt < 3; attempt++) {
             std::string md5_output;
@@ -309,12 +428,34 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
             }
             auto pos = md5_output.find(' ');
             if (pos == std::string::npos) pos = md5_output.find('\t');
-            if (pos != std::string::npos) device_md5 = md5_output.substr(0, pos);
-            while (!device_md5.empty() && (device_md5.back() == '\r' || device_md5.back() == '\n'))
-                device_md5.pop_back();
+            if (pos != std::string::npos) cached_device_md5_ = md5_output.substr(0, pos);
+            while (!cached_device_md5_.empty() && (cached_device_md5_.back() == '\r' || cached_device_md5_.back() == '\n'))
+                cached_device_md5_.pop_back();
             break;
         }
     }
+
+    version_queried_ = true;
+    LOGI("uitest version: '%s', device_md5: '%s'", uitest_version_.c_str(), cached_device_md5_.c_str());
+}
+
+bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
+    hdc_.ensure_connected();
+
+    for (int precheck = 0; precheck < 3; precheck++) {
+        std::string check;
+        hdc_.shell_command("echo ok", &check, 3);
+        if (check.find("ok") != std::string::npos) break;
+        LOGW("hdc not ready (attempt %d/3): '%s'", precheck + 1, check.c_str());
+        Sleep(2000);
+    }
+
+    // Query uitest version + device SO md5 only once per connection. The capture
+    // ladder calls this per tier; caching avoids ~6 hdc shell round-trips per tier
+    // and speeds up descent (e.g. 51001 old-arch: ~25s → ~5s).
+    query_device_facts();
+
+    const std::string &device_md5 = cached_device_md5_;
 
     std::string ps_output;
     {
@@ -328,8 +469,6 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
             }
         }
     }
-
-    LOGI("uitest version: '%s', device_md5: '%s'", uitest_version_.c_str(), device_md5.c_str());
 
     // use_abstract_socket_ will be set after SO selection based on which SO is deployed.
     // HOScrcpy determines socket mode by the actual SO type, not just uitest version:
@@ -364,7 +503,21 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
     // When MD5 matches a normal SO on a uitest < 6.0.2.1 device, HOScrcpy switches
     // to TCP mode — the SO variant determines the socket mode, not just uitest version.
     bool is_sec_so = local_so.find("unix_6") != std::string::npos;
+    // 7.0 SO: WebSocket channel over TCP port 5000 (HOScrcpy 2.13 behavior).
+    // The 7.0 SO parses soName main version >= 7 → isWebSocketSo → WebSocket channel.
+    bool is_ws_so = local_so.find("7.0-") != std::string::npos;
+    // Emulator SO (cloud device): listens on TCP 5000 with gRPC (verified on
+    // old-arch cloud phones — /proc/net/unix shows no scrcpy abstract socket,
+    // netstat shows tcp6 :::5000 LISTEN). It is NOT WebSocket and NOT abstract.
+    bool is_emulator_so = local_so.find("emulator") != std::string::npos;
+    use_emulator_so_ = is_emulator_so;
     use_abstract_socket_ = is_sec_so;
+    use_webSocket_ = is_ws_so;
+    // Emulator SO uses TCP 5000 + gRPC (not WebSocket, not abstract socket)
+    if (is_emulator_so) {
+        use_abstract_socket_ = false;
+        use_webSocket_ = false;
+    }
 
     // Fallback: if uitest version is unknown but the device already has an abstract
     // socket from a previous session, prefer abstract socket mode. This handles the
@@ -380,7 +533,8 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
     }
 
     LOGI("use_abstract_socket: %s (based on SO type: %s)", use_abstract_socket_ ? "true" : "false",
-         is_sec_so ? "sec SO (abstract socket)" : "normal SO (TCP)");
+         is_sec_so ? "sec SO (abstract socket)" : (is_emulator_so ? "emulator SO (TCP 5000)" : "normal SO (TCP)"));
+    LOGI("use_webSocket: %s (7.0 SO → WebSocket channel)", use_webSocket_ ? "true" : "false");
 
     std::string local_md5 = get_local_so_md5(local_so);
     bool so_up_to_date = !device_md5.empty() && (local_md5 == device_md5);
@@ -488,14 +642,19 @@ bool ScreenCapture::wait_for_extension_ready() {
                 extension_ready = true;
                 break;
             }
-            // Fallback: check if extension process is running and abstract socket exists
-            hdc_.shell_command("cat /proc/net/unix", &check, 3);
-            if (!running_) return false;
-            if (check.find(kGrpcSocketName) != std::string::npos) {
-                LOGI("uitest extension ready (abstract socket fallback) after %d ms", (i + 1) * 100);
-                use_abstract_socket_ = true;
-                extension_ready = true;
-                break;
+            // Fallback: check if extension process is running and abstract socket exists.
+            // 7.0 SO (WebSocket) and emulator SO both use TCP 5000 — neither creates
+            // the scrcpy_grpc_socket abstract socket, so skip this fallback (would
+            // wrongly flip use_abstract_socket_ to true if a stale socket lingers).
+            if (!use_webSocket_ && !use_emulator_so_) {
+                hdc_.shell_command("cat /proc/net/unix", &check, 3);
+                if (!running_) return false;
+                if (check.find(kGrpcSocketName) != std::string::npos) {
+                    LOGI("uitest extension ready (abstract socket fallback) after %d ms", (i + 1) * 100);
+                    use_abstract_socket_ = true;
+                    extension_ready = true;
+                    break;
+                }
             }
             // Final fallback: if extension process exists after a reasonable wait,
             // assume it's ready (netstat may be unreliable on some HarmonyOS versions)
@@ -516,6 +675,28 @@ bool ScreenCapture::wait_for_extension_ready() {
                     LOGI("uitest extension ready (process detected, netstat unreliable) after %d ms", (i + 1) * 100);
                     extension_ready = true;
                     break;
+                }
+            }
+            // Fast-fail: after ~1s (i==9), if the socket never appeared AND no
+            // extension process exists, the SO failed to load (typical for an
+            // incompatible SO variant). Skip the remaining ~2s of polling so the
+            // ladder can move to the next tier quickly.
+            if (i == 9) {
+                std::string ps_fast;
+                hdc_.shell_command("ps -ef", &ps_fast, 3);
+                if (!running_) return false;
+                std::istringstream pfss(ps_fast);
+                bool ext_alive = false;
+                while (std::getline(pfss, nline)) {
+                    if (nline.find("extension-name") != std::string::npos &&
+                        nline.find("grep") == std::string::npos) {
+                        ext_alive = true;
+                        break;
+                    }
+                }
+                if (!ext_alive) {
+                    LOGW("Extension process not alive after 1s (SO load failed?), fast-failing this tier");
+                    return false;
                 }
             }
         }
@@ -602,6 +783,22 @@ bool ScreenCapture::setup_port_forward() {
     return true;
 }
 
+// Remove both local forwards (video + control). Used between capture-tier
+// attempts so each tier starts with a clean forward state.
+void ScreenCapture::cleanup_forward_ports() {
+    if (local_video_port_ > 0) {
+        hdc_.forward_remove(local_video_port_, use_abstract_socket_,
+                            use_abstract_socket_ ? kGrpcSocketName : "");
+        local_video_port_ = 0;
+    }
+    if (local_control_port_ > 0) {
+        hdc_.forward_remove(local_control_port_, use_abstract_socket_,
+                            use_abstract_socket_ ? kUitestSocketName : "");
+        local_control_port_ = 0;
+    }
+    local_base_port_ = 0;
+}
+
 bool ScreenCapture::setup_grpc_stream(bool force_restart) {
     LOGI("setup_grpc_stream: serial='%s'%s", hdc_.serial().c_str(), force_restart ? " (force_restart)" : "");
 
@@ -613,43 +810,117 @@ bool ScreenCapture::setup_grpc_stream(bool force_restart) {
         return false;
     }
 
-    if (!start_uitest_with_extension(force_restart)) {
-        LOGE("Failed to start uitest with extension");
+    // Priority ladder (strict order, best first):
+    //   1. 7.0 SO — WebSocket virtual screen (HOScrcpy 2.13 behavior)
+    //   2. 6.x unix SOs — gRPC virtual screen (abstract socket)
+    //   3. emulator SO — cloud-device main-screen output (gRPC over TCP 5000)
+    //   4. caller falls back to snapshot_display if all fail
+    // Fetch device facts (uitest version + SO md5) once, cached and reused by
+    // every capture-tier attempt.
+    query_device_facts();
+
+    std::vector<std::string> candidates = build_so_candidates(cached_device_md5_);
+    if (candidates.empty()) {
+        LOGE("No server SO candidates found in %s", server_dir_.c_str());
         return false;
     }
 
-    if (!setup_port_forward()) {
-        LOGE("Failed to setup port forward");
-        return false;
-    }
+    for (size_t tier = 0; tier < candidates.size(); tier++) {
+        if (!running_) return false;
+        const std::string &so_path = candidates[tier];
 
-    bool connected = false;
-    grpc_client_.set_idle_timeout_sec(AppConfig::instance().idle_timeout_sec);
-    for (int retry = 0; retry < 5; retry++) {
-        LOGI("gRPC connect attempt %d to 127.0.0.1:%u", retry + 1, local_video_port_);
-        if (grpc_client_.connect("127.0.0.1", local_video_port_)) {
-            connected = true;
-            LOGI("gRPC connected successfully");
-            break;
+        // Force this SO for start_uitest_with_extension's selection
+        forced_so_path_ = so_path;
+        use_webSocket_ = false;
+        use_abstract_socket_ = false;  // reset; set by start_uitest_with_extension
+        use_emulator_so_ = false;      // reset; set by start_uitest_with_extension
+
+        LOGI("Trying capture tier %zu/%zu: %s", tier + 1, candidates.size(),
+             so_path.substr(so_path.find_last_of("\\/") + 1).c_str());
+
+        if (!start_uitest_with_extension(force_restart || tier > 0)) {
+            LOGE("Tier %zu: failed to start uitest extension with %s", tier + 1,
+                 so_path.substr(so_path.find_last_of("\\/") + 1).c_str());
+            forced_so_path_.clear();
+            continue;
         }
-        if (retry == 1) {
-            LOGI("Retrying uitest extension start...");
-            hdc_.shell_command(build_extension_cmd(), nullptr, 5);
-            Sleep(1000);
-        } else {
-            Sleep(500);
+        forced_so_path_.clear();
+
+        // WebSocket channel for 7.0 SO
+        if (use_webSocket_) {
+            if (!setup_port_forward()) {
+                LOGE("Tier %zu: failed to setup port forward for WebSocket", tier + 1);
+                continue;
+            }
+
+            bool connected = false;
+            for (int retry = 0; retry < 5; retry++) {
+                LOGI("WebSocket connect attempt %d to 127.0.0.1:%u (tier %zu)",
+                     retry + 1, local_video_port_, tier + 1);
+                if (webSocket_client_.connect("127.0.0.1", local_video_port_)) {
+                    connected = true;
+                    LOGI("WebSocket connected successfully");
+                    break;
+                }
+                if (retry == 1) {
+                    LOGI("Retrying uitest extension start...");
+                    hdc_.shell_command(build_extension_cmd(), nullptr, 5);
+                    Sleep(1000);
+                } else {
+                    Sleep(500);
+                }
+            }
+
+            if (connected) {
+                mode_ = CaptureMode::kWebSocketStream;
+                LOGI("WebSocket stream setup complete (tier %zu), starting streaming", tier + 1);
+                return true;
+            }
+
+            LOGW("WebSocket connect failed (tier %zu), trying next tier", tier + 1);
+            webSocket_client_.disconnect();
+            cleanup_forward_ports();
+            continue;
         }
+
+        // gRPC channel (6.x unix SOs + emulator SO)
+        if (!setup_port_forward()) {
+            LOGE("Tier %zu: failed to setup port forward for gRPC", tier + 1);
+            continue;
+        }
+
+        bool connected = false;
+        grpc_client_.set_idle_timeout_sec(AppConfig::instance().idle_timeout_sec);
+        for (int retry = 0; retry < 5; retry++) {
+            LOGI("gRPC connect attempt %d to 127.0.0.1:%u (tier %zu)",
+                 retry + 1, local_video_port_, tier + 1);
+            if (grpc_client_.connect("127.0.0.1", local_video_port_)) {
+                connected = true;
+                LOGI("gRPC connected successfully");
+                break;
+            }
+            if (retry == 1) {
+                LOGI("Retrying uitest extension start...");
+                hdc_.shell_command(build_extension_cmd(), nullptr, 5);
+                Sleep(1000);
+            } else {
+                Sleep(500);
+            }
+        }
+
+        if (connected) {
+            mode_ = CaptureMode::kGrpcStream;
+            LOGI("gRPC stream setup complete (tier %zu), starting streaming", tier + 1);
+            return true;
+        }
+
+        LOGW("gRPC connect failed (tier %zu), trying next tier", tier + 1);
+        grpc_client_.disconnect();
+        cleanup_forward_ports();
     }
 
-    if (!connected) {
-        LOGE("Failed to connect gRPC server after retries");
-        return false;
-    }
-
-    mode_ = CaptureMode::kGrpcStream;
-    LOGI("gRPC stream setup complete, starting streaming");
-
-    return true;
+    LOGE("All capture tiers failed (7.0 WebSocket, 6.x gRPC, emulator gRPC)");
+    return false;
 }
 
 bool ScreenCapture::setup_snapshot_fallback() {
@@ -705,6 +976,7 @@ bool ScreenCapture::start() {
     if (!grpc_ok) {
         LOGW("gRPC stream failed, falling back to snapshot_display mode");
         grpc_client_.disconnect();
+        webSocket_client_.disconnect();
         if (local_video_port_ > 0) {
             hdc_.forward_remove(local_video_port_, use_abstract_socket_,
                                 use_abstract_socket_ ? kGrpcSocketName : "");
@@ -722,7 +994,7 @@ bool ScreenCapture::start() {
         }
     }
 
-    if (mode_ == CaptureMode::kGrpcStream && grpc_ok) {
+    if ((mode_ == CaptureMode::kGrpcStream || mode_ == CaptureMode::kWebSocketStream) && grpc_ok) {
         running_ = true;
         got_stream_data_ = false;
         // Initialize frame pool (3-buffer) - lazy allocation:
@@ -732,14 +1004,22 @@ bool ScreenCapture::start() {
         }
         pool_idx_ = 0;
         if (!frame_event_) frame_event_ = CreateEventA(NULL, FALSE, FALSE, NULL);
-        thread_ = std::thread(&ScreenCapture::grpc_stream_loop, this);
+        if (mode_ == CaptureMode::kWebSocketStream) {
+            thread_ = std::thread(&ScreenCapture::webSocket_stream_loop, this);
+        } else {
+            thread_ = std::thread(&ScreenCapture::grpc_stream_loop, this);
+        }
 
         uint64_t frames_before = frame_count_.load();
 
         for (int i = 0; i < 30 && frame_count_.load() == frames_before; i++) {
             if (i == 3 && frame_count_.load() == frames_before) {
                 LOGI("No frame after 300ms, requesting IDR frame...");
-                grpc_client_.request_idr_frame();
+                if (use_webSocket_) {
+                    webSocket_client_.request_idr_frame();
+                } else {
+                    grpc_client_.request_idr_frame();
+                }
             }
             if (i == 8 && frame_count_.load() == frames_before) {
                 LOGI("No frame after 800ms, sending screen wakeup trigger...");
@@ -749,7 +1029,11 @@ bool ScreenCapture::start() {
             }
             if (i == 18 && frame_count_.load() == frames_before) {
                 LOGI("No frame after 1800ms, retrying IDR + trigger...");
-                grpc_client_.request_idr_frame();
+                if (use_webSocket_) {
+                    webSocket_client_.request_idr_frame();
+                } else {
+                    grpc_client_.request_idr_frame();
+                }
                 hdc_.shell_command("uinput -M -m 200 200 100 100 --trace", nullptr, 5);
             }
             if (frame_event_) WaitForSingleObject(frame_event_, 100);
@@ -773,6 +1057,8 @@ bool ScreenCapture::start() {
     if (!frame_event_) frame_event_ = CreateEventA(NULL, FALSE, FALSE, NULL);
     if (mode_ == CaptureMode::kGrpcStream) {
         thread_ = std::thread(&ScreenCapture::grpc_stream_loop, this);
+    } else if (mode_ == CaptureMode::kWebSocketStream) {
+        thread_ = std::thread(&ScreenCapture::webSocket_stream_loop, this);
     } else {
         thread_ = std::thread(&ScreenCapture::snapshot_loop, this);
     }
@@ -785,6 +1071,7 @@ void ScreenCapture::stop() {
     if (thread_.joinable()) thread_.join();
 
     grpc_client_.disconnect();
+    webSocket_client_.disconnect();
     decoder_.cleanup();
 
     if (frame_event_) { CloseHandle(frame_event_); frame_event_ = nullptr; }
@@ -920,6 +1207,302 @@ bool ScreenCapture::reconnect_grpc_stream() {
     }
 
     LOGI("gRPC reconnected successfully");
+    return true;
+}
+
+// ============================================================
+// WebSocket stream loop (7.0 SO)
+// Mirrors grpc_stream_loop but drives WebSocketClient. The client's
+// receiver thread calls on_frame per decoded H264 frame; this loop
+// waits on frame_event_ and performs the same stall detection,
+// hdc reachability checks, and reconnection as the gRPC path.
+// ============================================================
+void ScreenCapture::webSocket_stream_loop() {
+    LOGI("WebSocket stream loop started");
+
+    auto on_frame = [this](const uint8_t *data, size_t size) {
+        got_stream_data_ = true;
+
+        bool ok = decoder_.decode(data, size);
+        if (!ok) {
+            if (size > 100) {
+                LOGW("Decode fail (%zu bytes): %02x %02x %02x %02x %02x %02x %02x %02x",
+                     size, data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
+            }
+            return;
+        }
+
+        auto &img = decoder_.image();
+        if (img.width == 0 || img.height == 0) return;
+
+        uint32_t w = img.width, h = img.height;
+
+        auto &frame = frame_pool_[pool_idx_];
+        if (frame.use_count() > 1) {
+            frame = std::make_shared<DecodedImage>();
+        }
+        std::swap(*frame, decoder_.image_ref());
+        decoder_.rebind_rgb_pointer();
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            latest_frame_ = frame;
+        }
+        pool_idx_ = (pool_idx_ + 1) % 3;
+
+        if (w != width_.load() || h != height_.load()) {
+            width_ = w;
+            height_ = h;
+            LOGI("Screen resolution changed: %ux%u", w, h);
+        }
+        frame_count_++;
+        if (frame_event_) SetEvent(frame_event_);
+        if (notify_hwnd_) PostMessageA(notify_hwnd_, kMsgFrameRender, 0, 0);
+    };
+
+    if (!webSocket_client_.start_streaming(on_frame)) {
+        LOGE("Failed to start WebSocket streaming");
+        running_ = false;
+        return;
+    }
+
+    LOGI("WebSocket streaming started (start command sent)");
+
+    int reconnect_attempts = 0;
+    int hdc_check_counter = 0;
+
+    uint64_t stall_frame_count = frame_count_.load();
+    int stall_counter = 0;
+    const int kFrameStallLimit = 30;  // 30 * 500ms = 15s
+    int stall_reconnect_count = 0;
+    const int kMaxStallReconnects = 3;
+    int healthy_frame_counter = 0;
+    const int kHealthyFrameThreshold = 60;  // 60 * 500ms = 30s
+
+    while (running_) {
+        while (running_ && webSocket_client_.is_connected() && webSocket_client_.is_streaming_active()) {
+            if (frame_event_) {
+                WaitForSingleObject(frame_event_, 500);
+            } else {
+                Sleep(500);
+            }
+
+            if (frame_count_.load() > stall_frame_count) {
+                stall_frame_count = frame_count_.load();
+                stall_counter = 0;
+                healthy_frame_counter++;
+                if (healthy_frame_counter >= kHealthyFrameThreshold) {
+                    if (stall_reconnect_count > 0) {
+                        LOGI("Frames flowing for 30s, resetting stall reconnect count");
+                    }
+                    stall_reconnect_count = 0;
+                    healthy_frame_counter = 0;
+                }
+            } else {
+                stall_counter++;
+                healthy_frame_counter = 0;
+                if (stall_counter >= kFrameStallLimit) {
+                    stall_reconnect_count++;
+                    if (stall_reconnect_count >= kMaxStallReconnects) {
+                        if (hdc_.is_device_reachable()) {
+                            LOGW("Stall limit reached but device still reachable via hdc, "
+                                 "continuing reconnect attempts");
+                            break;
+                        }
+                        LOGE("Device disconnected (no frames after %d stall reconnects)",
+                             stall_reconnect_count);
+                        if (notify_hwnd_) {
+                            PostMessageA(notify_hwnd_, kMsgDeviceDisconnected, 0, 0);
+                        }
+                        running_ = false;
+                        break;
+                    } else {
+                        LOGW("No new frames for %ds, triggering stall reconnect (%d/%d)",
+                             kFrameStallLimit / 2, stall_reconnect_count, kMaxStallReconnects);
+                        break;
+                    }
+                }
+            }
+
+            // Periodic hdc reachability check (same cadence as gRPC path)
+            hdc_check_counter++;
+            int hdc_check_interval = hdc_.is_tcp() ? 10 : 20;
+            if (hdc_check_counter >= hdc_check_interval) {
+                hdc_check_counter = 0;
+                if (!hdc_.is_device_reachable()) {
+                    if (hdc_.is_tcp() && hdc_.try_reconnect_new_port()) {
+                        LOGI("Device reconnected with new port during streaming, triggering WS reconnect");
+                        break;
+                    }
+                    LOGE("Device disconnected (hdc unreachable during streaming)");
+                    if (notify_hwnd_) {
+                        PostMessageA(notify_hwnd_, kMsgDeviceDisconnected, 0, 0);
+                    }
+                    running_ = false;
+                    break;
+                }
+            }
+        }
+
+        if (!running_) break;
+
+        reconnecting_ = true;
+        if (notify_hwnd_) {
+            PostMessageA(notify_hwnd_, kMsgReconnecting,
+                         static_cast<WPARAM>(reconnect_attempts + 1),
+                         static_cast<LPARAM>(max_grpc_reconnect_));
+        }
+
+        if (!webSocket_client_.is_connected() || !webSocket_client_.is_streaming_active()) {
+            LOGW("WS stream disconnected (connected=%d, streaming=%d), attempting reconnect (%d/%d)",
+                 webSocket_client_.is_connected(), webSocket_client_.is_streaming_active(),
+                 reconnect_attempts + 1, max_grpc_reconnect_);
+        }
+
+        webSocket_client_.stop_streaming();
+
+        if (reconnect_attempts >= max_grpc_reconnect_) {
+            LOGE("Max reconnect attempts reached, giving up");
+            break;
+        }
+
+        reconnect_attempts++;
+
+        if (!reconnect_webSocket_stream()) {
+            LOGE("Reconnect failed (attempt %d/%d)", reconnect_attempts, max_grpc_reconnect_);
+
+            if (!hdc_.is_device_reachable()) {
+                if (hdc_.is_tcp() && hdc_.try_reconnect_new_port()) {
+                    LOGI("Device reconnected with new port, retrying WS reconnection");
+                    continue;
+                }
+                LOGE("Device disconnected (hdc unreachable), stopping reconnection");
+                if (notify_hwnd_) {
+                    PostMessageA(notify_hwnd_, kMsgDeviceDisconnected, 0, 0);
+                }
+                break;
+            }
+
+            if (reconnect_attempts >= max_grpc_reconnect_) break;
+            Sleep(1000);
+            continue;
+        }
+
+        if (!webSocket_client_.start_streaming(on_frame)) {
+            LOGE("Failed to restart streaming after reconnect");
+            Sleep(1000);
+            continue;
+        }
+
+        LOGI("WS streaming restarted after reconnect (attempt %d)", reconnect_attempts);
+
+        uint64_t frames_before = frame_count_.load();
+        webSocket_client_.request_idr_frame();
+
+        for (int i = 0; i < 30 && running_ && frame_count_.load() == frames_before; i++) {
+            Sleep(100);
+        }
+
+        if (frame_count_.load() > frames_before) {
+            LOGI("Reconnect successful, frames flowing again");
+            reconnect_attempts = 0;
+            reconnecting_ = false;
+        } else {
+            LOGW("Reconnect: no frames after 3s, will retry");
+        }
+    }
+
+    webSocket_client_.stop_streaming();
+    reconnecting_ = false;
+    running_ = false;
+    LOGI("WebSocket stream loop ended, frames: %llu", (unsigned long long)frame_count_.load());
+
+    if (notify_hwnd_) {
+        PostMessageA(notify_hwnd_, kMsgStreamEnded, 0, 0);
+    }
+}
+
+bool ScreenCapture::reconnect_webSocket_stream() {
+    LOGI("Attempting WebSocket reconnection...");
+
+    if (!hdc_.is_device_reachable()) {
+        if (hdc_.is_tcp() && hdc_.try_reconnect_new_port()) {
+            LOGI("Device reconnected with new port, continuing reconnection");
+        } else {
+            LOGE("Reconnect: device is not reachable via hdc (TCP connection may be lost)");
+            return false;
+        }
+    }
+    if (!running_) return false;
+
+    if (hdc_.is_tcp()) {
+        if (!hdc_.ensure_connected()) {
+            LOGE("Reconnect: failed to re-establish hdc connection");
+            return false;
+        }
+    }
+    if (!running_) return false;
+
+    webSocket_client_.disconnect();
+    Sleep(500);
+    if (!running_) return false;
+
+    uint16_t old_video_port = local_video_port_;
+    uint16_t old_control_port = local_control_port_;
+
+    if (local_video_port_ > 0) {
+        hdc_.forward_remove(local_video_port_, use_abstract_socket_,
+                            use_abstract_socket_ ? kGrpcSocketName : "");
+        local_video_port_ = 0;
+    }
+    if (local_control_port_ > 0) {
+        hdc_.forward_remove(local_control_port_, use_abstract_socket_,
+                            use_abstract_socket_ ? kUitestSocketName : "");
+        local_control_port_ = 0;
+    }
+    if (!running_) return false;
+
+    hdc_.cleanup_stale_forwards({old_video_port, old_control_port});
+    Sleep(300);
+    if (!running_) return false;
+
+    kill_uitest_extension();
+    if (!running_) return false;
+    hdc_.shell_command(build_extension_cmd(), nullptr, 5);
+    if (!running_) return false;
+
+    if (!wait_for_extension_ready()) {
+        LOGE("Reconnect: uitest extension failed to start");
+        return false;
+    }
+    if (!running_) return false;
+
+    Sleep(1000);
+    if (!running_) return false;
+
+    if (!setup_port_forward()) {
+        LOGE("Reconnect: failed to setup port forward");
+        return false;
+    }
+    if (!running_) return false;
+
+    bool connected = false;
+    for (int retry = 0; retry < 3; retry++) {
+        if (!running_) return false;
+        LOGI("Reconnect WS attempt %d to 127.0.0.1:%u", retry + 1, local_video_port_);
+        if (webSocket_client_.connect("127.0.0.1", local_video_port_)) {
+            connected = true;
+            break;
+        }
+        Sleep(500);
+    }
+
+    if (!connected) {
+        LOGE("Reconnect: failed to connect WebSocket server");
+        return false;
+    }
+
+    LOGI("WebSocket reconnected successfully");
     return true;
 }
 

@@ -6,8 +6,11 @@ Windows 端鸿蒙设备投屏控制工具，Base On [HOScrcpy](https://gitcode.c
 
 ## 功能特性
 
-- **H264 实时投屏**：通过 gRPC 虚拟屏流 + nghttp2 + FFmpeg 硬解，低延迟实时画面
-- **JPEG 快照回退**：无 FFmpeg 时自动降级为 `snapshot_display` 模式（~2 FPS）
+- **H264 实时投屏**：多级出流链路（见"投屏链路"），低延迟实时画面
+  - **7.0 SO → WebSocket 虚拟屏**：新版 SO 走 RFC6455 WebSocket 通道（HOScrcpy 2.13 行为）
+  - **6.x SO → gRPC 虚拟屏**：nghttp2 + FFmpeg 硬解
+  - **emulator SO → 云手机主屏**：云设备（CPH）主屏输出，gRPC abstract socket
+- **JPEG 快照回退**：以上出流全部失败时降级为 `snapshot_display` 模式（~2 FPS）
 - **Direct2D 渲染**：优先使用 D2D 硬件加速渲染，GDI 回退；零拷贝解码 + 帧池复用
 - **UI 布局检查**：实时查看设备 UI 组件树，点击节点高亮定位，支持搜索/刷新/展开，可拖拽分割线调整面板
 - **触控反控**：点击、长按、滑动、鼠标滚轮；双通道 touchUp 保证释放；鼠标拖出画面自动释放
@@ -37,23 +40,24 @@ Windows 端鸿蒙设备投屏控制工具，Base On [HOScrcpy](https://gitcode.c
 │  │       │            │                │              │  │
 │  │  ┌────┴────────────┴────────────────┴──────────┐   │  │
 │  │  │            ScreenCapture                     │   │  │
-│  │  │  ┌──────────────┐  ┌─────────────────────┐  │   │  │
-│  │  │  │ gRPC Stream  │  │ Snapshot Fallback   │  │   │  │
-│  │  │  │ (nghttp2)    │  │ (JPEG/GDI+)         │  │   │  │
-│  │  │  └──────────────┘  └─────────────────────┘  │   │  │
+│  │  │  ┌──────────────┐ ┌─────────────┐ ┌────────┐│   │  │
+│  │  │  │ WebSocket    │ │ gRPC Stream │ │ Snapshot││   │  │
+│  │  │  │ (7.0 SO)     │ │ (6.x SO)    │ │ Fallback││   │  │
+│  │  │  └──────────────┘ └─────────────┘ └────────┘│   │  │
 │  │  └─────────────────────────────────────────────┘   │  │
 │  └────────────────────────────────────────────────────┘  │
-│         │ gRPC (H264)       │ uitest socket (control)    │
-│    ┌────┴───────────────────┴──────────┐                 │
-│    │         hdc fport forward         │                 │
-│    └────────────┬──────────────────────┘                 │
+│    │ WebSocket (H264) │ gRPC (H264) │ uitest socket (ctrl)│
+│    ┌─────────────────────────┴──────────────┐            │
+│    │         hdc fport forward              │            │
+│    └────────────┬───────────────────────────┘            │
 └─────────────────┼────────────────────────────────────────┘
                   │ USB / TCP
 ┌─────────────────┼────────────────────────────────────────┐
 │            HarmonyOS Device                              │
 │  ┌──────────────┴──────────────────────────────────┐    │
 │  │  uitest extension (libscreen_casting.z.so)       │    │
-│  │  VirtualScreen → H264 encode → gRPC stream       │    │
+│  │  VirtualScreen → H264 encode → WebSocket/gRPC    │    │
+│  │  (SO 版本决定通道: >=7.0 WebSocket, 6.x gRPC)      │    │
 │  └──────────────────────────────────────────────────┘    │
 │  ┌──────────────────────────────────────────────────┐    │
 │  │  uitest agent (agent.so)                          │    │
@@ -173,8 +177,9 @@ hscrcpy.exe -s 192.168.1.100:5555
 hscrcpy/
 ├── src/                    # 源代码
 │   ├── main.cpp            # Win32 GUI 主程序
-│   ├── screen_capture.cpp  # 投屏核心（gRPC 流 / 快照回退）
-│   ├── grpc_client.cpp     # nghttp2 + gRPC 客户端
+│   ├── screen_capture.cpp  # 投屏核心（WebSocket/gRPC 流 / 快照回退）
+│   ├── grpc_client.cpp     # nghttp2 + gRPC 客户端（6.x SO 通道）
+│   ├── websocket_client.cpp# RFC6455 WebSocket 客户端（7.0 SO 通道）
 │   ├── h264_decoder.cpp    # FFmpeg H264 解码（条件编译）
 │   ├── jpeg_decoder.cpp    # GDI+ JPEG 解码（回退模式）
 │   ├── input_injector.cpp  # 输入注入（uitest socket / shell，异步队列）
@@ -194,7 +199,7 @@ hscrcpy/
 │   ├── toolbar/            # 工具栏按钮图标
 │   └── file-manager/       # 文件管理器图标
 ├── server/                 # 设备端二进制
-│   ├── libscrcpy_server*.z.so  # uitest 扩展（虚拟屏 H264 编码）
+│   ├── libscrcpy_server*.z.so  # uitest 扩展（7.0=WebSocket, 6.x=gRPC, emulator=云主屏）
 │   └── uitest_agent*.so        # uitest agent（输入注入）
 ├── ffmpeg/                 # FFmpeg 开发文件（可选，需自行下载）
 ├── CMakeLists.txt          # CMake 构建配置
@@ -207,6 +212,18 @@ hscrcpy/
 
 ### 投屏链路
 
-1. 通过 `hdc shell` 推送并启动 uitest 扩展（`libscreen_casting.z.so`）
-2. 扩展创建 VirtualScreen，绑定 H264 编码器，通过 gRPC SERVER_STREAMING 推流
-3. 客户端通过 `hdc fport` 端口转发连接 gRPC，nghttp2 处理 HTTP/
+出流采用**多级优先级阶梯**（与 HOScrcpy 2.13 对齐），按顺序尝试，成功后即停止：
+
+```
+tier 1: 7.0 SO → WebSocket 虚拟屏    （RFC6455, TCP 5000 forward）
+tier 2: 6.x SO → gRPC 虚拟屏         （abstract socket scrcpy_grpc_socket, nghttp2）
+tier 3: emulator SO → 云手机主屏      （gRPC over TCP 5000）
+        ※ 云设备(CPH)+老架构(uitest<6.0.2.1)时 emulator 提前到 non-sec 之前
+        （老架构上 server1/2/3 连接成功但 0 帧, emulator 才能出流）
+tier 4: 全部失败 → snapshot_display 截图模式（~2 FPS）
+```
+
+1. 通过 `hdc shell` 推送并启动 uitest 扩展（`libscreen_casting.z.so`），SO 版本决定通道：
+   - **7.0 SO**：扩展监听 TCP 5000，客户端发 `{"type":"start"}` 等文本命令，收到 `started` 后开始收 4 字节大端长度前缀的 H264 二进制帧（WebSocket 通道）
+   - **6.x / emulator SO**：扩展创建 `scrcpy_grpc_socket` abstract socket，gRPC SERVER_STREAMING 推流
+2. 客户端通过 `hdc fport` 端口转发连接，nghttp2 处理 HTTP/

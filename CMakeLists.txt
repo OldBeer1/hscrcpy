@@ -15,6 +15,7 @@ add_executable(hscrcpy WIN32
     src/h264_decoder.cpp
     src/jpeg_decoder.cpp
     src/grpc_client.cpp
+    src/websocket_client.cpp
     src/window_renderer.cpp
     src/cli.cpp
     src/config.cpp
@@ -44,27 +45,26 @@ target_include_directories(hscrcpy PRIVATE
     ${FFMPEG_ROOT}/include
 )
 
-# Prefer .dll files directly (avoids dlltool .def issue)
-# MinGW GCC can link directly against .dll files
-# The package must have bin/*.dll with the actual shared libraries
+# Prefer .dll.a import libs (avoids MinGW direct-DLL auto-import issues,
+# e.g. av_base64_encode not resolved from the export table).
 set(FFMPEG_BIN "${FFMPEG_ROOT}/bin")
 set(FFMPEG_LIB "${FFMPEG_ROOT}/lib")
 
-# Try direct DLL linking first
-file(GLOB AVCODEC_DLL "${FFMPEG_BIN}/avcodec-*.dll")
-file(GLOB AVUTIL_DLL  "${FFMPEG_BIN}/avutil-*.dll")
-file(GLOB SWSCALE_DLL "${FFMPEG_BIN}/swscale-*.dll")
+find_library(AVCODEC_LIB avcodec.dll.a PATHS "${FFMPEG_LIB}" NO_DEFAULT_PATH)
+find_library(AVUTIL_LIB  avutil.dll.a  PATHS "${FFMPEG_LIB}" NO_DEFAULT_PATH)
+find_library(SWSCALE_LIB swscale.dll.a PATHS "${FFMPEG_LIB}" NO_DEFAULT_PATH)
 
-if(AVCODEC_DLL AND AVUTIL_DLL AND SWSCALE_DLL)
-    list(GET AVCODEC_DLL 0 AVCODEC_LIB)
-    list(GET AVUTIL_DLL 0 AVUTIL_LIB)
-    list(GET SWSCALE_DLL 0 SWSCALE_LIB)
-    message(STATUS "FFmpeg: linking via DLLs from ${FFMPEG_BIN}")
-else()
-    # Fallback: .dll.a import libs
-    find_library(AVCODEC_LIB avcodec.dll.a PATHS "${FFMPEG_LIB}" NO_DEFAULT_PATH)
-    find_library(AVUTIL_LIB  avutil.dll.a  PATHS "${FFMPEG_LIB}" NO_DEFAULT_PATH)
-    find_library(SWSCALE_LIB swscale.dll.a PATHS "${FFMPEG_LIB}" NO_DEFAULT_PATH)
+if(NOT AVCODEC_LIB OR NOT AVUTIL_LIB OR NOT SWSCALE_LIB)
+    # Fallback: link .dll files directly
+    file(GLOB AVCODEC_DLL "${FFMPEG_BIN}/avcodec-*.dll")
+    file(GLOB AVUTIL_DLL  "${FFMPEG_BIN}/avutil-*.dll")
+    file(GLOB SWSCALE_DLL "${FFMPEG_BIN}/swscale-*.dll")
+    if(AVCODEC_DLL AND AVUTIL_DLL AND SWSCALE_DLL)
+        list(GET AVCODEC_DLL 0 AVCODEC_LIB)
+        list(GET AVUTIL_DLL 0 AVUTIL_LIB)
+        list(GET SWSCALE_DLL 0 SWSCALE_LIB)
+        message(STATUS "FFmpeg: linking via DLLs from ${FFMPEG_BIN}")
+    endif()
 endif()
 
 if(NOT AVCODEC_LIB OR NOT AVUTIL_LIB OR NOT SWSCALE_LIB)

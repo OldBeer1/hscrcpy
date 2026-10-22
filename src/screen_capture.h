@@ -9,6 +9,7 @@
 
 #include "hdc_wrapper.h"
 #include "grpc_client.h"
+#include "websocket_client.h"
 #include "h264_decoder.h"
 #include "jpeg_decoder.h"
 #include "protocol.h"
@@ -26,7 +27,8 @@
 namespace hscrcpy {
 
 enum class CaptureMode {
-    kGrpcStream,
+    kGrpcStream,        // SO < 7.0: HTTP/2 gRPC channel (abstract socket)
+    kWebSocketStream,   // SO >= 7.0: RFC6455 WebSocket channel (TCP 5000)
     kSnapshotFallback,
 };
 
@@ -59,7 +61,10 @@ public:
     uint32_t width()  const { return width_; }
     uint32_t height() const { return height_; }
     bool running() const { return running_; }
-    bool grpc_connected() const { return running_ && grpc_client_.is_connected(); }
+    bool grpc_connected() const {
+        if (!running_) return false;
+        return use_webSocket_ ? webSocket_client_.is_connected() : grpc_client_.is_connected();
+    }
     bool is_reconnecting() const { return reconnecting_; }
     CaptureMode mode() const { return mode_; }
     uint64_t frame_count() const { return frame_count_; }
@@ -71,17 +76,24 @@ public:
 
 private:
     bool setup_grpc_stream(bool force_restart = false);
+    bool setup_webSocket_stream(bool force_restart = false);
     bool setup_snapshot_fallback();
     bool start_uitest_with_extension(bool force_restart = false);
+    void query_device_facts();  // uitest version + device SO md5 (cached, once per connection)
     bool wait_for_extension_ready();
     bool setup_port_forward();
+    void cleanup_forward_ports();
     bool reconnect_grpc_stream();
+    bool reconnect_webSocket_stream();
+    void grpc_stream_loop();
+    void webSocket_stream_loop();
     std::string get_local_so_md5(const std::string &filepath);
     std::string find_matching_so_with_md5(const std::string &device_md5);
+    std::vector<std::string> build_so_candidates(const std::string &device_md5);
+    bool is_cloud_device();
     std::string find_matching_agent_so();
     std::string build_extension_cmd() const;
     void kill_uitest_extension();
-    void grpc_stream_loop();
     void snapshot_loop();
     bool capture_one_snapshot();
 
@@ -100,13 +112,20 @@ private:
     HANDLE frame_event_ = nullptr;
 
     GrpcClient grpc_client_;
+    WebSocketClient webSocket_client_;
     H264Decoder decoder_;
     JpegDecoder jpeg_decoder_;
     uint16_t local_video_port_ = 0;
     uint16_t local_control_port_ = 0;
     uint16_t local_base_port_ = 0;
     bool use_abstract_socket_ = false;
+    bool use_webSocket_ = false;  // SO >= 7.0 → WebSocket channel
+    bool use_emulator_so_ = false;  // emulator SO → TCP 5000 gRPC (cloud main screen)
     uint16_t uitest_port_ = 5000;
+    std::string forced_so_path_;  // Non-empty: force this SO (emulator fallback)
+    // Cached device facts — queried once per connection (not per capture tier)
+    bool version_queried_ = false;      // uitest_version_ already fetched this connection
+    std::string cached_device_md5_;     // device SO md5, cached to avoid re-query per tier
     std::string uitest_version_;
     std::string server_dir_;
     int max_grpc_reconnect_ = 3;

@@ -182,7 +182,11 @@ if (-not (Test-Path "build\server")) {
         Write-Ok "server\ - copied"
     }
 } else {
-    Write-Ok "server\ - already exists"
+    # Sync new/updated SO files so newly added server variants appear in build\server
+    if (Test-Path "server") {
+        Copy-Item -Force "server\*" "build\server\" -ErrorAction SilentlyContinue
+        Write-Ok "server\ - updated"
+    }
 }
 
 if (-not (Test-Path "build\res")) {
