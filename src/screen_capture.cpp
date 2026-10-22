@@ -267,13 +267,14 @@ std::vector<std::string> ScreenCapture::build_so_candidates(const std::string &d
     // connect but produce 0 frames, while the emulator SO actually streams.
     bool cloud_device = is_cloud_device();
 
-    // Tier 1: 7.0 WebSocket (all devices — unconditional priority)
-    add_if_exists("libscrcpy_server_unix_7.0-20260930.z.so");
-
-    // Tier 2: 6.x unix SOs — gRPC virtual screen (abstract socket).
-    // These are SEC SOs; skip them on old devices (uitest < 6.0.2.1) where they
-    // cannot load — the non-sec variants below are the correct tier there.
+    // On old architecture (uitest < 6.0.2.1), 7.0 SO and 6.x sec SOs cannot
+    // load — skip them entirely and go straight to emulator (cloud) or non-sec
+    // (non-cloud). This avoids ~7s of wasted tier-1 polling on old-arch devices.
     if (prefer_sec) {
+        // Tier 1: 7.0 SO — WebSocket (TCP) or gRPC abstract socket (USB)
+        add_if_exists("libscrcpy_server_unix_7.0-20260930.z.so");
+
+        // Tier 2: 6.x unix SOs — gRPC virtual screen (abstract socket)
         add_if_exists("libscrcpy_server_unix_6.9-20260801.z.so");
         add_if_exists("libscrcpy_server_unix_6.8-20260801.z.so");
         add_if_exists("libscrcpy_server_unix_6.6-20260418.z.so");
@@ -281,7 +282,7 @@ std::vector<std::string> ScreenCapture::build_so_candidates(const std::string &d
         add_if_exists("libscrcpy_server_unix_6.4-20260113.z.so");
         add_if_exists("libscrcpy_server_unix_6.3.1-20260113.z.so");
     } else {
-        LOGI("uitest %s < 6.0.2.1, skipping 6.x sec SOs (non-sec gRPC tiers next)", uitest_version_.c_str());
+        LOGI("uitest %s < 6.0.2.1 (old arch), skipping 7.0 + 6.x sec SOs", uitest_version_.c_str());
     }
 
     // Tier 3: cloud-device main-screen output (emulator SO, TCP 5000 gRPC).
