@@ -610,7 +610,11 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
 
 bool ScreenCapture::wait_for_extension_ready() {
     bool extension_ready = false;
-    for (int i = 0; i < 30; i++) {
+    // Emulator SO is a 2.9MB large SO that takes 5-8s to load on old-arch cloud
+    // phones; the default 3s (30×100ms) timeout is too short and causes the
+    // tier to fail before the extension process even appears.
+    int max_polls = use_emulator_so_ ? 150 : 30;  // 15s for emulator, 3s otherwise
+    for (int i = 0; i < max_polls; i++) {
         Sleep(100);
         if (!running_) return false;
         std::string check;
@@ -681,7 +685,12 @@ bool ScreenCapture::wait_for_extension_ready() {
             // extension process exists, the SO failed to load (typical for an
             // incompatible SO variant). Skip the remaining ~2s of polling so the
             // ladder can move to the next tier quickly.
-            if (i == 9) {
+            // Skip fast-fail for emulator SO — it's a 2.9MB large SO that takes
+            // 5-6s to load on old-arch cloud phones; the process appears late but
+            // succeeds. Fast-failing here would skip the only working SO on those
+            // devices and fall through to non-sec SOs that connect but stream 0
+            // frames (black screen).
+            if (i == 9 && !use_emulator_so_) {
                 std::string ps_fast;
                 hdc_.shell_command("ps -ef", &ps_fast, 3);
                 if (!running_) return false;
@@ -703,8 +712,8 @@ bool ScreenCapture::wait_for_extension_ready() {
     }
 
     if (!extension_ready) {
-        LOGE("uitest extension failed to start (%s not listening after 3s)",
-             use_abstract_socket_ ? "abstract socket" : "port 5000");
+        LOGE("uitest extension failed to start (%s not listening after %ds)",
+             use_abstract_socket_ ? "abstract socket" : "port 5000", max_polls / 10);
 
         std::string ps_debug;
         hdc_.shell_command("ps -ef", &ps_debug, 3);
