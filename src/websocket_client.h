@@ -48,8 +48,11 @@ private:
     bool send_text(const std::string &msg);
     bool send_frame(uint8_t opcode, const uint8_t *payload, size_t len);
     // Reads one WebSocket frame header + payload from sock_.
+    // timeout_sec: per-recv select timeout. Use a short timeout during handshake
+    // (so outer deadline checks can fire); use a long timeout in receiver_loop
+    // so idle periods between frames don't falsely trigger reconnects.
     // Returns true on a complete frame; fills opcode/payload.
-    bool read_frame(uint8_t &opcode, std::vector<uint8_t> &payload);
+    bool read_frame(uint8_t &opcode, std::vector<uint8_t> &payload, int timeout_sec = 30);
     void reset_parser();
 
     int sock_ = -1;

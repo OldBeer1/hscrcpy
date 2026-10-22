@@ -286,9 +286,13 @@ bool WebSocketClient::send_text(const std::string &msg) {
 // Frame read (server → client, NOT masked)
 // ============================================================
 
-bool WebSocketClient::read_frame(uint8_t &opcode, std::vector<uint8_t> &payload) {
+bool WebSocketClient::read_frame(uint8_t &opcode, std::vector<uint8_t> &payload, int timeout_sec) {
+    // Header read: use the caller-specified timeout. A long timeout (30s) in
+    // receiver_loop tolerates idle periods between frames (static screen); a
+    // short timeout (2s) during start_streaming lets the outer 10s deadline fire.
+    // Connection death (RST/FIN) returns immediately from recv regardless of timeout.
     uint8_t hdr[2];
-    if (!recv_exact(sock_, hdr, 2, 2)) return false;
+    if (!recv_exact(sock_, hdr, 2, timeout_sec)) return false;
 
     bool fin = (hdr[0] & 0x80) != 0;
     opcode = hdr[0] & 0x0F;
@@ -297,18 +301,18 @@ bool WebSocketClient::read_frame(uint8_t &opcode, std::vector<uint8_t> &payload)
 
     if (len == 126) {
         uint8_t ext[2];
-        if (!recv_exact(sock_, ext, 2, 2)) return false;
+        if (!recv_exact(sock_, ext, 2, timeout_sec)) return false;
         len = (static_cast<uint64_t>(ext[0]) << 8) | ext[1];
     } else if (len == 127) {
         uint8_t ext[8];
-        if (!recv_exact(sock_, ext, 8, 2)) return false;
+        if (!recv_exact(sock_, ext, 8, timeout_sec)) return false;
         len = 0;
         for (int i = 0; i < 8; i++) len = (len << 8) | ext[i];
     }
 
     uint8_t mask_key[4] = {0, 0, 0, 0};
     if (masked) {
-        if (!recv_exact(sock_, mask_key, 4, 2)) return false;
+        if (!recv_exact(sock_, mask_key, 4, timeout_sec)) return false;
     }
 
     if (len > 64 * 1024 * 1024) {
@@ -317,7 +321,7 @@ bool WebSocketClient::read_frame(uint8_t &opcode, std::vector<uint8_t> &payload)
     }
 
     payload.resize(static_cast<size_t>(len));
-    if (len > 0 && !recv_exact(sock_, payload.data(), static_cast<size_t>(len), 2)) {
+    if (len > 0 && !recv_exact(sock_, payload.data(), static_cast<size_t>(len), timeout_sec)) {
         return false;
     }
     if (masked) {
@@ -365,7 +369,7 @@ bool WebSocketClient::start_streaming(const std::function<void(const uint8_t *, 
             LOGE("WS start timeout: no 'started' response within 10s");
             return false;
         }
-        if (!read_frame(opcode, payload)) {
+        if (!read_frame(opcode, payload, 2)) {
             LOGE("WS error while waiting for 'started' response");
             return false;
         }
