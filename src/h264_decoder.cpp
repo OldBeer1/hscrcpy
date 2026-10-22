@@ -244,6 +244,11 @@ bool H264Decoder::decode(const uint8_t *h264_data, size_t h264_size) {
             image_.width = static_cast<uint32_t>(display_w);
             image_.height = static_cast<uint32_t>(display_h);
             image_.stride = frame_rgb_->linesize[0];
+            // Cache src linesize for rebind_rgb_pointer(): after this function
+            // returns, the caller swaps image_ out and calls rebind, but by then
+            // avcodec_receive_frame may have returned EAGAIN on the next loop
+            // iteration, unref'ing frame_ — frame_->linesize[0] would be 0/stale.
+            last_src_linesize_ = frame_->linesize[0];
             // No memcpy needed - data is already in image_.data
             got_frame = true;
 
@@ -326,6 +331,7 @@ bool H264Decoder::decode(const uint8_t *h264_data, size_t h264_size) {
                     image_.width = static_cast<uint32_t>(display_w);
                     image_.height = static_cast<uint32_t>(display_h);
                     image_.stride = frame_rgb_->linesize[0];
+                    last_src_linesize_ = frame_->linesize[0];
                     got_frame = true;
 
                     // Verbose-only: log IDR frames (flush path — usually the first frame)
@@ -345,13 +351,14 @@ void H264Decoder::rebind_rgb_pointer() {
     // After std::swap(*frame, decoder_.image_ref()), image_.data is a new/different vector,
     // but frame_rgb_->data[0] still points to the old swapped-out buffer.
     // Re-bind frame_rgb_ arrays to the current image_.data.
-    // Use frame_->linesize[0] (not last_width_=coded_width) because the buffer is sized
-    // for linesize (see need_realloc). Using coded_width here would set linesize[0] too
-    // small, and if pointer_stale is false on next decode, sws_scale would misstride.
-    if (sws_initialized_ && frame_rgb_ && !image_.data.empty() && frame_) {
+    // Use last_src_linesize_ (cached at decode time), NOT frame_->linesize[0]:
+    // avcodec_receive_frame returns EAGAIN after a successful frame, which unrefs
+    // frame_ — frame_->linesize[0] becomes 0/stale, causing av_image_fill_arrays to
+    // misstride and sws_scale to write out of bounds ("Picture size ... invalid").
+    if (sws_initialized_ && frame_rgb_ && !image_.data.empty() && last_src_linesize_ > 0) {
         av_image_fill_arrays(frame_rgb_->data, frame_rgb_->linesize,
                              image_.data.data(), AV_PIX_FMT_BGRA,
-                             frame_->linesize[0], last_height_, 1);
+                             last_src_linesize_, last_height_, 1);
     }
 }
 

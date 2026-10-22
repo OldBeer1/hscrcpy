@@ -47,6 +47,7 @@ private:
     int last_width_  = 0;
     int last_height_ = 0;
     int last_pix_fmt_ = 0;
+    int last_src_linesize_ = 0;  // cached frame_->linesize[0] (frame_ may be unref'd by EAGAIN)
     size_t rgb_buf_size_ = 0;
 };
 
