@@ -231,18 +231,23 @@ int HdcWrapper::run_process(const std::string &cmd, std::string *output, int tim
     // this, killing only cmd.exe leaves hdc.exe orphaned with the pipe write
     // end open → reader thread's ReadFile blocks forever → deadlock under
     // INFINITE wait. Each run_process call creates its own job, so killing
-    // this job only affects THIS command's processes — other hdc.exe clients
-    // (other devices, other hscrcpy instances, the hdc daemon, fport streams)
-    // are NOT in this job and are untouched. KILL_ON_JOB_CLOSE also acts as a
-    // safety net if hscrcpy itself crashes mid-call (Windows reaps the handle
-    // and kills any survivors).
+    // this job only affects THIS command's processes.
+    //
+    // IMPORTANT: do NOT set JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE. The hdc client
+    // (hdc.exe) spawns a long-lived hdc daemon as its child process; the daemon
+    // inherits job membership. With kill-on-close, closing the job handle at
+    // the end of run_process kills the daemon too → every subsequent hdc
+    // command cold-starts the daemon (~1.4s vs ~0.1s) and fport forwards die
+    // (the daemon owns them) → gRPC sees "connected but no SETTINGS" then 10061.
+    // The job is kept only for TerminateJobObject on timeout; normal completion
+    // closes the handle without killing anything.
     HANDLE hJob = CreateJobObjectW(NULL, NULL);
     if (hJob) {
+        // No limit flags — job exists solely for timeout TerminateJobObject.
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
-        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
                                      &jeli, sizeof(jeli))) {
-            LOGW("SetInformationJobObject failed (err=%lu) — kill-on-close disabled", GetLastError());
+            LOGW("SetInformationJobObject failed (err=%lu)", GetLastError());
         }
     } else {
         LOGW("CreateJobObjectW failed (err=%lu) — timeout may leave hdc.exe orphaned", GetLastError());
@@ -339,9 +344,9 @@ int HdcWrapper::run_process(const std::string &cmd, std::string *output, int tim
     GetExitCodeProcess(pi.hProcess, &exitCode);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    // Close hJob last. If KILL_ON_JOB_CLOSE is set and any process in the job
-    // is still alive (shouldn't happen — either exited normally or was
-    // terminated above), this kills them as a safety net. Otherwise no-op.
+    // Close hJob last. No KILL_ON_JOB_CLOSE (see comment above) — closing the
+    // handle does NOT kill any process; the job only exists for timeout
+    // TerminateJobObject above.
     if (hJob) CloseHandle(hJob);
 
     if (output) *output = std::move(result);
