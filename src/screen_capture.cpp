@@ -503,16 +503,18 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
     // When MD5 matches a normal SO on a uitest < 6.0.2.1 device, HOScrcpy switches
     // to TCP mode — the SO variant determines the socket mode, not just uitest version.
     bool is_sec_so = local_so.find("unix_6") != std::string::npos;
-    // 7.0 SO: WebSocket channel over TCP port 5000 (HOScrcpy 2.13 behavior).
-    // The 7.0 SO parses soName main version >= 7 → isWebSocketSo → WebSocket channel.
-    bool is_ws_so = local_so.find("7.0-") != std::string::npos;
-    // Emulator SO (cloud device): listens on TCP 5000 with gRPC (verified on
-    // old-arch cloud phones — /proc/net/unix shows no scrcpy abstract socket,
-    // netstat shows tcp6 :::5000 LISTEN). It is NOT WebSocket and NOT abstract.
+    // 7.0 SO supports dual mode: WebSocket (TCP 5000) on cloud phones, and gRPC
+    // abstract socket on USB real devices. The SO binary contains both websocket
+    // and scrcpy_grpc_socket strings — the runtime channel depends on device type:
+    //   - TCP connection (cloud phones) → WebSocket over TCP 5000
+    //   - USB connection (real devices) → gRPC over abstract socket (scrcpy_grpc_socket)
+    // Verified: LNG USB real device creates scrcpy_grpc_socket (not TCP 5000);
+    //           53033 cloud phone listens on TCP 5000 (WebSocket).
+    bool is_7_0_so = local_so.find("7.0-") != std::string::npos;
     bool is_emulator_so = local_so.find("emulator") != std::string::npos;
     use_emulator_so_ = is_emulator_so;
-    use_abstract_socket_ = is_sec_so;
-    use_webSocket_ = is_ws_so;
+    use_abstract_socket_ = is_sec_so || (is_7_0_so && !hdc_.is_tcp());
+    use_webSocket_ = is_7_0_so && hdc_.is_tcp();
     // Emulator SO uses TCP 5000 + gRPC (not WebSocket, not abstract socket)
     if (is_emulator_so) {
         use_abstract_socket_ = false;
@@ -533,8 +535,9 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
     }
 
     LOGI("use_abstract_socket: %s (based on SO type: %s)", use_abstract_socket_ ? "true" : "false",
-         is_sec_so ? "sec SO (abstract socket)" : (is_emulator_so ? "emulator SO (TCP 5000)" : "normal SO (TCP)"));
-    LOGI("use_webSocket: %s (7.0 SO → WebSocket channel)", use_webSocket_ ? "true" : "false");
+         is_sec_so ? "sec SO (abstract socket)" : (is_7_0_so ? "7.0 SO USB (abstract socket)" : (is_emulator_so ? "emulator SO (TCP 5000)" : "normal SO (TCP)")));
+    LOGI("use_webSocket: %s (7.0 SO %s → WebSocket channel)", use_webSocket_ ? "true" : "false",
+         hdc_.is_tcp() ? "TCP" : "USB");
 
     std::string local_md5 = get_local_so_md5(local_so);
     bool so_up_to_date = !device_md5.empty() && (local_md5 == device_md5);
