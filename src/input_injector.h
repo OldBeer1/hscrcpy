@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <functional>
 #include <queue>
+#include <chrono>
 
 namespace hscrcpy {
 
@@ -88,6 +89,9 @@ private:
     std::condition_variable task_cv_;
     std::atomic<bool> task_running_{false};
     std::thread task_thread_;
+    // Cached device reachability for task_loop: avoids a 3s hdc echo per task.
+    std::chrono::steady_clock::time_point last_reach_check_{};
+    bool device_reachable_ = true;
 
     // Background shell thread: runs touchUp shell fallback without blocking task_queue.
     // Ensures detached threads don't outlive this object (use-after-free fix).

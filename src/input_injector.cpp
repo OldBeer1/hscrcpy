@@ -955,6 +955,30 @@ void InputInjector::task_loop() {
             task = std::move(task_queue_.front());
             task_queue_.pop();
         }
+
+        // Drop queued inject commands while the device is unreachable.
+        // No polling here: socket-mode tasks fail fast in send_to_socket (no hdc
+        // round-trip), and shell-mode fallback only runs when socket failed —
+        // which is exactly when a reachability probe is warranted.
+        if (use_socket_mode_ && control_sock_.load() < 0) {
+            LOGW("Input task skipped: control socket disconnected");
+            continue;
+        }
+        if (!use_socket_mode_) {
+            // Shell-only mode: probe reachability, but only after a task was
+            // actually dequeued (event-driven, not per-second polling). Cache the
+            // result briefly to avoid hammering hdc on burst input.
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_reach_check_ > std::chrono::milliseconds(2000)) {
+                last_reach_check_ = now;
+                device_reachable_ = hdc_.is_device_reachable();
+            }
+            if (!device_reachable_) {
+                LOGW("Input task skipped: device unreachable");
+                continue;
+            }
+        }
+
         task();
     }
 }
