@@ -2323,7 +2323,7 @@ void FileManagerWindow::enter_select_mode() {
     }
     SendMessageW(g_file_list, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(g_file_list, nullptr, TRUE);
-    // Switch to unchecked icon (取消全选)
+    // Switch to unchecked icon (deselect all)
     HICON hIco = load_icon_file("res\\file-manager\\file-unchecked.png", 24, 85, 85, 85, true);
     if (hIco) set_btn_icon(g_selectall_btn, hIco);
     // Disable buttons not applicable in select mode
@@ -2339,7 +2339,7 @@ void FileManagerWindow::exit_select_mode() {
     g_check_mode = false;
     // Remove checkboxes
     SendMessageW(g_file_list, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_CHECKBOXES, 0);
-    // Restore checked icon (多选)
+    // Restore checked icon (multi-select)
     HICON hIco = load_icon_file("res\\file-manager\\file-checked.png", 24, 85, 85, 85, true);
     if (hIco) set_btn_icon(g_selectall_btn, hIco);
     // Re-enable all buttons
@@ -2361,12 +2361,12 @@ void FileManagerWindow::toggle_select_all() {
     }
     SendMessageW(g_file_list, WM_SETREDRAW, FALSE, 0);
     if (all_checked) {
-        // Uncheck all → show checked icon (全选)
+        // Uncheck all → show checked icon (select all)
         for (int i = 0; i < count; i++) ListView_SetCheckState(g_file_list, i, FALSE);
         HICON hIco = load_icon_file("res\\file-manager\\file-checked.png", 24, 85, 85, 85, true);
         if (hIco) set_btn_icon(g_selectall_btn, hIco);
     } else {
-        // Check all → show unchecked icon (取消全选)
+        // Check all → show unchecked icon (deselect all)
         for (int i = 0; i < count; i++) ListView_SetCheckState(g_file_list, i, TRUE);
         HICON hIco = load_icon_file("res\\file-manager\\file-unchecked.png", 24, 85, 85, 85, true);
         if (hIco) set_btn_icon(g_selectall_btn, hIco);

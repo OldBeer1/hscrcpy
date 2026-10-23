@@ -132,7 +132,7 @@ std::string ScreenCapture::find_matching_so_with_md5(const std::string &device_m
     // Fallback list: the other category, tried if primary list is empty
     std::vector<std::string> primary = prefer_sec
         ? std::vector<std::string>{
-            // 7.0 优先: 新版 7.0 SO 走 WebSocket 通道 (HOScrcpy 2.13 行为)。
+            // 7.0 SO first: new-version SO uses the WebSocket channel (HOScrcpy 2.13 behavior).
             "libscrcpy_server_unix_7.0-20260930.z.so",
             "libscrcpy_server_unix_6.9-20260801.z.so",
             "libscrcpy_server_unix_6.8-20260801.z.so",
