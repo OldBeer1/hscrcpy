@@ -1,6 +1,6 @@
 #ifndef HSCRCPY_VERSION_H
 #define HSCRCPY_VERSION_H
 
-#define HSCRCPY_VERSION "1.0.0"
+#define HSCRCPY_VERSION "2.0.2"
 
 #endif
