@@ -504,18 +504,19 @@ bool ScreenCapture::start_uitest_with_extension(bool force_restart) {
     // When MD5 matches a normal SO on a uitest < 6.0.2.1 device, HOScrcpy switches
     // to TCP mode — the SO variant determines the socket mode, not just uitest version.
     bool is_sec_so = local_so.find("unix_6") != std::string::npos;
-    // 7.0 SO supports dual mode: WebSocket (TCP 5000) on cloud phones, and gRPC
-    // abstract socket on USB real devices. The SO binary contains both websocket
-    // and scrcpy_grpc_socket strings — the runtime channel depends on device type:
-    //   - TCP connection (cloud phones) → WebSocket over TCP 5000
-    //   - USB connection (real devices) → gRPC over abstract socket (scrcpy_grpc_socket)
-    // Verified: LNG USB real device creates scrcpy_grpc_socket (not TCP 5000);
-    //           53033 cloud phone listens on TCP 5000 (WebSocket).
+    // 7.0 SO supports dual mode: WebSocket (TCP 5000) or gRPC abstract socket
+    // (scrcpy_grpc_socket). The runtime channel is NOT determined by connection
+    // type — it depends on the device/system:
+    //   - cloud phones (TCP) → WebSocket over TCP 5000
+    //   - some USB real devices (e.g. 3GLUN, uitest 7.0.0.1) → WebSocket too
+    //   - other USB real devices (e.g. LNG) → gRPC abstract socket
+    // So default 7.0 SO to WebSocket (HOScrcpy behavior); wait_for_extension_ready
+    // detects an abstract socket and switches to gRPC mode if present.
     bool is_7_0_so = local_so.find("7.0-") != std::string::npos;
     bool is_emulator_so = local_so.find("emulator") != std::string::npos;
     use_emulator_so_ = is_emulator_so;
-    use_abstract_socket_ = is_sec_so || (is_7_0_so && !hdc_.is_tcp());
-    use_webSocket_ = is_7_0_so && hdc_.is_tcp();
+    use_abstract_socket_ = is_sec_so;
+    use_webSocket_ = is_7_0_so;
     // Emulator SO uses TCP 5000 + gRPC (not WebSocket, not abstract socket)
     if (is_emulator_so) {
         use_abstract_socket_ = false;
@@ -649,6 +650,20 @@ bool ScreenCapture::wait_for_extension_ready() {
                 LOGI("uitest extension ready (port 5000) after %d ms", (i + 1) * 100);
                 extension_ready = true;
                 break;
+            }
+            // 7.0 SO dual-mode switch: some USB real devices (e.g. LNG) run the
+            // 7.0 SO in gRPC abstract-socket mode instead of WebSocket. If the
+            // scrcpy_grpc_socket appears, switch to gRPC mode for this session.
+            if (use_webSocket_ && !use_emulator_so_) {
+                hdc_.shell_command("cat /proc/net/unix", &check, 3);
+                if (!running_) return false;
+                if (check.find(kGrpcSocketName) != std::string::npos) {
+                    LOGI("uitest extension ready (7.0 SO switched to abstract socket) after %d ms", (i + 1) * 100);
+                    use_abstract_socket_ = true;
+                    use_webSocket_ = false;
+                    extension_ready = true;
+                    break;
+                }
             }
             // Fallback: check if extension process is running and abstract socket exists.
             // 7.0 SO (WebSocket) and emulator SO both use TCP 5000 — neither creates

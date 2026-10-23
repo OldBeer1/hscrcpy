@@ -7,7 +7,7 @@ Windows 端鸿蒙设备投屏控制工具，Base On [HOScrcpy](https://gitcode.c
 ## 功能特性
 
 - **H264 实时投屏**：多级出流链路（见"投屏链路"），低延迟实时画面
-  - **7.0 SO → WebSocket 虚拟屏**：新版 SO 走 RFC6455 WebSocket 通道（HOScrcpy 2.13 行为）
+  - **7.0 SO → WebSocket 虚拟屏**：新版 SO 走 RFC6455 WebSocket 通道（7.0 SO 默认 WebSocket，检测到 abstract socket 时自动切换 gRPC）
   - **6.x SO → gRPC 虚拟屏**：nghttp2 + FFmpeg 硬解
   - **emulator SO → 云手机主屏**：云设备（CPH）主屏输出，gRPC abstract socket
 - **JPEG 快照回退**：以上出流全部失败时降级为 `snapshot_display` 模式（~2 FPS）
@@ -212,7 +212,7 @@ hscrcpy/
 
 ### 投屏链路
 
-出流采用**多级优先级阶梯**（与 HOScrcpy 2.13 对齐），按顺序尝试，成功后即停止：
+出流采用**多级优先级阶梯**，按顺序尝试，成功后即停止：
 
 ```
 tier 1: 7.0 SO → WebSocket 虚拟屏    （RFC6455, TCP 5000 forward）
@@ -224,6 +224,6 @@ tier 4: 全部失败 → snapshot_display 截图模式（~2 FPS）
 ```
 
 1. 通过 `hdc shell` 推送并启动 uitest 扩展（`libscreen_casting.z.so`），SO 版本决定通道：
-   - **7.0 SO**：扩展监听 TCP 5000，客户端发 `{"type":"start"}` 等文本命令，收到 `started` 后开始收 4 字节大端长度前缀的 H264 二进制帧（WebSocket 通道）
+   - **7.0 SO**：默认扩展监听 TCP 5000，客户端发 `{"type":"start"}` 等文本命令，收到 `started` 后开始收 4 字节大端长度前缀的 H264 二进制帧（WebSocket 通道）；部分设备上 7.0 SO 创建 `scrcpy_grpc_socket` abstract socket，客户端自动切换为 gRPC 通道
    - **6.x / emulator SO**：扩展创建 `scrcpy_grpc_socket` abstract socket，gRPC SERVER_STREAMING 推流
 2. 客户端通过 `hdc fport` 端口转发连接，nghttp2 处理 HTTP/
