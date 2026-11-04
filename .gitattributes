@@ -1,1 +1,1 @@
-common/nlohmann/json.hpp filter=lfs diff=lfs merge=lfs -text
+common/nlohmann/json.hpp text eol=lf

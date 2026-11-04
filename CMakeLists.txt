@@ -127,7 +127,14 @@ target_link_libraries(hscrcpy
 )
 
 target_compile_definitions(hscrcpy PRIVATE _CRT_SECURE_NO_WARNINGS)
-target_compile_options(hscrcpy PRIVATE -flto)
-target_link_options(hscrcpy PRIVATE -static -static-libgcc -static-libstdc++ -flto)
+# LTO is an optional optimization; some portable GCC builds omit support.
+include(CheckIPOSupported)
+check_ipo_supported(RESULT HSCRCPY_IPO_SUPPORTED LANGUAGES CXX)
+if(HSCRCPY_IPO_SUPPORTED)
+    set_property(TARGET hscrcpy PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+else()
+    message(STATUS "LTO is not supported by this toolchain; building without it")
+endif()
+target_link_options(hscrcpy PRIVATE -static -static-libgcc -static-libstdc++)
 
 install(TARGETS hscrcpy DESTINATION bin)

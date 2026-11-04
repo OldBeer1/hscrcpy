@@ -26,3 +26,6 @@ NUL
 
 # Release packaging (runtime binaries for distribution)
 hscrcpy/
+# Project-local toolchain and validation logs
+.tools/
+.validation/
