@@ -1,4 +1,6 @@
 #include "input_injector.h"
+#include "input_gesture.h"
+#include "nlohmann/json.hpp"
 #include "config.h"
 #include "log.h"
 #include "net_util.h"
@@ -44,11 +46,8 @@ InputInjector::~InputInjector() {
     reconnect_running_ = false;
     task_running_ = false;
     task_cv_.notify_all();
-    shell_bg_running_ = false;
-    shell_bg_cv_.notify_all();
     if (task_thread_.joinable()) task_thread_.join();
     if (reconnect_thread_.joinable()) reconnect_thread_.join();
-    if (shell_bg_thread_.joinable()) shell_bg_thread_.join();
     cleanup();
 }
 
@@ -76,6 +75,7 @@ bool InputInjector::init(const std::string &uitest_version) {
         if (n2 != n1) break;
     }
 
+    reconnect_running_ = true;
     bool agent_found = ensure_uitest_agent();
 
     if (!push_agent_so()) {
@@ -102,10 +102,6 @@ bool InputInjector::init(const std::string &uitest_version) {
     task_running_ = true;
     task_thread_ = std::thread(&InputInjector::task_loop, this);
 
-    // Background shell thread for touchUp fallback — safe lifecycle vs detach
-    shell_bg_running_ = true;
-    shell_bg_thread_ = std::thread(&InputInjector::shell_bg_loop, this);
-
     LOGI("Input injector initialized (socket_mode=%s, abstract_control=%s)",
          use_socket_mode_ ? "true" : "false", use_abstract_control_ ? "true" : "false");
     return true;
@@ -117,8 +113,6 @@ void InputInjector::request_stop() {
     reconnect_running_ = false;
     task_running_ = false;
     task_cv_.notify_all();
-    shell_bg_running_ = false;
-    shell_bg_cv_.notify_all();
 }
 
 void InputInjector::cleanup() {
@@ -282,69 +276,136 @@ bool InputInjector::setup_control_port() {
 
 bool InputInjector::send_to_socket(const std::string &json) {
     std::lock_guard<std::mutex> lock(socket_mutex_);
-    int sock = control_sock_.load();
-    if (sock < 0) {
-        return false;
-    }
-
-    auto sock_fd = static_cast<socket_t>(sock);
-
-    const char *data = json.c_str();
-    int remaining = static_cast<int>(json.size());
-    int total_sent = 0;
-
-    while (remaining > 0) {
-        int n = ::send(sock_fd, data + total_sent, remaining, 0);
-        if (n > 0) {
-            total_sent += n;
-            remaining -= n;
-            continue;
-        }
-
-        if (n == 0) {
-            LOGW("send to socket: connection closed");
-            CLOSE_SOCKET(sock_fd);
-            control_sock_.store(-1);
-            return false;
-        }
-
-        int err = WSAGetLastError();
-        if (err == WSAEWOULDBLOCK) {
-            Sleep(1);
-            continue;
-        }
-        LOGW("send to socket failed (err=%d), closing socket for reconnect", err);
+    const int sock = control_sock_.load();
+    if (sock < 0) return false;
+    const auto sock_fd = static_cast<socket_t>(sock);
+    auto disconnect = [this, sock_fd]() {
         CLOSE_SOCKET(sock_fd);
         control_sock_.store(-1);
         return false;
+    };
+    size_t offset = 0;
+    while (offset < json.size()) {
+        int n = ::send(sock_fd, json.data() + offset, static_cast<int>(json.size() - offset), 0);
+        if (n <= 0) {
+            LOGW("Input send failed (err=%d)", WSAGetLastError());
+            return disconnect();
+        }
+        offset += static_cast<size_t>(n);
     }
 
-    return true;
+    // The agent consumes one JSON request per receive; concatenated requests can
+    // silently lose touchUp. Keep exactly one request in flight until its reply.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+    std::string reply;
+    while (reply.size() < 8192) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) break;
+        fd_set reads;
+        FD_ZERO(&reads); FD_SET(sock_fd, &reads);
+        timeval timeout{static_cast<long>(remaining / 1000000), static_cast<long>(remaining % 1000000)};
+        if (select(0, &reads, nullptr, nullptr, &timeout) <= 0) break;
+        char buffer[512];
+        const int n = ::recv(sock_fd, buffer, sizeof(buffer), 0);
+        if (n <= 0) {
+            LOGW("Input reply connection closed (err=%d)", WSAGetLastError());
+            return disconnect();
+        }
+        reply.append(buffer, n);
+        // Consume the line terminator too; it may arrive in a separate TCP packet.
+        if (reply.find('\n') == std::string::npos) continue;
+        const auto response = nlohmann::json::parse(reply, nullptr, false);
+        if (!response.is_discarded()) {
+            if (!response.is_object() || !response.contains("result") ||
+                (response.contains("exception") && !response["exception"].is_null()) ||
+                (response.contains("error") && !response["error"].is_null())) {
+                LOGW("Input agent rejected request: %.300s", reply.c_str());
+                return disconnect();
+            }
+            return true;
+        }
+        if (reply.find('\n') != std::string::npos) {
+            LOGW("Invalid input reply: %.300s", reply.c_str());
+            return disconnect();
+        }
+    }
+    LOGW("Input acknowledgement missing or oversized; reconnect required");
+    return disconnect();
+}
+
+bool InputInjector::send_touch_json(const char *api, uint32_t x, uint32_t y) {
+    char json[512];
+    snprintf(json, sizeof(json),
+        "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
+        "\"params\":{\"api\":\"%s\",\"args\":{\"x\":%u,\"y\":%u}}}", api, x, y);
+    return send_to_socket(json);
+}
+
+bool InputInjector::dispatch_touch_down(uint32_t x, uint32_t y, bool allow_shell) {
+    if (touch_backend_ != TouchBackend::None)
+        dispatch_touch_up(last_touch_x_.load(), last_touch_y_.load());
+    bool sent = false;
+    if (use_socket_mode_ && control_sock_.load() >= 0)
+        sent = send_touch_json("touchDown", x, y);
+    if (sent) touch_backend_ = TouchBackend::Socket;
+    else if (allow_shell) {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "uinput -T -d %u %u", x, y);
+        sent = hdc_.shell_command(cmd, nullptr, 3);
+        touch_backend_ = sent ? TouchBackend::Shell : TouchBackend::None;
+    } else touch_backend_ = TouchBackend::None;
+    if (sent) {
+        last_touch_x_.store(x); last_touch_y_.store(y);
+        touch_down_time_ = std::chrono::steady_clock::now();
+    }
+    return sent;
+}
+
+bool InputInjector::dispatch_touch_move(uint32_t x, uint32_t y) {
+    if (touch_backend_ == TouchBackend::None) return false;
+    const uint32_t from_x = last_touch_x_.load(), from_y = last_touch_y_.load();
+    if (x == from_x && y == from_y) return true;
+    bool sent;
+    if (touch_backend_ == TouchBackend::Socket) sent = send_touch_json("touchMove", x, y);
+    else {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "uinput -T -m %u %u %u %u 16", from_x, from_y, x, y);
+        sent = hdc_.shell_command(cmd, nullptr, 3);
+    }
+    if (sent) { last_touch_x_.store(x); last_touch_y_.store(y); }
+    return sent;
+}
+
+bool InputInjector::dispatch_touch_up(uint32_t x, uint32_t y) {
+    if (touch_backend_ == TouchBackend::None) return true;
+    // A fast drag must retain its final move, even if intermediate moves were coalesced.
+    dispatch_touch_move(x, y);
+    const auto elapsed = std::chrono::steady_clock::now() - touch_down_time_;
+    const auto minimum = std::chrono::milliseconds(40);
+    if (elapsed < minimum) std::this_thread::sleep_for(minimum - elapsed);
+    bool sent = false;
+    if (touch_backend_ == TouchBackend::Socket) sent = send_touch_json("touchUp", x, y);
+    if (touch_backend_ == TouchBackend::Shell || !sent) {
+        // Recovery only after a failed socket send. Never duplicate a successful release.
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "uinput -T -u %u %u", x, y);
+        sent = hdc_.shell_command(cmd, nullptr, 3);
+    }
+    touch_backend_ = TouchBackend::None;
+    return sent;
 }
 
 bool InputInjector::inject_click(uint32_t x, uint32_t y) {
     std::lock_guard<std::mutex> lock(task_mutex_);
-    task_queue_.push([this, x, y]() {
-        if (use_socket_mode_) {
-            char json[512];
-            snprintf(json, sizeof(json),
-                     "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
-                     "\"params\":{\"api\":\"touchDown\",\"args\":{\"x\":%u,\"y\":%u}}}",
-                     x, y);
-            send_to_socket(json);
-            Sleep(10);
-            snprintf(json, sizeof(json),
-                     "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
-                     "\"params\":{\"api\":\"touchUp\",\"args\":{\"x\":%u,\"y\":%u}}}",
-                     x, y);
-            if (send_to_socket(json)) return;
+    queue_task_locked([this, x, y]() {
+        if (use_socket_mode_ && control_sock_.load() >= 0) {
+            if (dispatch_touch_down(x, y, false)) dispatch_touch_up(x, y);
+        } else {
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd), "uinput -T -c %u %u 40", x, y);
+            hdc_.shell_command(cmd, nullptr, 3);
         }
-        // Shell fallback
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "uinput -T -d %u %u", x, y);
-        hdc_.shell_command(cmd, nullptr, 3);
-        snprintf(cmd, sizeof(cmd), "uinput -T -u %u %u", x, y);
-        hdc_.shell_command(cmd, nullptr, 3);
     });
     task_cv_.notify_one();
     return true;
@@ -352,278 +413,67 @@ bool InputInjector::inject_click(uint32_t x, uint32_t y) {
 
 bool InputInjector::inject_long_click(uint32_t x, uint32_t y) {
     std::lock_guard<std::mutex> lock(task_mutex_);
-    task_queue_.push([this, x, y]() {
-        if (use_socket_mode_) {
-            char json[512];
-            snprintf(json, sizeof(json),
-                     "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
-                     "\"params\":{\"api\":\"touchDown\",\"args\":{\"x\":%u,\"y\":%u}}}",
-                     x, y);
-            send_to_socket(json);
-            Sleep(500);
-            snprintf(json, sizeof(json),
-                     "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
-                     "\"params\":{\"api\":\"touchUp\",\"args\":{\"x\":%u,\"y\":%u}}}",
-                     x, y);
-            if (send_to_socket(json)) return;
+    queue_task_locked([this, x, y]() {
+        if (use_socket_mode_ && control_sock_.load() >= 0) {
+            if (dispatch_touch_down(x, y, false)) {
+                Sleep(500);
+                dispatch_touch_up(x, y);
+            }
+        } else {
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd), "uitest uiInput longClick %u %u", x, y);
+            hdc_.shell_command(cmd, nullptr, 5);
         }
-        // Shell fallback
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "uinput -T -d %u %u", x, y);
-        hdc_.shell_command(cmd, nullptr, 3);
-        Sleep(500);
-        snprintf(cmd, sizeof(cmd), "uinput -T -u %u %u", x, y);
-        hdc_.shell_command(cmd, nullptr, 3);
     });
     task_cv_.notify_one();
     return true;
 }
 
 bool InputInjector::inject_touch_down(uint32_t x, uint32_t y) {
-    last_touch_x_.store(x);
-    last_touch_y_.store(y);
     std::lock_guard<std::mutex> lock(task_mutex_);
-    if (use_socket_mode_) {
-        char json[512];
-        snprintf(json, sizeof(json),
-                 "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
-                 "\"params\":{\"api\":\"touchDown\",\"args\":{\"x\":%u,\"y\":%u}}}",
-                 x, y);
-        std::string msg(json);
-        task_queue_.push([this, msg, x, y]() {
-            if (!send_to_socket(msg)) {
-                char cmd[256];
-                snprintf(cmd, sizeof(cmd), "uinput -T -d %u %u", x, y);
-                hdc_.shell_command(cmd, nullptr, 3);
-            }
-        });
-    } else {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "uinput -T -d %u %u", x, y);
-        std::string s(cmd);
-        task_queue_.push([this, s]() { hdc_.shell_command(s, nullptr, 3); });
-    }
+    pending_move_.reset();
+    last_move_time_ = {};
+    queue_task_locked([this, x, y]() { dispatch_touch_down(x, y); });
     task_cv_.notify_one();
     return true;
 }
-
 bool InputInjector::inject_touch_move(uint32_t x, uint32_t y) {
-    std::lock_guard<std::mutex> lock(task_mutex_);
-    if (use_socket_mode_) {
-        char json[512];
-        snprintf(json, sizeof(json),
-                 "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
-                 "\"params\":{\"api\":\"touchMove\",\"args\":{\"x\":%u,\"y\":%u}}}",
-                 x, y);
-        std::string msg(json);
-        task_queue_.push([this, msg, x, y]() {
-            if (send_to_socket(msg)) {
-                last_touch_x_.store(x);
-                last_touch_y_.store(y);
-                return;
-            }
-            // Shell fallback
-            uint32_t from_x = last_touch_x_.load(), from_y = last_touch_y_.load();
-            char cmd[256];
-            snprintf(cmd, sizeof(cmd), "uinput -T -m %u %u %u %u", from_x, from_y, x, y);
-            hdc_.shell_command(cmd, nullptr, 3);
-            last_touch_x_.store(x);
-            last_touch_y_.store(y);
-        });
-    } else {
-        // Shell fallback: uinput -T -m needs from/to coordinates
-        uint32_t from_x = last_touch_x_.load(), from_y = last_touch_y_.load();
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "uinput -T -m %u %u %u %u", from_x, from_y, x, y);
-        std::string s(cmd);
-        task_queue_.push([this, s, x, y]() {
-            hdc_.shell_command(s, nullptr, 3);
-            last_touch_x_.store(x);
-            last_touch_y_.store(y);
-        });
-    }
-    task_cv_.notify_one();
+    queue_touch_move(x, y);
     return true;
 }
-
 bool InputInjector::inject_touch_up(uint32_t x, uint32_t y) {
     std::lock_guard<std::mutex> lock(task_mutex_);
-    if (use_socket_mode_) {
-        char json[512];
-        snprintf(json, sizeof(json),
-                 "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
-                 "\"params\":{\"api\":\"touchUp\",\"args\":{\"x\":%u,\"y\":%u}}}",
-                 x, y);
-        std::string msg(json);
-        task_queue_.push([this, msg, x, y]() {
-            if (!send_to_socket(msg)) {
-                char cmd[256];
-                snprintf(cmd, sizeof(cmd), "uinput -T -u %u %u", x, y);
-                hdc_.shell_command(cmd, nullptr, 3);
-            }
-        });
-    } else {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "uinput -T -u %u %u", x, y);
-        std::string s(cmd);
-        task_queue_.push([this, s]() { hdc_.shell_command(s, nullptr, 3); });
-    }
+    // The pending move cell stays alive in its queued task; a later gesture cannot overwrite it.
+    pending_move_.reset();
+    queue_task_locked([this, x, y]() { dispatch_touch_up(x, y); });
     task_cv_.notify_one();
     return true;
 }
-
-void InputInjector::queue_touch_down(uint32_t x, uint32_t y) {
-    last_touch_x_.store(x);
-    last_touch_y_.store(y);
-    std::lock_guard<std::mutex> lock(task_mutex_);
-    if (use_socket_mode_) {
-        char json[512];
-        snprintf(json, sizeof(json),
-                 "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
-                 "\"params\":{\"api\":\"touchDown\",\"args\":{\"x\":%u,\"y\":%u}}}",
-                 x, y);
-        std::string msg(json);
-        task_queue_.push([this, msg, x, y]() {
-            if (!send_to_socket(msg)) {
-                char cmd[256];
-                snprintf(cmd, sizeof(cmd), "uinput -T -d %u %u", x, y);
-                hdc_.shell_command(cmd, nullptr, 3);
-            }
-        });
-    } else {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "uinput -T -d %u %u", x, y);
-        std::string s(cmd);
-        task_queue_.push([this, s]() { hdc_.shell_command(s, nullptr, 3); });
-    }
-    task_cv_.notify_one();
-}
+void InputInjector::queue_touch_down(uint32_t x, uint32_t y) { inject_touch_down(x, y); }
+void InputInjector::queue_touch_up(uint32_t x, uint32_t y) { inject_touch_up(x, y); }
 
 void InputInjector::queue_touch_move(uint32_t x, uint32_t y) {
-    // Throttle: limit move events to ~16ms intervals (~60Hz).
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_move_time_).count();
-    if (elapsed_ms < 16) return;
-    last_move_time_ = now;
-
-    // Update pending move position (always update so task uses latest coords)
-    pending_move_x_.store(x);
-    pending_move_y_.store(y);
-
-    // If there's already a pending move task in the queue, don't add another
-    if (has_pending_move_.exchange(true)) {
+    std::lock_guard<std::mutex> lock(task_mutex_);
+    if (pending_move_ && pending_move_->queued) {
+        pending_move_->x = x; pending_move_->y = y;
         return;
     }
-
-    uint64_t gen = move_generation_.load();
-
-    std::lock_guard<std::mutex> lock(task_mutex_);
-    task_queue_.push([this, gen]() {
-        has_pending_move_.store(false);
-
-        // Stale move: touchUp already happened (generation advanced), skip
-        if (gen != move_generation_.load()) return;
-
-        // Read the latest coordinates (may have been updated since enqueue)
-        uint32_t x = pending_move_x_.load();
-        uint32_t y = pending_move_y_.load();
-
-        if (use_socket_mode_) {
-            char json[512];
-            snprintf(json, sizeof(json),
-                     "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
-                     "\"params\":{\"api\":\"touchMove\",\"args\":{\"x\":%u,\"y\":%u}}}",
-                     x, y);
-            if (send_to_socket(json)) {
-                last_touch_x_.store(x);
-                last_touch_y_.store(y);
-                return;
-            }
-            // Shell fallback
-            uint32_t from_x = last_touch_x_.load(), from_y = last_touch_y_.load();
-            char cmd[256];
-            snprintf(cmd, sizeof(cmd), "uinput -T -m %u %u %u %u", from_x, from_y, x, y);
-            hdc_.shell_command(cmd, nullptr, 3);
-            last_touch_x_.store(x);
-            last_touch_y_.store(y);
-        } else {
-            uint32_t from_x = last_touch_x_.load(), from_y = last_touch_y_.load();
-            char cmd[256];
-            snprintf(cmd, sizeof(cmd), "uinput -T -m %u %u %u %u", from_x, from_y, x, y);
-            hdc_.shell_command(cmd, nullptr, 3);
-            last_touch_x_.store(x);
-            last_touch_y_.store(y);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_move_time_ < std::chrono::milliseconds(16)) return;
+    last_move_time_ = now;
+    auto move = std::make_shared<PendingMove>();
+    move->x = x; move->y = y;
+    pending_move_ = move;
+    queue_task_locked([this, move]() {
+        uint32_t x, y;
+        {
+            std::lock_guard<std::mutex> lock(task_mutex_);
+            x = move->x; y = move->y;
+            move->queued = false;
         }
+        dispatch_touch_move(x, y);
     });
     task_cv_.notify_one();
-}
-
-void InputInjector::queue_touch_up(uint32_t x, uint32_t y) {
-    std::lock_guard<std::mutex> lock(task_mutex_);
-
-    // Increment generation so stale queued moves self-cancel without flushing
-    // the entire queue (which could drop pending touchDown events).
-    move_generation_.fetch_add(1);
-    has_pending_move_.store(false);
-
-    // Always send touchUp via both socket AND shell.
-    // Socket may silently fail (agent not processing, TCP buffering, etc).
-    // Shell command via hdc is the guaranteed delivery path.
-    if (use_socket_mode_) {
-        bool socket_sent = false;
-        char json[512];
-        snprintf(json, sizeof(json),
-                 "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
-                 "\"params\":{\"api\":\"touchUp\",\"args\":{\"x\":%u,\"y\":%u}}}",
-                 x, y);
-        std::string msg(json);
-        // Try socket first (fast, ~1ms)
-        std::unique_lock<std::mutex> sock_lock(socket_mutex_, std::try_to_lock);
-        if (sock_lock.owns_lock()) {
-            int sock = control_sock_.load();
-            if (sock >= 0) {
-                auto sock_fd = static_cast<socket_t>(sock);
-                const char *data = msg.c_str();
-                int remaining = static_cast<int>(msg.size());
-                int total_sent = 0;
-                while (remaining > 0) {
-                    int n = ::send(sock_fd, data + total_sent, remaining, 0);
-                    if (n > 0) { total_sent += n; remaining -= n; continue; }
-                    if (n == 0 || WSAGetLastError() != WSAEWOULDBLOCK) break;
-                    Sleep(1);
-                }
-                if (remaining == 0) {
-                    socket_sent = true;
-                    LOGI("touchUp(%u,%u) socket sent", x, y);
-                }
-            }
-            sock_lock.unlock();
-        }
-
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "uinput -T -u %u %u", x, y);
-        std::string s(cmd);
-        if (socket_sent) {
-            // Shell fallback on background shell thread — guaranteed delivery without
-            // blocking task queue. Socket send succeeded but we can't be sure the agent
-            // processed it (TCP buffering, etc).
-            {
-                std::lock_guard<std::mutex> bg_lock(shell_bg_mutex_);
-                shell_bg_queue_.push(s);
-            }
-            shell_bg_cv_.notify_one();
-        } else {
-            // Socket failed, queue shell fallback normally
-            task_queue_.push([this, s]() { hdc_.shell_command(s, nullptr, 3); });
-            task_cv_.notify_one();
-        }
-    } else {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "uinput -T -u %u %u", x, y);
-        std::string s(cmd);
-        task_queue_.push([this, s]() { hdc_.shell_command(s, nullptr, 3); });
-        task_cv_.notify_one();
-    }
 }
 
 bool InputInjector::inject_mouse_down(const std::string &button, uint32_t x, uint32_t y) {
@@ -635,7 +485,7 @@ bool InputInjector::inject_mouse_down(const std::string &button, uint32_t x, uin
                  "\"params\":{\"api\":\"mouseDown\",\"args\":{\"x\":%u,\"y\":%u,\"mouseType\":\"%s\"}}}",
                  x, y, button.c_str());
         std::string msg(json);
-        task_queue_.push([this, msg, x, y]() {
+        queue_task_locked([this, msg, x, y]() {
             if (!send_to_socket(msg)) {
                 LOGW("mouse_down socket failed, fallback to shell");
                 char cmd[256];
@@ -647,7 +497,7 @@ bool InputInjector::inject_mouse_down(const std::string &button, uint32_t x, uin
         char cmd[256];
         snprintf(cmd, sizeof(cmd), "uinput -T -d %u %u", x, y);
         std::string s(cmd);
-        task_queue_.push([this, s]() { hdc_.shell_command(s, nullptr, 3); });
+        queue_task_locked([this, s]() { hdc_.shell_command(s, nullptr, 3); });
     }
     task_cv_.notify_one();
     return true;
@@ -669,13 +519,13 @@ bool InputInjector::inject_mouse_move(const std::string &button, uint32_t x, uin
                      x, y, button.c_str());
         }
         std::string msg(json);
-        task_queue_.push([this, msg]() { send_to_socket(msg); });
+        queue_task_locked([this, msg]() { send_to_socket(msg); });
     } else {
         uint32_t from_x = last_touch_x_.load(), from_y = last_touch_y_.load();
         char cmd[256];
         snprintf(cmd, sizeof(cmd), "uinput -T -m %u %u %u %u", from_x, from_y, x, y);
         std::string s(cmd);
-        task_queue_.push([this, s, x, y]() {
+        queue_task_locked([this, s, x, y]() {
             hdc_.shell_command(s, nullptr, 3);
             last_touch_x_.store(x);
             last_touch_y_.store(y);
@@ -694,7 +544,7 @@ bool InputInjector::inject_mouse_up(const std::string &button, uint32_t x, uint3
                  "\"params\":{\"api\":\"mouseUp\",\"args\":{\"x\":%u,\"y\":%u,\"mouseType\":\"%s\"}}}",
                  x, y, button.c_str());
         std::string msg(json);
-        task_queue_.push([this, msg, x, y]() {
+        queue_task_locked([this, msg, x, y]() {
             if (!send_to_socket(msg)) {
                 char cmd[256];
                 snprintf(cmd, sizeof(cmd), "uinput -T -u %u %u", x, y);
@@ -705,45 +555,44 @@ bool InputInjector::inject_mouse_up(const std::string &button, uint32_t x, uint3
         char cmd[256];
         snprintf(cmd, sizeof(cmd), "uinput -T -u %u %u", x, y);
         std::string s(cmd);
-        task_queue_.push([this, s]() { hdc_.shell_command(s, nullptr, 3); });
+        queue_task_locked([this, s]() { hdc_.shell_command(s, nullptr, 3); });
     }
     task_cv_.notify_one();
     return true;
 }
 
+bool InputInjector::perform_swipe(uint32_t from_x, uint32_t from_y,
+                                  uint32_t to_x, uint32_t to_y, uint32_t velocity) {
+    velocity = std::clamp(velocity, 200u, 40000u);
+    if (!use_socket_mode_ || control_sock_.load() < 0) {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "uitest uiInput swipe %u %u %u %u %u",
+                 from_x, from_y, to_x, to_y, velocity);
+        return hdc_.shell_command(cmd, nullptr, 5);
+    }
+    if (!dispatch_touch_down(from_x, from_y, false)) return false;
+    const double distance = std::hypot(static_cast<double>(to_x) - from_x,
+                                       static_cast<double>(to_y) - from_y);
+    const int duration_ms = std::clamp(static_cast<int>(distance * 1000.0 / velocity), 40, 350);
+    const int steps = std::clamp(duration_ms / 12, 4, 24);
+    bool sent = true;
+    for (int i = 1; i <= steps; ++i) {
+        Sleep(static_cast<DWORD>(duration_ms / steps));
+        if (!dispatch_touch_move(input::interpolate(from_x, to_x, i, steps),
+                                 input::interpolate(from_y, to_y, i, steps))) {
+            sent = false;
+            break;
+        }
+    }
+    // Release on this same worker, before any subsequent click or swipe can start.
+    const bool released = dispatch_touch_up(to_x, to_y);
+    return sent && released;
+}
+
 bool InputInjector::inject_swipe(uint32_t from_x, uint32_t from_y, uint32_t to_x, uint32_t to_y, uint32_t velocity) {
     std::lock_guard<std::mutex> lock(task_mutex_);
-    task_queue_.push([this, from_x, from_y, to_x, to_y, velocity]() {
-        if (use_socket_mode_) {
-            char json[512];
-            snprintf(json, sizeof(json),
-                     "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
-                     "\"params\":{\"api\":\"touchDown\",\"args\":{\"x\":%u,\"y\":%u}}}",
-                     from_x, from_y);
-            send_to_socket(json);
-            Sleep(20);
-            int steps = 10;
-            for (int i = 1; i <= steps; i++) {
-                uint32_t cx = from_x + (to_x - from_x) * i / steps;
-                uint32_t cy = from_y + (to_y - from_y) * i / steps;
-                snprintf(json, sizeof(json),
-                         "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
-                         "\"params\":{\"api\":\"touchMove\",\"args\":{\"x\":%u,\"y\":%u}}}",
-                         cx, cy);
-                send_to_socket(json);
-                Sleep(velocity / steps / 2);
-            }
-            snprintf(json, sizeof(json),
-                     "{\"module\":\"com.ohos.devicetest.hypiumApiHelper\",\"method\":\"Gestures\","
-                     "\"params\":{\"api\":\"touchUp\",\"args\":{\"x\":%u,\"y\":%u}}}",
-                     to_x, to_y);
-            send_to_socket(json);
-            return;
-        }
-        // Shell fallback
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "uitest uiInput swipe %u %u %u %u %u", from_x, from_y, to_x, to_y, velocity);
-        hdc_.shell_command(cmd, nullptr, 5);
+    queue_task_locked([this, from_x, from_y, to_x, to_y, velocity]() {
+        perform_swipe(from_x, from_y, to_x, to_y, velocity);
     });
     task_cv_.notify_one();
     return true;
@@ -751,28 +600,28 @@ bool InputInjector::inject_swipe(uint32_t from_x, uint32_t from_y, uint32_t to_x
 
 bool InputInjector::inject_back() {
     std::lock_guard<std::mutex> lock(task_mutex_);
-    task_queue_.push([this]() { hdc_.shell_command("uinput -K -d 2 -u 2", nullptr, 3); });
+    queue_task_locked([this]() { hdc_.shell_command("uinput -K -d 2 -u 2", nullptr, 3); });
     task_cv_.notify_one();
     return true;
 }
 
 bool InputInjector::inject_home() {
     std::lock_guard<std::mutex> lock(task_mutex_);
-    task_queue_.push([this]() { hdc_.shell_command("uinput -K -d 1 -u 1", nullptr, 3); });
+    queue_task_locked([this]() { hdc_.shell_command("uinput -K -d 1 -u 1", nullptr, 3); });
     task_cv_.notify_one();
     return true;
 }
 
 bool InputInjector::inject_recent() {
     std::lock_guard<std::mutex> lock(task_mutex_);
-    task_queue_.push([this]() { hdc_.shell_command("uitest uiInput keyEvent 10011", nullptr, 3); });
+    queue_task_locked([this]() { hdc_.shell_command("uitest uiInput keyEvent 10011", nullptr, 3); });
     task_cv_.notify_one();
     return true;
 }
 
 bool InputInjector::inject_power() {
     std::lock_guard<std::mutex> lock(task_mutex_);
-    task_queue_.push([this]() { hdc_.shell_command("uinput -K -d 18 -u 18", nullptr, 3); });
+    queue_task_locked([this]() { hdc_.shell_command("uinput -K -d 18 -u 18", nullptr, 3); });
     task_cv_.notify_one();
     return true;
 }
@@ -780,7 +629,7 @@ bool InputInjector::inject_power() {
 bool InputInjector::inject_key_event(const std::string &key) {
     std::string cmd = "uinput -K -d " + key + " -u " + key;
     std::lock_guard<std::mutex> lock(task_mutex_);
-    task_queue_.push([this, cmd]() { hdc_.shell_command(cmd, nullptr, 3); });
+    queue_task_locked([this, cmd]() { hdc_.shell_command(cmd, nullptr, 3); });
     task_cv_.notify_one();
     return true;
 }
@@ -794,7 +643,7 @@ bool InputInjector::inject_key_code(int key_code, bool shift) {
     }
     LOGI("inject_key_code: %s", cmd);
     std::lock_guard<std::mutex> lock(task_mutex_);
-    task_queue_.push([this, c = std::string(cmd)]() {
+    queue_task_locked([this, c = std::string(cmd)]() {
         hdc_.shell_command(c, nullptr, 3);
     });
     task_cv_.notify_one();
@@ -815,7 +664,7 @@ bool InputInjector::inject_text(const std::string &text, uint32_t x, uint32_t y)
         snprintf(cmd, sizeof(cmd), "uitest uiInput inputText 0 0 '%s'", escaped.c_str());
     }
     std::lock_guard<std::mutex> lock(task_mutex_);
-    task_queue_.push([this, cmd]() {
+    queue_task_locked([this, cmd]() {
         hdc_.shell_command(cmd, nullptr, 5);
     });
     task_cv_.notify_one();
@@ -824,47 +673,145 @@ bool InputInjector::inject_text(const std::string &text, uint32_t x, uint32_t y)
 
 bool InputInjector::inject_reboot() {
     std::lock_guard<std::mutex> lock(task_mutex_);
-    task_queue_.push([this]() { hdc_.shell_command("reboot", nullptr, 5); });
+    queue_task_locked([this]() { hdc_.shell_command("reboot", nullptr, 5); });
     task_cv_.notify_one();
     return true;
 }
 
-bool InputInjector::inject_wheel(uint32_t x, uint32_t y, int32_t delta) {
-    int notches = std::abs(delta) / 120;
-    if (notches < 1) notches = 1;
-    int pixels_per_notch = AppConfig::instance().scroll_pixels_per_notch;
-    int scroll_amount = notches * pixels_per_notch;
-    if (scroll_amount > AppConfig::instance().scroll_max) scroll_amount = AppConfig::instance().scroll_max;
-
-    int from_y = static_cast<int>(y);
-    int to_y;
-    if (delta > 0) {
-        to_y = from_y + scroll_amount;
-    } else {
-        to_y = from_y - scroll_amount;
+// Caller holds task_mutex_. A later non-wheel action seals the current wheel
+// burst so new wheel events cannot jump ahead of a click/key already in the queue.
+void InputInjector::queue_task_locked(std::function<void()> task) {
+    if (pending_wheel_) {
+        pending_wheel_->accepting = false;
+        pending_wheel_.reset();
     }
-    if (to_y < 0) to_y = 0;
+    task_queue_.push(std::move(task));
+}
 
-    int steps = (std::max)(8, scroll_amount / 30);
+namespace {
+// A private high-resolution timer avoids rounded Sleep intervals without
+// changing the system timer resolution. The fallback also supports older Windows.
+class WheelTick {
+public:
+    WheelTick() : timer_(CreateWaitableTimerExW(nullptr, nullptr, 0x00000002,
+                                               TIMER_MODIFY_STATE | SYNCHRONIZE)) {}
+    ~WheelTick() { if (timer_) CloseHandle(timer_); }
+    void wait_until(std::chrono::steady_clock::time_point deadline) {
+        auto remaining = deadline - std::chrono::steady_clock::now();
+        if (remaining <= decltype(remaining)::zero()) return;
+        LARGE_INTEGER due{};
+        due.QuadPart = -(std::max)(int64_t{1},
+            std::chrono::duration_cast<std::chrono::nanoseconds>(remaining).count() / 100);
+        if (timer_ && SetWaitableTimer(timer_, &due, 0, nullptr, nullptr, FALSE) &&
+            WaitForSingleObject(timer_, 100) == WAIT_OBJECT_0) return;
+        std::this_thread::sleep_until(deadline);
+    }
+private:
+    HANDLE timer_ = nullptr;
+};
+}
 
-    if (use_socket_mode_) {
+void InputInjector::perform_wheel(const std::shared_ptr<PendingWheel> &wheel) {
+    uint32_t x, anchor_y, height;
+    int64_t remaining;
+    bool socket_mode;
+    auto close_burst = [this, &wheel]() {
+        wheel->accepting = false; // caller holds task_mutex_
+        if (pending_wheel_ == wheel) pending_wheel_.reset();
+    };
+    {
         std::lock_guard<std::mutex> lock(task_mutex_);
-        task_queue_.push([this, x, from_y, to_y, steps]() {
-            inject_touch_down(x, static_cast<uint32_t>(from_y));
-            for (int i = 1; i <= steps; i++) {
-                uint32_t cy = static_cast<uint32_t>(
-                    from_y + (to_y - from_y) * i / steps);
-                inject_touch_move(x, cy);
-                Sleep(10);
-            }
-            inject_touch_up(x, static_cast<uint32_t>(to_y));
-        });
-        task_cv_.notify_one();
+        x = wheel->x; anchor_y = wheel->y; height = wheel->height;
+        remaining = wheel->pixels;
+        wheel->pixels = 0;
+        if (remaining == 0) { close_burst(); return; }
+        socket_mode = use_socket_mode_ && control_sock_.load() >= 0;
+        if (!socket_mode) close_burst(); // shell swipe is an indivisible command
+    }
+    auto first = input::wheel_swipe(x, anchor_y, remaining, height);
+    if (!first.valid) return;
+    if (!socket_mode) {
+        perform_swipe(x, first.from_y, x, first.to_y, 3000);
+        return;
+    }
+    if (!dispatch_touch_down(x, first.from_y, false)) {
+        std::lock_guard<std::mutex> lock(task_mutex_);
+        close_burst();
+        return;
+    }
+
+    const int64_t margin = (std::min)(int64_t{12}, static_cast<int64_t>(height) / 8);
+    const int64_t low = margin, high = static_cast<int64_t>(height) - 1 - margin;
+    const int64_t maximum = (std::min)(high - low, (std::max)(int64_t{1},
+        static_cast<int64_t>(AppConfig::instance().scroll_max)));
+    remaining = std::clamp(remaining, -maximum, maximum);
+    int64_t y = first.from_y;
+    WheelTick timer;
+    auto next_tick = std::chrono::steady_clock::now() + std::chrono::milliseconds(8);
+    auto idle_since = std::chrono::steady_clock::time_point{};
+    while (task_running_) {
+        timer.wait_until(next_tick);
+        const auto now = std::chrono::steady_clock::now();
+        next_tick = now + std::chrono::milliseconds(8);
+        bool done = false;
+        {
+            std::lock_guard<std::mutex> lock(task_mutex_);
+            remaining = std::clamp(remaining + wheel->pixels, -maximum, maximum);
+            wheel->pixels = 0;
+            if (remaining == 0) {
+                if (idle_since == std::chrono::steady_clock::time_point{}) idle_since = now;
+                if (!wheel->accepting || now - idle_since >= std::chrono::milliseconds(24)) {
+                    close_burst();
+                    done = true;
+                }
+            } else idle_since = {};
+        }
+        if (done) break;
+        if (remaining == 0) continue;
+        // Small increments track the wheel smoothly; a fast burst catches up
+        // adaptively instead of leaving a long queue behind the pointer.
+        const int64_t magnitude = remaining < 0 ? -remaining : remaining;
+        const int64_t step = (std::min)(magnitude, (std::max)(int64_t{24}, magnitude / 4));
+        const int64_t next_y = std::clamp(y + (remaining > 0 ? step : -step), low, high);
+        if (next_y == y) {
+            // Reposition a lifted finger only when the screen edge is reached.
+            dispatch_touch_up(x, static_cast<uint32_t>(y));
+            auto rebased = input::wheel_swipe(x, anchor_y, remaining, height);
+            if (!rebased.valid || !dispatch_touch_down(x, rebased.from_y, false)) break;
+            y = rebased.from_y;
+            continue;
+        }
+        if (!dispatch_touch_move(x, static_cast<uint32_t>(next_y))) break;
+        remaining -= next_y - y;
+        y = next_y;
+    }
+    {
+        std::lock_guard<std::mutex> lock(task_mutex_);
+        close_burst();
+    }
+    dispatch_touch_up(x, static_cast<uint32_t>(y));
+}
+
+bool InputInjector::inject_wheel(uint32_t x, uint32_t y, int32_t delta, uint32_t screen_height) {
+    if (delta == 0 || screen_height < 4) return true;
+    std::lock_guard<std::mutex> lock(task_mutex_);
+    const int64_t pixels_per_notch = std::clamp(AppConfig::instance().scroll_pixels_per_notch, 1, 10000);
+    const int64_t scaled = static_cast<int64_t>(delta) * pixels_per_notch + wheel_remainder_;
+    const int64_t pixels = scaled / 120;
+    wheel_remainder_ = scaled % 120;
+    if (pixels == 0) return true;
+    const int64_t maximum = (std::max)(int64_t{1}, static_cast<int64_t>(AppConfig::instance().scroll_max));
+    if (pending_wheel_ && pending_wheel_->accepting) {
+        pending_wheel_->pixels = std::clamp(pending_wheel_->pixels + pixels, -maximum, maximum);
         return true;
     }
-    int velocity = 800;
-    return inject_swipe(x, static_cast<uint32_t>(from_y),
-                        x, static_cast<uint32_t>(to_y), velocity);
+    auto wheel = std::make_shared<PendingWheel>();
+    wheel->x = x; wheel->y = y; wheel->height = screen_height;
+    wheel->pixels = std::clamp(pixels, -maximum, maximum);
+    pending_wheel_ = wheel;
+    task_queue_.push([this, wheel]() { perform_wheel(wheel); });
+    task_cv_.notify_one();
+    return true;
 }
 
 void InputInjector::reconnect_loop() {
@@ -874,27 +821,12 @@ void InputInjector::reconnect_loop() {
         Sleep(2000);
         if (!reconnect_running_) break;
 
-        // Drain agent responses to prevent its TCP send buffer from filling up.
-        // The agent sends one response per request (raw JSON, no length prefix).
-        // If we never drain, the agent eventually blocks and stops processing.
-        int sock = control_sock_.load();
-        if (sock >= 0) {
-            auto sock_fd = static_cast<socket_t>(sock);
-            fd_set rfds;
-            struct timeval tv = {0, 0};  // non-blocking select
-            FD_ZERO(&rfds);
-            FD_SET(sock_fd, &rfds);
-            while (select(0, &rfds, nullptr, nullptr, &tv) > 0) {
-                char buf[512];
-                int n = ::recv(sock_fd, buf, sizeof(buf), 0);
-                if (n <= 0) break;
-                FD_ZERO(&rfds);
-                FD_SET(sock_fd, &rfds);
-            }
+        // send_to_socket owns each reply. Draining here could steal the ACK
+        // of a request in flight and leave a drag without its release.
+        if (control_sock_.load() >= 0) {
             consecutive_failures = 0;
             continue;
         }
-
         LOGI("Control socket disconnected, attempting reconnect...");
 
         if (!ensure_uitest_agent()) {
@@ -960,10 +892,7 @@ void InputInjector::task_loop() {
         // No polling here: socket-mode tasks fail fast in send_to_socket (no hdc
         // round-trip), and shell-mode fallback only runs when socket failed —
         // which is exactly when a reachability probe is warranted.
-        if (use_socket_mode_ && control_sock_.load() < 0) {
-            LOGW("Input task skipped: control socket disconnected");
-            continue;
-        }
+
         if (!use_socket_mode_) {
             // Shell-only mode: probe reachability, but only after a task was
             // actually dequeued (event-driven, not per-second polling). Cache the
@@ -981,22 +910,8 @@ void InputInjector::task_loop() {
 
         task();
     }
-}
-
-void InputInjector::shell_bg_loop() {
-    while (shell_bg_running_) {
-        std::string cmd;
-        {
-            std::unique_lock<std::mutex> lock(shell_bg_mutex_);
-            shell_bg_cv_.wait_for(lock, std::chrono::milliseconds(100), [this] {
-                return !shell_bg_queue_.empty() || !shell_bg_running_;
-            });
-            if (shell_bg_queue_.empty()) continue;
-            cmd = std::move(shell_bg_queue_.front());
-            shell_bg_queue_.pop();
-        }
-        hdc_.shell_command(cmd, nullptr, 3);
-    }
+    if (touch_backend_ != TouchBackend::None)
+        dispatch_touch_up(last_touch_x_.load(), last_touch_y_.load());
 }
 
 } // namespace hscrcpy

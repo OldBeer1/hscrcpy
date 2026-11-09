@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.16)
+project(hscrcpy_audio_companion)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_library(audio_capture SHARED audio_capture.cpp)
+target_include_directories(audio_capture PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../common")
+target_link_libraries(audio_capture PUBLIC libace_napi.z.so libnative_avscreen_capture.so libnative_media_core.so)

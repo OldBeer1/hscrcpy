@@ -8,6 +8,7 @@
 #include <d2d1.h>
 #pragma comment(lib, "gdiplus.lib")
 
+#include "audio_forwarder.h"
 #include "cli.h"
 #include "config.h"
 #include "screen_capture.h"
@@ -38,6 +39,11 @@ static const char *CANVAS_CLASS = "HScrcpyCanvasClass";
 static HINSTANCE g_hInst = nullptr;
 static HdcWrapper *g_hdc = nullptr;
 static ScreenCapture *g_capture = nullptr;
+static AudioForwarder *g_audio = nullptr;
+static HWND g_audio_checkbox = nullptr;
+static HWND g_audio_status = nullptr;
+static uint32_t g_audio_generation = 0;
+static constexpr UINT kMsgAudioStatus = WM_APP + 30;
 static InputInjector *g_input = nullptr;
 static uint32_t g_screen_w = 0, g_screen_h = 0;
 static std::string g_sized_serial;  // serial of the phone last auto-sized (per-phone first-connect)
@@ -99,7 +105,7 @@ static std::mutex g_frame_mutex;
 static uint64_t g_last_rendered_seq = 0;
 static HANDLE g_frame_event = nullptr;
 
-static int TOOLBAR_H = 68;
+static int TOOLBAR_H = 94;
 static bool g_snapshot_warned = false;
 
 static bool g_mouse_down = false;
@@ -123,6 +129,7 @@ static uint32_t g_device_screen_w = 0, g_device_screen_h = 0;
 #define ID_BTN_CPH     1014
 #define ID_BTN_RECORD  1015
 #define ID_BTN_SCREENSHOT 1016
+#define ID_CHK_AUDIO 1017
 
 static ULONG_PTR g_gdiplus_token = 0;
 
@@ -743,8 +750,8 @@ static CanvasLayout calc_canvas_layout() {
 static bool is_inside_canvas_image(int wx, int wy) {
     auto lay = calc_canvas_layout();
     if (lay.draw_w == 0) return false;
-    return wx >= lay.off_x && wx <= lay.off_x + lay.draw_w &&
-           wy >= lay.off_y && wy <= lay.off_y + lay.draw_h;
+    return wx >= lay.off_x && wx < lay.off_x + lay.draw_w &&
+           wy >= lay.off_y && wy < lay.off_y + lay.draw_h;
 }
 
 static std::pair<uint32_t, uint32_t> canvas_to_screen(int wx, int wy) {
@@ -761,8 +768,9 @@ static std::pair<uint32_t, uint32_t> canvas_to_screen(int wx, int wy) {
     uint32_t phy_w = g_screen_w * g_capture_config.scale;
     uint32_t phy_h = g_screen_h * g_capture_config.scale;
 
-    return {static_cast<uint32_t>(rel_x * phy_w / lay.draw_w),
-            static_cast<uint32_t>(rel_y * phy_h / lay.draw_h)};
+    if (phy_w == 0 || phy_h == 0) return {0, 0};
+    return {(std::min)(phy_w - 1, static_cast<uint32_t>(static_cast<uint64_t>(rel_x) * phy_w / lay.draw_w)),
+            (std::min)(phy_h - 1, static_cast<uint32_t>(static_cast<uint64_t>(rel_y) * phy_h / lay.draw_h))};
 }
 
 static WNDPROC g_canvas_orig_wndproc = nullptr;
@@ -1091,8 +1099,9 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_ERASEBKGND:
         return 1;
-    case WM_LBUTTONDOWN: {
-        if (g_mirroring && g_input) {
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK: {
+        if (g_mirroring && g_input && is_inside_canvas_image(GET_X_LPARAM(lp), GET_Y_LPARAM(lp))) {
             HWND prev = SetFocus(hwnd);
             LOGI("SetFocus to canvas: hwnd=%p, prev=%p, err=%d", hwnd, prev, GetLastError());
             POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -1135,16 +1144,25 @@ static LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     }
+    case WM_CANCELMODE:
+    case WM_CAPTURECHANGED:
+        if (g_mouse_down && g_input) {
+            g_mouse_down = false;
+            g_input->queue_touch_up(g_last_touch_x, g_last_touch_y);
+            if (GetCapture() == hwnd) ReleaseCapture();
+        }
+        return 0;
     case WM_RBUTTONUP:
         if (g_mirroring && g_input) g_input->inject_back();
         return 0;
     case WM_MOUSEWHEEL: {
-        if (g_mirroring && g_input) {
+        if (g_mirroring && g_input && !g_mouse_down) {
             auto delta = GET_WHEEL_DELTA_WPARAM(wp);
-            POINTS pts = MAKEPOINTS(lp);
-            POINT pt = {pts.x, pts.y};
+            POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ScreenToClient(hwnd, &pt);
+            if (!is_inside_canvas_image(pt.x, pt.y)) return 0;
             auto [x, y] = canvas_to_screen(pt.x, pt.y);
-            g_input->inject_wheel(x, y, delta);
+            g_input->inject_wheel(x, y, delta, g_screen_h * g_capture_config.scale);
         }
         return 0;
     }
@@ -1445,6 +1463,20 @@ static std::string dump_layout_json() {
     return json_str;
 }
 
+static void update_audio_status(AudioStatus status) {
+    const char *text = "Audio off";
+    switch (status) {
+    case AudioStatus::Off: text = "Audio off"; break;
+    case AudioStatus::Preparing: text = "Preparing phone audio..."; break;
+    case AudioStatus::Waiting: text = "Allow audio capture on the phone"; break;
+    case AudioStatus::Playing: text = "Playing phone audio"; break;
+    case AudioStatus::MissingApp: text = "Audio app needed (see AUDIO.md)"; break;
+    case AudioStatus::Error: text = "Audio unavailable (see log)"; break;
+    case AudioStatus::Disconnected: text = "Audio stopped - toggle to retry"; break;
+    }
+    if (g_audio_status) SetWindowTextA(g_audio_status, text);
+}
+
 static void stop_mirroring();
 
 static void try_update_frame() {
@@ -1589,13 +1621,19 @@ static void stop_mirroring() {
     auto *cap = g_capture;
     auto *inp = g_input;
     auto *hdc = g_hdc;
+    auto *audio = g_audio;
+    g_audio = nullptr;
+    ++g_audio_generation;
+    if (audio) audio->request_stop();
+    update_audio_status(AudioStatus::Off);
     g_capture = nullptr;
     g_input = nullptr;
     g_hdc = nullptr;
 
     join_cleanup_thread();
-    g_cleanup_thread = std::thread([cap, inp, hdc]() {
+    g_cleanup_thread = std::thread([cap, inp, hdc, audio]() {
         if (cap) { cap->stop(); delete cap; }
+        if (audio) { audio->stop(); delete audio; }
         if (inp) { delete inp; }
         if (hdc) { delete hdc; }
         PostMessageA(g_hwnd, kMsgStopComplete, 0, 0);
@@ -1826,6 +1864,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_btn_record_hwnd  = mkbtn("res\\toolbar\\record.png", ID_BTN_RECORD);
         g_btn_screenshot_hwnd = mkbtn("res\\toolbar\\screenshot.png", ID_BTN_SCREENSHOT);
 
+        g_audio_checkbox = CreateWindowA("BUTTON", "Audio",
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 8, 67, 78, 22,
+            hwnd, (HMENU)ID_CHK_AUDIO, g_hInst, nullptr);
+        SendMessageA(g_audio_checkbox, BM_SETCHECK,
+                     AppConfig::instance().audio_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+        g_audio_status = CreateWindowA("STATIC", "Start mirroring to forward audio",
+            WS_CHILD | WS_VISIBLE | SS_LEFT, 90, 71, 430, 18, hwnd, nullptr, g_hInst, nullptr);
+
         g_canvas_hwnd = CreateWindowA(CANVAS_CLASS, "",
                                        WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_TABSTOP,
                                        0, TOOLBAR_H, 400, 400, hwnd, NULL, g_hInst, NULL);
@@ -1895,6 +1941,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 auto dev = get_selected_device();
                 if (!dev.serial.empty()) start_mirroring(dev.serial, dev.ip, dev.port);
             }
+            break;
+        }
+        case ID_CHK_AUDIO: {
+            bool enabled = SendMessageA(g_audio_checkbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            AppConfig::instance().audio_enabled = enabled;
+            config_save();
+            if (g_audio) g_audio->set_enabled(enabled);
+            update_audio_status(enabled && g_audio ? AudioStatus::Preparing : AudioStatus::Off);
             break;
         }
         case ID_BTN_REFRESH:
@@ -2313,6 +2367,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         });
 
         g_mirroring = true;
+        try {
+            auto generation = ++g_audio_generation;
+            g_audio = new AudioForwarder(g_hdc->serial(), g_hdc->ip(), g_hdc->port(),
+                [generation](AudioStatus status) {
+                    PostMessageA(g_hwnd, kMsgAudioStatus, static_cast<WPARAM>(status), generation);
+                });
+            if (!AppConfig::instance().audio_enabled) update_audio_status(AudioStatus::Off);
+            g_audio->start(AppConfig::instance().audio_enabled);
+        } catch (const std::exception &e) {
+            LOGE("Cannot start audio worker: %s", e.what());
+            delete g_audio; g_audio = nullptr;
+            update_audio_status(AudioStatus::Error);
+        }
         g_is_cloud_phone = g_hdc && g_hdc->is_tcp() && CphWindow::is_cloud_phone(
             [](const std::string &cmd, std::string *output, int timeout_sec) -> bool {
                 if (!g_hdc) return false;
@@ -2454,6 +2521,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     }
+    case kMsgAudioStatus:
+        if (g_audio && static_cast<uint32_t>(lp) == g_audio_generation)
+            update_audio_status(static_cast<AudioStatus>(wp));
+        break;
     case kMsgFrameRender: {
         // Event-driven frame rendering: decode thread notifies UI immediately
         if (g_mirroring) try_update_frame();
@@ -2525,6 +2596,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // Immediately signal capture and input threads to exit.
             // This makes their blocking shell calls return early.
             if (g_capture) g_capture->request_stop();
+            if (g_audio) g_audio->request_stop();
             if (g_input) g_input->request_stop();
             // Trigger full cleanup if not already stopping
             if (g_mirroring && !g_stopping) {
@@ -2535,6 +2607,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_DESTROY:
+        ++g_audio_generation;
+        if (g_audio) { g_audio->stop(); delete g_audio; g_audio = nullptr; }
         destroy_backbuffer();
         LayoutWindow::destroy();
         FileManagerWindow::destroy();
@@ -2604,6 +2678,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
             return 0;
         }
         g_verbose = g_cli_args.verbose;
+        if (g_cli_args.audio_override >= 0)
+            AppConfig::instance().audio_enabled = g_cli_args.audio_override != 0;
     }
 
     WNDCLASSEXA canvas_wc = {};

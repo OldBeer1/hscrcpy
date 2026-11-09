@@ -1,6 +1,7 @@
 #include "hdc_wrapper.h"
 #include "log.h"
 #include <cstdio>
+#include <cctype>
 #include <sstream>
 #include <algorithm>
 
@@ -412,6 +413,32 @@ bool HdcWrapper::forward_tcp(uint16_t local_port, uint16_t remote_port) {
     LOGD("forward_tcp result: %s (ret=%d, ok=%s)", result.c_str(), ret, ok ? "true" : "false");
     if (ok) register_forward_port(local_port);
     return ok;
+}
+
+bool HdcWrapper::reverse_tcp(uint16_t device_port, uint16_t local_port) {
+    if (!device_port || !local_port) return false;
+    std::string result;
+    auto cmd = "rport tcp:" + std::to_string(device_port) + " tcp:" + std::to_string(local_port);
+    int code = run_process(build_hdc_cmd(cmd), &result, 5000);
+    return code == 0 && result.find("OK") != std::string::npos &&
+           result.find("Fail") == std::string::npos;
+}
+
+bool HdcWrapper::reverse_remove(uint16_t device_port, uint16_t local_port) {
+    if (!device_port || !local_port) return false;
+    // Remove only the exact reverse mapping this audio session created.
+    return run_process(build_hdc_cmd("fport rm tcp:" + std::to_string(device_port) +
+                       " tcp:" + std::to_string(local_port)), nullptr, 3000) == 0;
+}
+
+bool HdcWrapper::install_hap(const std::string &path) {
+    if (path.empty() || path.find_first_of("\"\r\n") != std::string::npos) return false;
+    std::string result;
+    int code = run_process(build_hdc_cmd("install -r \"" + path + "\""), &result, 15000);
+    std::transform(result.begin(), result.end(), result.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return code == 0 && result.find("success") != std::string::npos &&
+           result.find("failed") == std::string::npos;
 }
 
 bool HdcWrapper::forward_localabstract(uint16_t local_port, const std::string &socket_name) {

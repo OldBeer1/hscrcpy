@@ -10,6 +10,8 @@ set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O2 -msse2")
 add_executable(hscrcpy WIN32
     src/main.cpp
     src/hdc_wrapper.cpp
+    src/audio_receiver.cpp
+    src/audio_forwarder.cpp
     src/screen_capture.cpp
     src/input_injector.cpp
     src/h264_decoder.cpp
@@ -123,7 +125,7 @@ message(STATUS "FFmpeg: OK (${AVCODEC_LIB})")
 # Windows libraries
 # ============================================
 target_link_libraries(hscrcpy
-    gdi32 gdiplus ws2_32 shell32 user32 kernel32 ole32 d2d1 comctl32 uxtheme
+    gdi32 gdiplus ws2_32 shell32 user32 kernel32 ole32 d2d1 comctl32 uxtheme winmm bcrypt
 )
 
 target_compile_definitions(hscrcpy PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -138,3 +140,33 @@ endif()
 target_link_options(hscrcpy PRIVATE -static -static-libgcc -static-libstdc++)
 
 install(TARGETS hscrcpy DESTINATION bin)
+
+option(HSCRCPY_BUILD_TESTS "Build Windows audio and input regression tests" OFF)
+if(HSCRCPY_BUILD_TESTS)
+    enable_testing()
+    add_executable(hscrcpy_test_hdc tests/fake_hdc.cpp)
+    set_target_properties(hscrcpy_test_hdc PROPERTIES OUTPUT_NAME hdc
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/audio-tests")
+    add_executable(hscrcpy_audio_tests tests/audio_tests.cpp src/audio_receiver.cpp
+        src/audio_forwarder.cpp src/hdc_wrapper.cpp src/cli.cpp)
+    target_include_directories(hscrcpy_audio_tests PRIVATE src common)
+    target_link_libraries(hscrcpy_audio_tests PRIVATE ws2_32 winmm bcrypt)
+    target_link_options(hscrcpy_audio_tests PRIVATE -static -static-libgcc -static-libstdc++)
+    set_target_properties(hscrcpy_audio_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/audio-tests")
+    add_dependencies(hscrcpy_audio_tests hscrcpy_test_hdc)
+    add_test(NAME audio_protocol_playback_lifecycle COMMAND hscrcpy_audio_tests)
+    set_tests_properties(audio_protocol_playback_lifecycle PROPERTIES
+        TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/audio-tests")
+    add_executable(hscrcpy_input_tests tests/input_tests.cpp src/input_injector.cpp
+        src/hdc_wrapper.cpp src/config.cpp)
+    target_include_directories(hscrcpy_input_tests PRIVATE src common)
+    target_link_libraries(hscrcpy_input_tests PRIVATE ws2_32 user32 shell32)
+    target_link_options(hscrcpy_input_tests PRIVATE -static -static-libgcc -static-libstdc++)
+    set_target_properties(hscrcpy_input_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/audio-tests")
+    add_dependencies(hscrcpy_input_tests hscrcpy_test_hdc)
+    add_test(NAME input_gesture_queue COMMAND hscrcpy_input_tests)
+    set_tests_properties(input_gesture_queue PROPERTIES
+        TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/audio-tests")
+endif()

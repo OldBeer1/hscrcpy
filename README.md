@@ -4,7 +4,13 @@ Windows 端鸿蒙设备投屏控制工具，Base On [HOScrcpy](https://gitcode.c
 
 ![image.png](https://raw.gitcode.com/user-images/assets/10037292/69bb303f-07c2-4d67-bb51-28ff731b1020/image.png 'image.png')
 
+## 下载运行包
+
+从 [GitHub Releases](https://github.com/OldBeer1/hscrcpy/releases/latest) 下载完整的 `hscrcpy-Windows-x64-migration-*.zip` 和对应的 `.sha256` 文件。完整解压后，先运行“校验运行包.cmd”，再运行“开始使用.cmd”。换电脑或准备新手机的步骤见 [MIGRATION.md](MIGRATION.md)。
+
 ## 功能特性
+
+- **音频转发（新增）**：手机内部声音通过 HDC 传到 Windows 播放，可单独开关；需要构建、签名并安装手机端应用，详见 [AUDIO.md](AUDIO.md)。换电脑、换手机的完整迁移包与签名安装流程见 [MIGRATION.md](MIGRATION.md)。Windows 与手机端均已编译，已完成当前鸿蒙 7 手机的签名安装和音频实测，用户确认电脑播放声音正常。
 
 - **H264 实时投屏**：多级出流链路（见"投屏链路"），低延迟实时画面
   - **7.0 SO → WebSocket 虚拟屏**：新版 SO 走 RFC6455 WebSocket 通道（7.0 SO 默认 WebSocket，检测到 abstract socket 时自动切换 gRPC）
@@ -13,7 +19,7 @@ Windows 端鸿蒙设备投屏控制工具，Base On [HOScrcpy](https://gitcode.c
 - **JPEG 快照回退**：以上出流全部失败时降级为 `snapshot_display` 模式（~2 FPS）
 - **Direct2D 渲染**：优先使用 D2D 硬件加速渲染，GDI 回退；零拷贝解码 + 帧池复用
 - **UI 布局检查**：实时查看设备 UI 组件树，点击节点高亮定位，支持搜索/刷新/展开，可拖拽分割线调整面板
-- **触控反控**：点击、长按、滑动、鼠标滚轮；双通道 touchUp 保证释放；鼠标拖出画面自动释放
+- **触控反控**：点击、长按、滑动、鼠标滚轮；触控动作逐条确认后按序发送，通道失败时恢复释放；鼠标拖出画面自动释放
 - **键盘输入**：英文/数字通过 `uinput` keyEvent 映射，中文通过 `uitest uiInput inputText` 输入
 - **剪贴板粘贴**：Ctrl+V 将 Windows 剪贴板内容输入到手机
 - **文件管理器**：浏览设备文件系统，支持上传/下载/删除/新建目录

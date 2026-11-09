@@ -25,6 +25,7 @@ struct AppConfig {
 
     int scroll_pixels_per_notch = 200;
     int scroll_max = 800;
+    bool audio_enabled = true;
 
     static AppConfig &instance();
 };

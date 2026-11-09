@@ -1,0 +1,10 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "Audio capture companion",
+  "main": "",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "libaudio_capture.so": "file:./src/main/cpp/types/libaudio_capture"
+  }
+}

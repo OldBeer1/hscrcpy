@@ -29,3 +29,22 @@ hscrcpy/
 # Project-local toolchain and validation logs
 .tools/
 .validation/
+
+# Local HarmonyOS build outputs and signing material
+audio-companion/**/build/
+audio-companion/.hvigor/
+audio-companion/oh_modules/
+audio-companion/**/oh_modules/
+audio-companion/.idea/
+audio-companion/local.properties
+audio-companion/**/.cxx/
+*.p12
+*.pfx
+*.p7b
+server/audio-capture.hap
+
+# Local DevEco signing configuration; use the public example on a fresh checkout
+/audio-companion/build-profile.json5
+
+# Generated migration kits
+/artifacts/

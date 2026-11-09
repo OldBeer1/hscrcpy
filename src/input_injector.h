@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <functional>
 #include <queue>
+#include <memory>
 #include <chrono>
 
 namespace hscrcpy {
@@ -39,7 +40,7 @@ public:
     bool inject_mouse_down(const std::string &button, uint32_t x, uint32_t y);
     bool inject_mouse_move(const std::string &button, uint32_t x, uint32_t y);
     bool inject_mouse_up(const std::string &button, uint32_t x, uint32_t y);
-    bool inject_wheel(uint32_t x, uint32_t y, int32_t delta);
+    bool inject_wheel(uint32_t x, uint32_t y, int32_t delta, uint32_t screen_height);
     bool inject_swipe(uint32_t from_x, uint32_t from_y, uint32_t to_x, uint32_t to_y, uint32_t velocity = 600);
     bool inject_back();
     bool inject_home();
@@ -57,7 +58,13 @@ private:
     bool ensure_uitest_agent();
     void reconnect_loop();
     void task_loop();
-    void shell_bg_loop();
+    void queue_task_locked(std::function<void()> task);
+    friend struct InputInjectorTestAccess;
+    bool send_touch_json(const char *api, uint32_t x, uint32_t y);
+    bool dispatch_touch_down(uint32_t x, uint32_t y, bool allow_shell = true);
+    bool dispatch_touch_move(uint32_t x, uint32_t y);
+    bool dispatch_touch_up(uint32_t x, uint32_t y);
+    bool perform_swipe(uint32_t from_x, uint32_t from_y, uint32_t to_x, uint32_t to_y, uint32_t velocity);
 
     HdcWrapper &hdc_;
     uint16_t base_port_ = 0;
@@ -73,17 +80,21 @@ private:
     std::atomic<uint32_t> last_touch_x_{0};
     std::atomic<uint32_t> last_touch_y_{0};
 
-    std::chrono::steady_clock::time_point last_move_time_;
-    // Move coalescing: only one move task in queue, uses latest coordinates.
-    // pending_move_x_/y_ are only written from the UI thread (WM_MOUSEMOVE handler),
-    // so no interleaving between writes. Task thread reads them atomically — at worst
-    // it sees a slightly stale y from the previous store, which is harmless for move.
-    std::atomic<bool> has_pending_move_{false};
-    std::atomic<uint32_t> pending_move_x_{0};
-    std::atomic<uint32_t> pending_move_y_{0};
-    // Move generation: incremented on touchUp so stale queued moves self-cancel
-    // without flushing the entire queue (which could drop touchDown events).
-    std::atomic<uint64_t> move_generation_{0};
+    enum class TouchBackend { None, Socket, Shell };
+    TouchBackend touch_backend_ = TouchBackend::None; // input worker only
+    std::chrono::steady_clock::time_point touch_down_time_{};
+    struct PendingMove { uint32_t x = 0, y = 0; bool queued = true; };
+    struct PendingWheel {
+        uint32_t x = 0, y = 0, height = 0;
+        int64_t pixels = 0;
+        bool accepting = true;
+    };
+    void perform_wheel(const std::shared_ptr<PendingWheel> &wheel);
+    // Queue cells are protected by task_mutex_; each gesture owns its own move cell.
+    std::shared_ptr<PendingMove> pending_move_;
+    std::shared_ptr<PendingWheel> pending_wheel_;
+    int64_t wheel_remainder_ = 0;
+    std::chrono::steady_clock::time_point last_move_time_{};
     std::queue<std::function<void()>> task_queue_;
     std::mutex task_mutex_;
     std::condition_variable task_cv_;
@@ -93,13 +104,6 @@ private:
     std::chrono::steady_clock::time_point last_reach_check_{};
     bool device_reachable_ = true;
 
-    // Background shell thread: runs touchUp shell fallback without blocking task_queue.
-    // Ensures detached threads don't outlive this object (use-after-free fix).
-    std::thread shell_bg_thread_;
-    std::queue<std::string> shell_bg_queue_;
-    std::mutex shell_bg_mutex_;
-    std::condition_variable shell_bg_cv_;
-    std::atomic<bool> shell_bg_running_{false};
 
 };
 

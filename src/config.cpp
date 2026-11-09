@@ -52,6 +52,7 @@ void config_load() {
 
     c.scroll_pixels_per_notch = read_int("Input", "ScrollPixelsPerNotch", c.scroll_pixels_per_notch, path.c_str());
     c.scroll_max = read_int("Input", "ScrollMax", c.scroll_max, path.c_str());
+    c.audio_enabled = read_int("Audio", "Enabled", c.audio_enabled ? 1 : 0, path.c_str()) != 0;
 
     if (c.usb_scale < 1) c.usb_scale = 1;
     if (c.usb_scale > 5) c.usb_scale = 5;
@@ -97,6 +98,7 @@ void config_save() {
 
     write_int("Input", "ScrollPixelsPerNotch", c.scroll_pixels_per_notch, path.c_str());
     write_int("Input", "ScrollMax", c.scroll_max, path.c_str());
+    write_int("Audio", "Enabled", c.audio_enabled ? 1 : 0, path.c_str());
 
     LOGI("Config saved to %s", path.c_str());
 }

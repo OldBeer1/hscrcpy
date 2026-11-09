@@ -14,6 +14,7 @@ struct CliArgs {
     bool show_help   = false;
     bool verbose     = false;
     bool auto_start  = false;
+    int audio_override = -1; // -1: saved setting, 0: disabled, 1: enabled.
     int display_id   = 0;
     int scale        = 0;
     int bitrate      = 0;

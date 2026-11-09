@@ -32,6 +32,9 @@ public:
 
     std::vector<HdcDevice> list_devices();
     bool forward_tcp(uint16_t local_port, uint16_t remote_port);
+    bool reverse_tcp(uint16_t device_port, uint16_t local_port);
+    bool reverse_remove(uint16_t device_port, uint16_t local_port);
+    bool install_hap(const std::string &path);
     bool forward_localabstract(uint16_t local_port, const std::string &socket_name);
     bool forward_remove(uint16_t local_port, bool is_abstract, const std::string &socket_name = "");
     bool forward_remove_all();

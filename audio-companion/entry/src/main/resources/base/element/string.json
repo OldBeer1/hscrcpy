@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "app_name",
+      "value": "hscrcpy 音频"
+    },
+    {
+      "name": "module_desc",
+      "value": "将手机内部播放声音传到已连接的电脑"
+    },
+    {
+      "name": "background_reason",
+      "value": "向电脑持续传输已授权采集的手机内部声音"
+    }
+  ]
+}

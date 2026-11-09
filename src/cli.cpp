@@ -30,6 +30,10 @@ bool CliParser::parse(CliArgs &args, int argc, char *argv[]) {
         } else if ((arg == "--bitrate") && i + 1 < argc) {
             args.bitrate = std::atoi(argv[++i]);
             if (args.bitrate < 1) args.bitrate = 1;
+        } else if (arg == "--audio") {
+            args.audio_override = 1;
+        } else if (arg == "--no-audio") {
+            args.audio_override = 0;
         } else if (arg == "--help") {
             args.show_help = true;
             return true;
@@ -53,6 +57,8 @@ void CliParser::print_usage(const char *prog) {
     printf("  -v, --verbose          Verbose output\n");
     printf("      --scale=N          Resolution scale divisor 1-5 (default: auto)\n");
     printf("      --bitrate=N        Video bitrate in bps (default: auto)\n");
+    printf("      --audio            Enable internal audio forwarding (companion app required)\n");
+    printf("      --no-audio         Disable audio forwarding\n");
     printf("      --help             Show this help\n");
     printf("\nVideo stream: gRPC H264 (primary), snapshot_display (fallback)\n");
     printf("Input injection: uitest socket JSON protocol\n");
